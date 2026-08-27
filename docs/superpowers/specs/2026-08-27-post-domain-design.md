@@ -1261,13 +1261,18 @@ the same no-lease condition:
 … AND ssl_mutation_token IS NULL
 ```
 
-This is deliberately not an expiry test. Ordinary work skips all leased rows; only
-`LeaseRecovery` selects on expiry, and only it may transition an expired lease.
+This is deliberately not an expiry test. Ordinary work skips all leased rows. Expiry
+selects work in exactly one place — the dedicated `LeaseRecovery` selector below — and
+only `LeaseRecovery` may transition an expired lease.
 
 #### LeaseRecovery — the only claimant of expired leases
 
-`Ssl\LeaseRecovery` runs as its own pass in `pd_ssl_sweep` with its own selector, which
-is the **only** query in the plugin that keys on lease expiry:
+`Ssl\LeaseRecovery` runs as its own pass in `pd_ssl_sweep` with its own selector. It is
+the **only work selector in the plugin that finds rows by lease expiry**; every
+ordinary-work selector instead requires `ssl_mutation_token IS NULL`. The phase-specific
+recovery CAS statements below also test expiry, but they are not selectors — they pin the
+expected expired state as a precondition of changing it, which is exactly what makes each
+transition safe:
 
 ```sql
 SELECT … FROM {prefix}pd_domains
@@ -1553,7 +1558,8 @@ LIMIT :batch
 ```
 
 The lease condition is a no-lease test, not an expiry test. An expired lease still blocks
-ordinary work; only `LeaseRecovery` (§12.6) selects on expiry.
+ordinary work; the `LeaseRecovery` selector (§12.6) is the only one that finds work by
+expiry.
 
 Every transition sets the next attempt explicitly: `pending` +15 min; `verified` +24 h;
 transient backoff +30 min growing exponentially to a 6 h cap; SSL transient honours
@@ -1826,13 +1832,17 @@ effect on deletability.
 **Forced local deletion** (`DELETE …?force=true`) removes the **local row only**, writes
 an event recording that a provider resource may have been left behind, and **never**
 bypasses this gate or issues a provider deletion. It issues no provider mutation, but it
-must still atomically prove that none is in flight: it acquires a `RESERVED` lease —
-which, like every ordinary acquisition, requires `ssl_mutation_token IS NULL` and so
-**cannot overwrite any existing lease, expired included** — and deletes the row under a
-CAS that requires that lease's token, kind, and phase. A row in `IN_FLIGHT` or
-`RECOVERING`, or one holding an expired lease of any phase, cannot be force-deleted: the
-acquire refuses with `pd_mutation_in_progress`, so a local delete can never orphan a
-request that is still outstanding at the provider.
+must still atomically prove that **the row carries no provider-mutation lease at all**.
+It acquires its own `RESERVED` lease through the ordinary acquisition CAS, which requires
+`ssl_mutation_token IS NULL`, and so it can only ever start from a lease-free row; it
+then deletes the row under a CAS naming that lease's token, kind, and phase.
+
+**A row carrying any existing provider-mutation lease — `RESERVED`, `IN_FLIGHT`, or
+`RECOVERING`, expired or unexpired — cannot be force-locally deleted.** The acquire
+matches nothing and the request is refused with `pd_mutation_in_progress`. That is a
+stronger and simpler guarantee than "nothing is in flight": it also refuses a row that
+another worker is merely preparing to mutate, so a local delete can never orphan a
+request that is outstanding at the provider, nor race one that is about to be sent.
 
 ### 14.6 Creation and ambiguous-create recovery
 
@@ -2248,12 +2258,15 @@ remain.
    event carrying the `host` snapshot.
 4. `NullDriver`, or `ssl_state = none`, means nothing external exists ⇒ hard delete
    immediately, `200 OK`. No authorization is required because no provider mutation
-   occurs, but a `RESERVED` lease is still taken so the delete cannot race one.
+   occurs, but a `RESERVED` lease is still taken — through the same acquisition CAS,
+   which succeeds only when `ssl_mutation_token IS NULL` — so the delete cannot race a
+   mutation or step over one that is being prepared.
 5. After 12 attempts / 24 h the row remains, an admin notice names the probable orphan,
-   and an operator may `DELETE …?force=true` — which takes a `RESERVED` lease, removes
-   the local row under a CAS naming that lease, records that a provider resource may
-   remain, and issues **no** provider deletion. It is refused outright while the row is
-   `IN_FLIGHT` or `RECOVERING`.
+   and an operator may `DELETE …?force=true` — which takes a `RESERVED` lease from a
+   lease-free row, removes the local row under a CAS naming that lease, records that a
+   provider resource may remain, and issues **no** provider deletion. It is refused while
+   **any** provider-mutation lease exists on the row, whether `RESERVED`, `IN_FLIGHT`, or
+   `RECOVERING`, and whether expired or unexpired.
 
 A row awaiting removal never serves and never re-verifies.
 
@@ -2608,13 +2621,16 @@ Cloudflare client):**
   zero provider mutations**
 - ordinary queues — verification, SSL, reconciliation, deletion, Admin, REST, CLI — skip
   leased rows in all three phases, unexpired and expired alike
-- only the dedicated `LeaseRecovery` selector claims expired leases; no ordinary query
-  keys on lease expiry
+- only the dedicated `LeaseRecovery` selector finds work by lease expiry; no
+  ordinary-work selector does, while the phase-specific recovery CAS statements correctly
+  pin the expired state they transition
 - an expired `RESERVED` row becomes ordinarily eligible **only after** its no-read
   cleanup CAS succeeds
 - expired `IN_FLIGHT` and `RECOVERING` rows cannot become ordinarily eligible by token
   overwrite
-- force-local-delete cannot overwrite any existing lease, including an expired one
+- force-local-delete refused against every existing lease — `RESERVED`, `IN_FLIGHT`, and
+  `RECOVERING`, each tested both unexpired and expired — and likewise for a local delete
+  where no provider resource exists
 - **no provider mutation occurs while the lease is only `RESERVED`** — the driver's
   mutating methods are never entered
 - the `RESERVED → IN_FLIGHT` CAS consumes the authorization **before** the driver is
