@@ -1,4 +1,4 @@
-# post-domain — implementation plan suite index
+# post-domain — Implementation Plan Suite Index
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement each plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -41,7 +41,7 @@ without reading the next.
      └─ 07 ssl authorization       (needs 02 schema + 06 FreshProof)
          └─ 08 ssl lifecycle
              └─ 09 cloudflare driver
-10 rest api          (needs 02, 03, 07, 08; 09 optional at runtime)
+10 rest api          (needs 02, 03, 06, 07, 08; 09 optional at runtime)
 11 admin and docs    (needs everything; last)
 ```
 
@@ -59,7 +59,7 @@ in parallel by separate workers; 10 integrates both.
 | 05 | §7, §7.1, §7.2, §7.3, §7.4, §7.5, §8, §8.1, §9 (CORS and ajax), §11.5, §11.8 (URL rows) |
 | 06 | §13.1, §13.2, §13.3, §13.4, §13.5, §13.6, §11.6 (verification rows), §11.8 (label row) |
 | 07 | §12.2 (behaviour), §12.6 (protocol), §14.1, §14.2, §14.3, §14.4, §14.5, §14.8, §14.9, §11.6 (driver, lease, ttl rows) |
-| 08 | §14.6, §14.7, §14.10, §14.15, §14.17 |
+| 08 | §12.6 (fencing at finalization), §14.4 (the precondition set enforced per operation), §14.6, §14.7, §14.10, §14.15, §14.17 |
 | 09 | §14.11, §14.12, §14.13, §14.14, §14.16 (never requesting a wildcard), §14.18, §11.6 (method, apex rows), §11.8 (method and apex rows) |
 | 10 | §15, §15.1, §15.2, §15.3, §14.16 (rejecting a wildcard host), §11.6 (capability row) |
 | 11 | §16, §16.1, §16.2, §17 (acceptance), §19, §20 (gate reporting) |
@@ -83,9 +83,9 @@ its predecessor's gate is green.
 | 05 | The rendered-output compatibility matrix passes for every row in spec §7.2 |
 | 06 | A seeded mapping goes `unverified → pending → verified` against a stubbed resolver, and a transient result never deactivates it |
 | 07 | No provider mutation is reachable without a consumed permit; the four lease race tests pass |
-| 08 | Every ambiguous outcome test resolves by a provider read; force-local-delete cannot overwrite a lease |
-| 09 | The status map generates from the pinned snapshot and CI fails on an unclassified value |
-| 10 | Management routes are absent from `/wp-json/` discovery on a mapped host |
+| 08 | Every ambiguous outcome test resolves by a provider read; every precondition failure proves zero mutating provider calls; a failed finalization writes and deletes nothing; force-local-delete cannot overwrite a lease |
+| 09 | The status map generates offline from the digested snapshot, all 16 hostname and 21 SSL values are classified, and CI fails on an unclassified value or a digest mismatch |
+| 10 | Management routes are absent from `/wp-json/` discovery on a mapped host, and every registered route is answered by a real handler introduced in the same task |
 | 11 | Full suite green; README covers every item in spec §19 |
 
 ## Deferred capability gate

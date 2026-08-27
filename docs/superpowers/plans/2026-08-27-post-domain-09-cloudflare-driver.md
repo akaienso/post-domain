@@ -1,4 +1,4 @@
-# post-domain 09 — Cloudflare for SaaS driver
+# post-domain 09 — Cloudflare for SaaS driver Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -44,7 +44,7 @@ Inherit Plans 01–08, and add:
 
 | File | Responsibility |
 |---|---|
-| `references/cloudflare-api-schema.<date>.json` | Pinned upstream snapshot |
+| `references/cloudflare-api-schema.2026-08-27.json` | Pinned upstream snapshot |
 | `references/cloudflare-schema-provenance.json` | Source URL, retrieval date, SHA-256 |
 | `references/cloudflare-status-policy.php` | Human-authored classification |
 | `references/cloudflare-status-map.php` | Generated from schema × policy |
@@ -61,7 +61,7 @@ Inherit Plans 01–08, and add:
 ### Task 1: Pinned schema, policy, and the generator
 
 **Files:**
-- Create: `bin/generate-cloudflare-status-map.php`, `references/cloudflare-status-policy.php`, `references/cloudflare-schema-provenance.json`, `references/cloudflare-api-schema.2026-08-27.json`
+- Create: `bin/generate-cloudflare-status-map.php`, `bin/extract-cloudflare-status-schema.sh`, `references/cloudflare-status-policy.php`, `references/cloudflare-schema-provenance.json`, `references/cloudflare-api-schema.2026-08-27.json`
 - Modify: `composer.json` (add the `generate:status-map` script), `.github/workflows/ci.yml`
 - Test: `tests/unit/Ssl/StatusMapGeneratorTest.php`
 
@@ -71,19 +71,82 @@ Inherit Plans 01–08, and add:
   `array{hostname: array<string,string>, ssl: array<string,string>}`, and the
   `composer generate:status-map` command.
 
-**Obtaining the pinned snapshot** — a one-time step the implementer performs and
-records:
+#### The authoritative source
 
-1. Download the Custom Hostnames schema fragment from
-   `https://developers.cloudflare.com/api/resources/custom_hostnames/methods/edit/`
-   into `references/cloudflare-api-schema.2026-08-27.json` as
-   `{"hostname_status": [...], "ssl_status": [...]}`.
-2. Record its `sha256sum` output, the source URL, and the UTC retrieval date in
-   `references/cloudflare-schema-provenance.json`.
-3. Add one classification row per value to `references/cloudflare-status-policy.php`.
-   Generation fails until every value has one, which is the point.
+The prose API reference does not publish either enum in full. The machine-readable
+OpenAPI document does:
 
-The pinned input is the source of truth; the map and fixtures are derived.
+- URL: `https://raw.githubusercontent.com/cloudflare/api-schemas/main/openapi.json`
+- Format: OpenAPI 3.0.3, `info.version` `4.0.0`
+- Size: roughly 24 MB, so download it to a temporary path rather than piping it
+  through anything that buffers in memory.
+
+Both enums live on the **list** operation's query parameters, keyed by parameter
+`name`. Select by name, never by array index — the parameter order is not part of
+the contract.
+
+#### Extracting the snapshot
+
+`bin/extract-cloudflare-status-schema.sh` performs the one-time retrieval. It is a
+developer tool, run by hand and committed for reproducibility; the plugin never
+executes it and never reaches the network:
+
+```bash
+#!/usr/bin/env bash
+# Retrieves the Cloudflare OpenAPI document and extracts the two custom-hostname
+# status enums into a pinned snapshot. Developer tool: never run by the plugin.
+set -euo pipefail
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+date_stamp="${1:?usage: extract-cloudflare-status-schema.sh YYYY-MM-DD}"
+url='https://raw.githubusercontent.com/cloudflare/api-schemas/main/openapi.json'
+work="$(mktemp -d)"
+trap 'rm -rf "${work}"' EXIT
+
+curl --fail --silent --show-error --location "${url}" --output "${work}/openapi.json"
+
+jq --sort-keys '
+	.paths["/zones/{zone_id}/custom_hostnames"].get.parameters as $p
+	| {
+		hostname_status: ( $p[] | select( .name == "hostname_status" ) | .schema.enum ),
+		ssl_status:      ( $p[] | select( .name == "ssl_status" )      | .schema.enum )
+	}
+' "${work}/openapi.json" > "${root}/references/cloudflare-api-schema.${date_stamp}.json"
+
+snapshot="cloudflare-api-schema.${date_stamp}.json"
+digest="$( shasum -a 256 "${root}/references/${snapshot}" | cut -d' ' -f1 )"
+api_version="$( jq -r '.info.version' "${work}/openapi.json" )"
+
+jq -n \
+	--arg file "${snapshot}" \
+	--arg source_url "${url}" \
+	--arg retrieved_at "$( date -u +%Y-%m-%dT%H:%M:%SZ )" \
+	--arg sha256 "${digest}" \
+	--arg api_version "${api_version}" \
+	--arg extraction 'jq .paths["/zones/{zone_id}/custom_hostnames"].get.parameters[] | select(.name=="hostname_status" or .name=="ssl_status") | .schema.enum' \
+	'{ file: $file, source_url: $source_url, retrieved_at: $retrieved_at, sha256: $sha256, api_version: $api_version, extraction: $extraction }' \
+	> "${root}/references/cloudflare-schema-provenance.json"
+
+echo "hostname_status: $( jq '.hostname_status | length' "${root}/references/${snapshot}" )"
+echo "ssl_status:      $( jq '.ssl_status | length' "${root}/references/${snapshot}" )"
+```
+
+Verified on 2026-08-27: `hostname_status` carries **16** values and `ssl_status`
+carries **21**, matching the specification's stated cardinality. Both are listed
+in full in the policy below, so nothing here is left to be discovered later.
+
+The negative fixture is derived from the snapshot the same way — one invented
+value appended so generation has something to reject:
+
+```bash
+jq '.hostname_status += ["pd_unclassified_probe"]' \
+	references/cloudflare-api-schema.2026-08-27.json \
+	> tests/unit/fixtures/cloudflare-schema-extra-value.json
+```
+
+Everything after this point is offline: the snapshot, the policy, and the
+generator are all committed, and `composer generate:status-map` reads only files
+in the repository.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -120,12 +183,16 @@ final class StatusMapGeneratorTest extends TestCase {
 		return array( 'schema' => $schema, 'provenance' => $provenance );
 	}
 
-	public function test_the_provenance_records_source_date_and_digest(): void {
+	public function test_the_provenance_records_source_date_digest_and_extraction(): void {
 		$provenance = $this->pinned()['provenance'];
 
-		$this->assertArrayHasKey( 'source_url', $provenance );
+		$this->assertSame(
+			'https://raw.githubusercontent.com/cloudflare/api-schemas/main/openapi.json',
+			$provenance['source_url']
+		);
 		$this->assertArrayHasKey( 'retrieved_at', $provenance );
-		$this->assertArrayHasKey( 'sha256', $provenance );
+		$this->assertArrayHasKey( 'api_version', $provenance );
+		$this->assertStringContainsString( 'hostname_status', $provenance['extraction'] );
 		$this->assertMatchesRegularExpression( '/^[0-9a-f]{64}$/', $provenance['sha256'] );
 	}
 
@@ -145,6 +212,59 @@ final class StatusMapGeneratorTest extends TestCase {
 		$this->assertCount( 21, $schema['ssl_status'] );
 	}
 
+	public function test_the_snapshot_holds_the_exact_values_the_policy_was_written_against(): void {
+		$schema = $this->pinned()['schema'];
+
+		$this->assertSame(
+			array(
+				'active',
+				'pending',
+				'active_redeploying',
+				'moved',
+				'pending_deletion',
+				'deleted',
+				'pending_blocked',
+				'pending_migration',
+				'pending_provisioned',
+				'test_pending',
+				'test_active',
+				'test_active_apex',
+				'test_blocked',
+				'test_failed',
+				'provisioned',
+				'blocked',
+			),
+			$schema['hostname_status']
+		);
+
+		$this->assertSame(
+			array(
+				'initializing',
+				'pending_validation',
+				'deleted',
+				'pending_issuance',
+				'pending_deployment',
+				'pending_deletion',
+				'pending_expiration',
+				'expired',
+				'active',
+				'initializing_timed_out',
+				'validation_timed_out',
+				'issuance_timed_out',
+				'deployment_timed_out',
+				'deletion_timed_out',
+				'pending_cleanup',
+				'staging_deployment',
+				'staging_active',
+				'deactivating',
+				'inactive',
+				'backup_issued',
+				'holding_deployment',
+			),
+			$schema['ssl_status']
+		);
+	}
+
 	public function test_every_schema_value_has_a_classification(): void {
 		$schema = $this->pinned()['schema'];
 
@@ -157,6 +277,29 @@ final class StatusMapGeneratorTest extends TestCase {
 
 		foreach ( $schema['ssl_status'] as $value ) {
 			$this->assertArrayHasKey( $value, $policy['ssl'], "unclassified ssl status {$value}" );
+		}
+	}
+
+	public function test_the_policy_classifies_nothing_the_schema_does_not_publish(): void {
+		$schema = $this->pinned()['schema'];
+
+		/** @var array{hostname: array<string, string>, ssl: array<string, string>} $policy */
+		$policy = require $this->root() . '/references/cloudflare-status-policy.php';
+
+		$this->assertSame( array(), array_diff( array_keys( $policy['hostname'] ), $schema['hostname_status'] ) );
+		$this->assertSame( array(), array_diff( array_keys( $policy['ssl'] ), $schema['ssl_status'] ) );
+	}
+
+	public function test_every_classification_is_one_of_the_four_local_states(): void {
+		/** @var array{hostname: array<string, string>, ssl: array<string, string>} $policy */
+		$policy = require $this->root() . '/references/cloudflare-status-policy.php';
+
+		foreach ( array_merge( $policy['hostname'], $policy['ssl'] ) as $value => $class ) {
+			$this->assertContains(
+				$class,
+				array( 'active', 'pending_validation', 'failed', 'revoked' ),
+				"{$value} maps to an unknown local state"
+			);
 		}
 	}
 
@@ -181,6 +324,23 @@ final class StatusMapGeneratorTest extends TestCase {
 		$this->assertStringContainsString( 'EXIT:1', (string) $output );
 	}
 
+	public function test_generation_fails_on_a_digest_mismatch(): void {
+		$root  = $this->root();
+		$path  = $root . '/references/cloudflare-api-schema.2026-08-27.json';
+		$saved = (string) file_get_contents( $path );
+
+		file_put_contents( $path, rtrim( $saved ) . "\n" );
+
+		$output = shell_exec(
+			'php ' . escapeshellarg( $root . '/bin/generate-cloudflare-status-map.php' ) . ' --stdout 2>&1; echo "EXIT:$?"'
+		);
+
+		file_put_contents( $path, $saved );
+
+		$this->assertStringContainsString( 'digest mismatch', (string) $output );
+		$this->assertStringContainsString( 'EXIT:1', (string) $output );
+	}
+
 	public function test_the_generator_makes_no_network_call(): void {
 		$source = (string) file_get_contents( $this->root() . '/bin/generate-cloudflare-status-map.php' );
 
@@ -191,10 +351,6 @@ final class StatusMapGeneratorTest extends TestCase {
 }
 ```
 
-Create the negative fixture `tests/unit/fixtures/cloudflare-schema-extra-value.json`
-by copying the pinned snapshot and appending one invented value,
-`"pd_unclassified_probe"`, to `hostname_status`.
-
 - [ ] **Step 2: Run the test to verify it fails**
 
 Run: `vendor/bin/phpunit --testsuite unit --filter StatusMapGeneratorTest`
@@ -202,30 +358,48 @@ Expected: FAIL — `file_get_contents(…/references/cloudflare-schema-provenanc
 
 - [ ] **Step 3: Write minimal implementation**
 
-Create `references/cloudflare-schema-provenance.json`:
+Create `bin/extract-cloudflare-status-schema.sh` with the script given above,
+`chmod +x` it, and run it once:
 
-```json
-{
-	"file": "cloudflare-api-schema.2026-08-27.json",
-	"source_url": "https://developers.cloudflare.com/api/resources/custom_hostnames/methods/edit/",
-	"retrieved_at": "2026-08-27T00:00:00Z",
-	"sha256": "<sha256sum of the committed snapshot>"
-}
+```bash
+chmod +x bin/extract-cloudflare-status-schema.sh
+bin/extract-cloudflare-status-schema.sh 2026-08-27
 ```
 
-Create `references/cloudflare-api-schema.2026-08-27.json` from the source above,
-in the shape `{"hostname_status": ["…"], "ssl_status": ["…"]}`, containing every
-value the schema publishes for each axis.
+That writes `references/cloudflare-api-schema.2026-08-27.json` and
+`references/cloudflare-schema-provenance.json`. Confirm it printed
+`hostname_status: 16` and `ssl_status: 21`; if either count differs, Cloudflare
+has changed the contract and the policy below must be revisited before going
+further rather than patched to fit.
 
-Create `references/cloudflare-status-policy.php` with one row per value. Every
-value in the snapshot must appear here, mapped to one of `active`,
-`pending_validation`, `failed`, or `revoked`:
+Then create the negative fixture:
+
+```bash
+jq '.hostname_status += ["pd_unclassified_probe"]' \
+	references/cloudflare-api-schema.2026-08-27.json \
+	> tests/unit/fixtures/cloudflare-schema-extra-value.json
+```
+
+Create `references/cloudflare-status-policy.php`. This is the complete
+classification — every one of the 16 hostname values and 21 SSL values, with no
+value left to be filled in:
 
 ```php
 <?php
 /**
- * Human-authored classification. The schema says which values exist; this says
- * what each one means. Generation fails on any value missing from here.
+ * Human-authored classification. The pinned schema says which values exist; this
+ * says what each one means locally. Generation fails on any value missing here.
+ *
+ * Local states: active, pending_validation, failed, revoked.
+ *
+ * - active             the certificate is serving traffic now
+ * - pending_validation the provider is still working; wait, do not act
+ * - failed             a terminal problem an operator must resolve
+ * - revoked            the resource is being or has been withdrawn
+ *
+ * Cloudflare's `test_*` hostname statuses describe a staging hostname that is
+ * not serving production traffic, so a healthy test state is pending rather
+ * than active; a failed one is a real failure.
  *
  * @package PostDomain
  */
@@ -234,22 +408,53 @@ declare( strict_types = 1 );
 
 return array(
 	'hostname' => array(
-		'active'  => 'active',
-		'pending' => 'pending_validation',
-		'moved'   => 'failed',
-		'deleted' => 'revoked',
-		'blocked' => 'failed',
-		// …one row per value in the pinned snapshot's hostname_status array.
+		'active'              => 'active',
+		'pending'             => 'pending_validation',
+		'active_redeploying'  => 'active',
+		'moved'               => 'failed',
+		'pending_deletion'    => 'revoked',
+		'deleted'             => 'revoked',
+		'pending_blocked'     => 'failed',
+		'pending_migration'   => 'pending_validation',
+		'pending_provisioned' => 'pending_validation',
+		'test_pending'        => 'pending_validation',
+		'test_active'         => 'pending_validation',
+		'test_active_apex'    => 'pending_validation',
+		'test_blocked'        => 'failed',
+		'test_failed'         => 'failed',
+		'provisioned'         => 'pending_validation',
+		'blocked'             => 'failed',
 	),
 	'ssl'      => array(
-		'active'             => 'active',
-		'pending_validation' => 'pending_validation',
-		'expired'            => 'failed',
-		'deleted'            => 'revoked',
-		// …one row per value in the pinned snapshot's ssl_status array.
+		'initializing'           => 'pending_validation',
+		'pending_validation'     => 'pending_validation',
+		'deleted'                => 'revoked',
+		'pending_issuance'       => 'pending_validation',
+		'pending_deployment'     => 'pending_validation',
+		'pending_deletion'       => 'revoked',
+		'pending_expiration'     => 'active',
+		'expired'                => 'failed',
+		'active'                 => 'active',
+		'initializing_timed_out' => 'failed',
+		'validation_timed_out'   => 'failed',
+		'issuance_timed_out'     => 'failed',
+		'deployment_timed_out'   => 'failed',
+		'deletion_timed_out'     => 'failed',
+		'pending_cleanup'        => 'revoked',
+		'staging_deployment'     => 'pending_validation',
+		'staging_active'         => 'pending_validation',
+		'deactivating'           => 'revoked',
+		'inactive'               => 'revoked',
+		'backup_issued'          => 'active',
+		'holding_deployment'     => 'pending_validation',
 	),
 );
 ```
+
+Two of those deserve a note, because they are the ones a reviewer will question.
+`pending_expiration` still serves traffic, so it is `active` and the operator is
+warned elsewhere rather than being told the certificate is broken. `backup_issued`
+likewise describes a certificate that exists and serves.
 
 Create `bin/generate-cloudflare-status-map.php`:
 
@@ -368,17 +573,59 @@ Run `composer generate:status-map` once to produce the committed map.
 - [ ] **Step 4: Run the test to verify it passes**
 
 Run: `composer generate:status-map && vendor/bin/phpunit --testsuite unit --filter StatusMapGeneratorTest`
-Expected: PASS — 7 tests
+Expected: PASS — 10 tests
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 5: Add the optional drift check**
+
+This job is scheduled, not part of the required build, and it never edits
+anything. It tells a maintainer that Cloudflare published a value the pinned
+snapshot does not have; a human then decides what the new value means.
+
+Create `.github/workflows/cloudflare-schema-drift.yml`:
+
+```yaml
+name: Cloudflare schema drift
+
+on:
+  schedule:
+    - cron: '17 6 * * 1'
+  workflow_dispatch:
+
+jobs:
+  drift:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compare the live enums with the pinned snapshot
+        run: |
+          curl --fail --silent --show-error --location \
+            https://raw.githubusercontent.com/cloudflare/api-schemas/main/openapi.json \
+            --output /tmp/openapi.json
+          jq --sort-keys '
+            .paths["/zones/{zone_id}/custom_hostnames"].get.parameters as $p
+            | {
+                hostname_status: ( $p[] | select( .name == "hostname_status" ) | .schema.enum ),
+                ssl_status:      ( $p[] | select( .name == "ssl_status" )      | .schema.enum )
+              }
+          ' /tmp/openapi.json > /tmp/live.json
+          if ! diff -u references/cloudflare-api-schema.2026-08-27.json /tmp/live.json; then
+            echo '::warning::Cloudflare status enums have drifted; classify the new values before repinning.'
+            exit 1
+          fi
+```
+
+- [ ] **Step 6: Commit**
 
 ```bash
-git add bin/generate-cloudflare-status-map.php references/ composer.json .github/workflows/ci.yml tests/unit/Ssl/StatusMapGeneratorTest.php tests/unit/fixtures/cloudflare-schema-extra-value.json
+git add bin/generate-cloudflare-status-map.php bin/extract-cloudflare-status-schema.sh references/ composer.json .github/workflows/ci.yml .github/workflows/cloudflare-schema-drift.yml tests/unit/Ssl/StatusMapGeneratorTest.php tests/unit/fixtures/cloudflare-schema-extra-value.json
 git commit -m "Generate the Cloudflare status map from a pinned, digested snapshot
 
-The schema says which values exist and the policy says what they mean; the map
-is their join. CI fails on an unclassified value, a digest mismatch, or a
-cardinality change, and generation never touches the network."
+The enums come from the published OpenAPI document, selected by parameter name
+rather than position. The schema says which values exist and the policy says
+what they mean; the map is their join. CI fails on an unclassified value, a
+digest mismatch, or a cardinality change, and generation never touches the
+network."
 ```
 
 ---
