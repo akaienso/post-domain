@@ -1800,6 +1800,7 @@ found by a human at implementation time, one task at a time.
 | `duplicate-import` | the same `use` twice in one example |
 | `duplicate-declaration` | the same type declared twice, unless the second is introduced by a `Replace \`src/…\` with` line |
 | `arity` | a call to one of the pinned lease and context APIs with the wrong argument count |
+| `uncovered-critical-fragment` | a skipped fragment carrying concurrency, authorization, transaction, deletion, or provider-binding code with no `<!-- covered-by: … -->` marker naming the test that covers it |
 
 The `missing-import` rule is the one that matters most, because it is exactly the
 defect that reached review: `Reconciler` calling `AtomicTransition::commit()` with
@@ -1813,7 +1814,10 @@ is:
 - **Fragments are not inspected at all.** A block that does not begin with `<?php`
   is a method body, a `composer.json` addition, or a YAML snippet. It is counted
   **and listed by file, block number, and the line that introduces it**, so an
-  unvalidated example can be found rather than merely tallied.
+  unvalidated example can be found rather than merely tallied — and a fragment
+  carrying critical logic must say which test covers it, or the check fails. That
+  is a coverage claim by a human, not something this tool verifies; it makes the
+  gap visible and attributable rather than closing it.
 - **This task's own defect fixtures are not inspected**, because they are supposed
   to be broken. They are introduced by the words `checker fixture` and appear in
   the same skipped list, so the exemption is auditable and cannot be used to
@@ -1821,6 +1825,13 @@ is:
 - It does not type-check, resolve WordPress or PHP built-ins, verify that a method
   exists on the class being called, or check argument *types* — only the arity of
   a pinned list.
+- **It does not verify SQL.** Counting `%s` in a prepared statement is exactly the
+  fragile regex this tool is not. Placeholder/value agreement is proven instead by
+  the success-path tests in Plans 02, 06, 07, and 08 — `MutationLeaseTest`'s
+  owner-pinned write cases in particular, which run every lease CAS against a real
+  row **and a bystander row**, because a value list one short makes the revision
+  land in the `id` placeholder, affects zero rows, and is indistinguishable from a
+  correctly-refused wrong owner unless a success path exists.
 - A clean run means "this parses and its names resolve", never "this is correct".
 
 - [ ] **Step 1: Write the failing test**
@@ -1910,6 +1921,7 @@ final class PlanExamplesTest extends TestCase {
 			'duplicate import'    => array( 'duplicate-import', '[duplicate-import]' ),
 			'duplicate type'      => array( 'duplicate-declaration', '[duplicate-declaration]' ),
 			'wrong arity'         => array( 'arity', '[arity]' ),
+			'uncovered fragment'  => array( 'uncovered-fragment', '[uncovered-critical-fragment]' ),
 		);
 	}
 
@@ -1926,10 +1938,30 @@ final class PlanExamplesTest extends TestCase {
 
 		$this->assertSame( 0, $result['code'], $result['output'] );
 	}
+
+	public function test_a_critical_fragment_without_a_coverage_marker_fails(): void {
+		$result = $this->fixture( 'uncovered-fragment' );
+
+		$this->assertSame( 1, $result['code'], $result['output'] );
+		$this->assertStringContainsString( '[uncovered-critical-fragment]', $result['output'] );
+	}
+
+	public function test_a_critical_fragment_with_a_coverage_marker_passes(): void {
+		$result = $this->fixture( 'covered-fragment' );
+
+		$this->assertSame( 0, $result['code'], $result['output'] );
+		$this->assertStringContainsString( '[covered]', $result['output'] );
+	}
+
+	public function test_every_critical_skipped_fragment_in_the_suite_names_its_test(): void {
+		// The real suite, not a fixture: this is the assertion that keeps the
+		// coverage claims honest as the plans change.
+		$this->assertSame( 0, $this->run()['code'] );
+	}
 }
 ```
 
-Create the six defect fixtures plus one accepted-replacement fixture under
+Create the seven defect fixtures plus two accepted fixtures under
 `tests/fixtures/plan-examples/`. Each is a minimal Markdown file holding exactly
 the defect its name gives.
 
@@ -2039,6 +2071,28 @@ final class Caller {
 ```
 ````
 
+checker fixture — `uncovered-fragment.md`:
+
+````markdown
+```php
+	public function sweep(): void {
+		$this->lease->delete_row( $owner );
+	}
+```
+````
+
+checker fixture — `covered-fragment.md`:
+
+````markdown
+<!-- covered-by: SomeTest -->
+
+```php
+	public function sweep(): void {
+		$this->lease->delete_row( $owner );
+	}
+```
+````
+
 checker fixture — `replacement.md`:
 
 ````markdown
@@ -2140,6 +2194,7 @@ foreach ( (array) $pd_files as $pd_file ) {
 			'complete' => str_starts_with( ltrim( $pd_code ), '<?php' ) && ! $pd_fixture,
 			'replace'  => str_contains( $pd_lead, 'Replace `' ),
 			'intro'    => substr( (string) end( $pd_lines ), 0, 70 ),
+			'lead'     => $pd_lead,
 		);
 	}
 }
@@ -2156,6 +2211,49 @@ foreach ( $pd_blocks as $pd_block ) {
 	} else {
 		$pd_skipped[] = $pd_block;
 	}
+}
+
+/**
+ * Logic a skipped fragment must not carry silently. A fragment cannot be linted,
+ * so one containing concurrency, authorization, transaction, deletion, or
+ * provider-binding code must either be promoted to a complete example or name the
+ * test that covers it, in a `<!-- covered-by: … -->` line just above its fence.
+ */
+$pd_critical = array(
+	'AtomicTransition',
+	'TransitionResult',
+	'MutationLease',
+	'LeaseOwner',
+	'claim_recovery',
+	'delete_row',
+	'finalize(',
+	'->delete(',
+	'ssl_mutation_',
+	'ssl_provider_environment',
+	'DriverFactory',
+	'BoundResource',
+	'permission_callback',
+);
+
+foreach ( $pd_skipped as $pd_block ) {
+	$pd_hits = array();
+
+	foreach ( $pd_critical as $pd_marker ) {
+		if ( str_contains( $pd_block['code'], $pd_marker ) ) {
+			$pd_hits[] = $pd_marker;
+		}
+	}
+
+	if ( array() === $pd_hits || str_contains( $pd_block['lead'], 'covered-by:' ) ) {
+		continue;
+	}
+
+	$pd_errors[] = sprintf(
+		'[uncovered-critical-fragment] %s block %d carries %s — promote it or add a covered-by marker',
+		$pd_block['file'],
+		$pd_block['index'],
+		implode( ', ', $pd_hits )
+	);
 }
 
 // Pass one: what does the suite declare, and where?
@@ -2203,6 +2301,14 @@ foreach ( $pd_complete as $pd_block ) {
 		$pd_errors[] = sprintf( '[syntax] %s: %s', $pd_where, (string) reset( $pd_lint ) );
 	}
 
+	// Comments first: an apostrophe in prose would otherwise open a phantom
+	// string and swallow the code after it. Every reference scan below runs on
+	// this stripped form, so a class named in a comment or a string is not
+	// mistaken for a use of it.
+	$pd_bare = (string) preg_replace( '#/\*.*?\*/#s', '', $pd_block['code'] );
+	$pd_bare = (string) preg_replace( '#//[^\n]*#', '', $pd_bare );
+	$pd_bare = (string) preg_replace( "#'(?:[^'\\\\]|\\\\.)*'#", "''", $pd_bare );
+
 	preg_match_all( '/^use\s+([^;]+);/m', $pd_block['code'], $pd_uses );
 
 	$pd_imported = array();
@@ -2222,7 +2328,7 @@ foreach ( $pd_complete as $pd_block ) {
 		}
 	}
 
-	preg_match_all( '/\\\\(PostDomain\\\\[A-Za-z0-9_\\\\]+)/', $pd_block['code'], $pd_inline );
+	preg_match_all( '/\\\\(PostDomain\\\\[A-Za-z0-9_\\\\]+)/', $pd_bare, $pd_inline );
 
 	foreach ( $pd_inline[1] as $pd_symbol ) {
 		$pd_symbol = rtrim( $pd_symbol, '\\' );
@@ -2231,14 +2337,6 @@ foreach ( $pd_complete as $pd_block ) {
 			$pd_errors[] = sprintf( '[unresolved-fq] %s: %s', $pd_where, $pd_symbol );
 		}
 	}
-
-	// Comments first: an apostrophe in prose would otherwise open a phantom
-	// string and swallow the code after it. Both the reference scan and the arity
-	// scan run on this stripped form, so a class named in a comment or a string is
-	// not mistaken for a use of it.
-	$pd_bare = (string) preg_replace( '#/\*.*?\*/#s', '', $pd_block['code'] );
-	$pd_bare = (string) preg_replace( '#//[^\n]*#', '', $pd_bare );
-	$pd_bare = (string) preg_replace( "#'(?:[^'\\\\]|\\\\.)*'#", "''", $pd_bare );
 
 	// A bare short name that the suite declares elsewhere, neither imported here
 	// nor living in this block's own namespace. This is the Reconciler defect.
@@ -2345,7 +2443,13 @@ printf( "fragments NOT inspected: %d\n", count( $pd_skipped ) );
 printf( "types declared: %d\n", count( $pd_declared ) );
 
 foreach ( $pd_skipped as $pd_block ) {
-	printf( "  skipped %s block %d — %s\n", $pd_block['file'], $pd_block['index'], $pd_block['intro'] );
+	printf(
+		"  skipped %s block %d — %s%s\n",
+		$pd_block['file'],
+		$pd_block['index'],
+		$pd_block['intro'],
+		str_contains( $pd_block['lead'], 'covered-by:' ) ? ' [covered]' : ''
+	);
 }
 
 $pd_errors = array_values( array_unique( $pd_errors ) );
@@ -2375,7 +2479,7 @@ Add to `.github/workflows/ci.yml`, alongside the other lint steps:
 - [ ] **Step 4: Run the test to verify it passes**
 
 Run: `composer lint:plans && vendor/bin/phpunit --testsuite unit --filter PlanExamplesTest`
-Expected: PASS — 11 tests (including the six defect fixtures)
+Expected: PASS — 15 tests (including the seven defect fixtures)
 
 If `lint:plans` reports anything, that is a **plan** defect, not an implementation
 one: fix the plan document before writing the code it describes. And read the

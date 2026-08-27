@@ -291,6 +291,50 @@ final class SerializerTest extends WP_UnitTestCase {
 		$this->assertSame( 'cf-zone:zone-1', $resource['ssl']['mutation_in_progress']['environment'] );
 	}
 
+	public function test_the_resource_environment_is_reported_separately_from_the_mutation_environment(): void {
+		global $wpdb;
+
+		$mapping = $this->mapping( VerificationState::VERIFIED, ActivationState::ACTIVE );
+
+		// The resource lives in zone A; a method change is in flight in zone A too,
+		// but they are different facts with different lifetimes.
+		$wpdb->update( // phpcs:ignore WordPress.DB
+			Schema::domains_table(),
+			array(
+				'ssl_provider_environment' => 'cf-zone:zone-a',
+				'ssl_mutation_token'       => str_repeat( '6', 32 ),
+				'ssl_mutation_kind'        => 'method',
+				'ssl_mutation_phase'       => 'in_flight',
+				'ssl_mutation_expires_at'  => gmdate( 'Y-m-d H:i:s', time() + 60 ),
+				'ssl_mutation_driver'      => 'cloudflare-saas',
+				'ssl_mutation_environment' => 'cf-zone:zone-a',
+			),
+			array( 'id' => $mapping->id )
+		);
+
+		$resource = MappingSerializer::resource( $this->repo->by_id( $mapping->id ) );
+
+		$this->assertSame( 'cf-zone:zone-a', $resource['ssl']['provider_environment'] );
+		$this->assertSame( 'cf-zone:zone-a', $resource['ssl']['mutation_in_progress']['environment'] );
+		$this->assertArrayHasKey( 'environment_reachable', $resource['ssl'] );
+	}
+
+	public function test_an_unreadable_environment_is_reported_as_such(): void {
+		global $wpdb;
+
+		$mapping = $this->mapping( VerificationState::VERIFIED, ActivationState::ACTIVE );
+
+		$wpdb->update( // phpcs:ignore WordPress.DB
+			Schema::domains_table(),
+			array( 'ssl_provider_environment' => 'cf-zone:a-zone-nobody-configured' ),
+			array( 'id' => $mapping->id )
+		);
+
+		$resource = MappingSerializer::resource( $this->repo->by_id( $mapping->id ) );
+
+		$this->assertFalse( $resource['ssl']['environment_reachable'] );
+	}
+
 	public function test_the_etag_carries_the_revision(): void {
 		$mapping = $this->mapping( VerificationState::VERIFIED, ActivationState::ACTIVE );
 
@@ -378,6 +422,7 @@ final class Errors {
 	public const CONFIRMATION_REQUIRED    = 'pd_confirmation_required';
 	public const NO_DRIVER                = 'pd_no_driver';
 	public const SSL_NOT_CONFIGURED       = 'pd_ssl_not_configured';
+	public const ENVIRONMENT_DRIFTED      = 'pd_provider_environment_changed';
 	public const FENCED                   = 'pd_mutation_fenced';
 	public const FINALIZATION_FAILED      = 'pd_finalization_failed';
 	public const OUTCOME_AMBIGUOUS        = 'pd_provider_outcome_ambiguous';
@@ -493,6 +538,11 @@ final class MappingSerializer {
 		$resource['ssl'] = array(
 			'state'                      => $mapping->ssl_state->value,
 			'provider'                   => $mapping->ssl_provider,
+			// Where the resource lives, which is not the same fact as where a
+			// mutation currently in flight is going.
+			'provider_environment'       => $mapping->ssl_provider_environment,
+			'environment_reachable'      => null === $mapping->ssl_ref
+				|| ! ( \PostDomain\Ssl\BoundResource::driver_for( $mapping ) instanceof \PostDomain\Ssl\DriverUnavailable ),
 			'ownership_origin'           => $mapping->ssl_ownership_origin?->value,
 			'owned_by_this_installation' => null !== $mapping->ssl_ownership_origin
 				&& $mapping->ssl_owner_installation_id === Environment::installation_id(),
@@ -617,7 +667,7 @@ final class MappingSerializer {
 - [ ] **Step 4: Run the test to verify it passes**
 
 Run: `composer test:integration -- --filter Rest\\SerializerTest`
-Expected: PASS — 19 tests
+Expected: PASS — 21 tests
 
 - [ ] **Step 5: Commit**
 
@@ -874,7 +924,7 @@ use PostDomain\Ssl\CreateAuthorizer;
 use PostDomain\Ssl\CreateService;
 use PostDomain\Ssl\DeletionAuthorizer;
 use PostDomain\Ssl\DeletionService;
-use PostDomain\Ssl\DriverFactory;
+use PostDomain\Ssl\BoundResource;
 use PostDomain\Ssl\DriverUnavailable;
 use PostDomain\Ssl\MethodChangeAuthorizer;
 use PostDomain\Ssl\MethodChangeService;
@@ -914,9 +964,14 @@ final class SslServices {
 		);
 	}
 
-	/** @return SslDriver|DriverUnavailable */
+	/**
+	 * BoundResource, not DriverFactory: for a mapping that already has a resource
+	 * this also proves the driver still points at the environment it lives in.
+	 *
+	 * @return SslDriver|DriverUnavailable
+	 */
 	public function driver_for( Mapping $mapping ) {
-		return DriverFactory::for_mapping( $mapping );
+		return BoundResource::driver_for( $mapping );
 	}
 }
 ```
@@ -1351,6 +1406,8 @@ Add to `ManagementController::register()`:
 
 and add these methods:
 
+<!-- covered-by: Rest\ResourceTest -->
+
 ```php
 	private function register_domain(): void {
 		register_rest_route(
@@ -1620,6 +1677,8 @@ Add to `ManagementController::register()`:
 
 and:
 
+<!-- covered-by: Rest\VerificationRoutesTest -->
+
 ```php
 	private function register_verification(): void {
 		foreach (
@@ -1765,6 +1824,7 @@ use PostDomain\Ssl\MethodChangeAuthorizer;
 use PostDomain\Ssl\MethodChangeService;
 use PostDomain\Ssl\MutationGate;
 use PostDomain\Ssl\MutationLease;
+use PostDomain\Ssl\RemovalOutcome;
 use PostDomain\Support\Schema;
 use PostDomain\Support\SystemClock;
 use PostDomain\Tests\Integration\Ssl\Fixtures\RecordingDriver;
@@ -1957,6 +2017,19 @@ final class SslRoutesTest extends WP_UnitTestCase {
 		$this->assertSame( OwnershipOrigin::ADOPTED, $this->repo->by_id( $m->id )?->ssl_ownership_origin );
 	}
 
+	public function test_an_unestablished_removal_never_answers_204(): void {
+		$this->boot( RecordingDriver::removing( RemovalOutcome::REMOVED ) );
+		$m = $this->mapping( true );
+
+		$this->request( 'DELETE', '/ssl', $m );
+
+		add_filter( 'query', $fail = static fn( string $q ): string => 'COMMIT' === $q ? 'SELECT bad_syntax FROM' : $q );
+		$response = $this->request( 'DELETE', '/ssl', $this->repo->by_id( $m->id ) ?? $m );
+		remove_filter( 'query', $fail );
+
+		$this->assertNotSame( 204, $response->get_status(), 'no success we cannot stand behind' );
+	}
+
 	public function test_removing_ssl_returns_202_and_keeps_the_row(): void {
 		$this->boot( RecordingDriver::succeeding( 'ref-1' ) );
 		$m = $this->mapping( true );
@@ -2080,6 +2153,8 @@ Add to `ManagementController::register()`:
 
 and:
 
+<!-- covered-by: Rest\SslRoutesTest -->
+
 ```php
 	private function register_ssl(): void {
 		register_rest_route(
@@ -2135,6 +2210,14 @@ and:
 		$driver = $this->ssl->driver_for( $mapping );
 
 		if ( $driver instanceof \PostDomain\Ssl\DriverUnavailable ) {
+			if ( 'provider_environment_changed' === $driver->reason ) {
+				return self::error(
+					Errors::ENVIRONMENT_DRIFTED,
+					\PostDomain\Ssl\BoundResource::drift_detail( $mapping ),
+					409
+				);
+			}
+
 			return self::error(
 				'ssl_not_configured' === $driver->reason ? Errors::SSL_NOT_CONFIGURED : Errors::NO_DRIVER,
 				sprintf( 'No SSL driver is available for this mapping (%s).', $driver->reason ),
@@ -2258,6 +2341,17 @@ and:
 			return self::error( Errors::MUTATION_UNAUTHORIZED, 'The removal was refused before any provider call.', 409 );
 		}
 
+		if ( 'deferred' === $outcome ) {
+			// The local outcome could not be established. Re-reading the row here
+			// would read the same connection that does not know, so this answers
+			// 409 rather than a 204 it cannot stand behind.
+			return self::error(
+				Errors::FINALIZATION_FAILED,
+				'The provider removed the certificate; whether that was recorded locally is not yet established. Re-read the mapping shortly.',
+				409
+			);
+		}
+
 		$after = $this->repo->by_id( $mapping->id );
 
 		return null === $after
@@ -2284,6 +2378,7 @@ and:
 				'lease_unavailable'                => Errors::MUTATION_IN_PROGRESS,
 				'ssl_not_configured'               => Errors::SSL_NOT_CONFIGURED,
 				'driver_not_registered'            => Errors::NO_DRIVER,
+				'provider_environment_changed'     => Errors::ENVIRONMENT_DRIFTED,
 				'unowned_resource',
 				'foreign_marker_override_required' => Errors::UNOWNED_RESOURCE,
 				default                            => Errors::MUTATION_UNAUTHORIZED,
@@ -2349,7 +2444,7 @@ and:
 - [ ] **Step 4: Run the test to verify it passes**
 
 Run: `composer test:integration -- --filter Rest\\SslRoutesTest`
-Expected: PASS — 17 tests
+Expected: PASS — 18 tests
 
 - [ ] **Step 5: Commit**
 
@@ -2486,6 +2581,8 @@ Add to `ManagementController::register()`:
 ```
 
 and:
+
+<!-- covered-by: Rest\EnvironmentRoutesTest -->
 
 ```php
 	private function register_environment(): void {

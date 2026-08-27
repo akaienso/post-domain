@@ -408,7 +408,7 @@ final class SchemaTest extends WP_UnitTestCase {
 				'verify_lease_expires_at', 'resolver_class',
 				'ssl_provider', 'ssl_ref', 'ssl_ownership_origin', 'ssl_owner_installation_id',
 				'ssl_adopted_at', 'ssl_adopted_by', 'ssl_method', 'ssl_method_requested_at',
-				'ssl_marker_support', 'ssl_checked_at', 'ssl_next_attempt_at',
+				'ssl_provider_environment', 'ssl_marker_support', 'ssl_checked_at', 'ssl_next_attempt_at',
 				'ssl_transient_count', 'ssl_provider_state', 'ssl_error',
 				'ssl_mutation_token', 'ssl_mutation_kind', 'ssl_mutation_phase',
 				'ssl_mutation_expires_at', 'ssl_mutation_driver', 'ssl_mutation_environment',
@@ -554,6 +554,7 @@ final class Schema {
 				ssl_mutation_kind varchar(20) NULL,
 				ssl_mutation_phase varchar(20) NULL,
 				ssl_mutation_expires_at datetime NULL,
+				ssl_provider_environment varchar(190) NULL,
 				ssl_mutation_driver varchar(60) NULL,
 				ssl_mutation_environment varchar(190) NULL,
 				deletion_requested_at datetime NULL,
@@ -650,7 +651,7 @@ default label costs 23. The limit is structural rather than a runtime check."
 **Interfaces:**
 - Consumes: `Schema` (Task 2), the enums (Task 1).
 - Produces:
-  - `PostDomain\Mapping\Mapping` — readonly, with `int $id`, `string $host`, `?int $alias_of`, `?int $post_id`, `int $revision`, `VerificationState $verification_state`, `ActivationState $activation_state`, `SslState $ssl_state`, `?string $integrity_error`, `string $challenge`, `string $challenge_label`, `?OwnershipOrigin $ssl_ownership_origin`, `?string $ssl_owner_installation_id`, `?string $ssl_provider`, `?string $ssl_ref`, `?string $ssl_method`, `?string $ssl_mutation_token`, `?MutationKind $ssl_mutation_kind`, `?MutationPhase $ssl_mutation_phase`, `?string $ssl_mutation_expires_at`, `?string $ssl_mutation_driver`, `?string $ssl_mutation_environment`, `?string $ssl_next_attempt_at`, `int $ssl_transient_count`.
+  - `PostDomain\Mapping\Mapping` — readonly, with `int $id`, `string $host`, `?int $alias_of`, `?int $post_id`, `int $revision`, `VerificationState $verification_state`, `ActivationState $activation_state`, `SslState $ssl_state`, `?string $integrity_error`, `string $challenge`, `string $challenge_label`, `?OwnershipOrigin $ssl_ownership_origin`, `?string $ssl_owner_installation_id`, `?string $ssl_provider`, `?string $ssl_provider_environment`, `?string $ssl_ref`, `?string $ssl_method`, `?string $ssl_mutation_token`, `?MutationKind $ssl_mutation_kind`, `?MutationPhase $ssl_mutation_phase`, `?string $ssl_mutation_expires_at`, `?string $ssl_mutation_driver`, `?string $ssl_mutation_environment`, `?string $ssl_next_attempt_at`, `int $ssl_transient_count`.
 
   `ssl_next_attempt_at` and `ssl_transient_count` are **readable but not
   writable through `save()`** — they are scheduling state owned by the
@@ -777,6 +778,7 @@ final class Mapping {
 		public readonly ?OwnershipOrigin $ssl_ownership_origin = null,
 		public readonly ?string $ssl_owner_installation_id = null,
 		public readonly ?string $ssl_provider = null,
+		public readonly ?string $ssl_provider_environment = null,
 		public readonly ?string $ssl_ref = null,
 		public readonly ?string $ssl_method = null,
 		public readonly ?string $ssl_mutation_token = null,
@@ -808,6 +810,7 @@ final class Mapping {
 			null === $row['ssl_ownership_origin'] ? null : OwnershipOrigin::from( (string) $row['ssl_ownership_origin'] ),
 			$row['ssl_owner_installation_id'],
 			$row['ssl_provider'],
+			$row['ssl_provider_environment'],
 			$row['ssl_ref'],
 			$row['ssl_method'],
 			$row['ssl_mutation_token'],
@@ -1128,9 +1131,74 @@ final class RepositoryWriteTest extends WP_UnitTestCase {
 				0, 'example.test', null, 42, 1,
 				VerificationState::UNVERIFIED, ActivationState::INACTIVE, SslState::NONE,
 				null, str_repeat( 'h', 32 ), '_post-domain-challenge',
-				\PostDomain\Mapping\OwnershipOrigin::CREATED, null, 'cloudflare-saas', 'ref-1'
+				\PostDomain\Mapping\OwnershipOrigin::CREATED, null, 'cloudflare-saas', 'cf-zone:a', 'ref-1'
 			)
 		);
+	}
+
+	public function test_a_bound_resource_without_its_environment_is_rejected(): void {
+		// Otherwise an ordinary read falls back to current configuration and can
+		// ask the wrong account about somebody else's certificate.
+		$this->expectException( InvalidMapping::class );
+		$this->repo->save(
+			new Mapping(
+				0, 'example.test', null, 42, 1,
+				VerificationState::UNVERIFIED, ActivationState::INACTIVE, SslState::NONE,
+				null, str_repeat( 'j', 32 ), '_post-domain-challenge',
+				\PostDomain\Mapping\OwnershipOrigin::CREATED, 'install-a', 'cloudflare-saas', null, 'ref-1'
+			)
+		);
+	}
+
+	public function test_an_environment_without_a_bound_resource_is_rejected(): void {
+		$this->expectException( InvalidMapping::class );
+		$this->repo->save(
+			new Mapping(
+				0, 'example.test', null, 42, 1,
+				VerificationState::UNVERIFIED, ActivationState::INACTIVE, SslState::NONE,
+				null, str_repeat( 'k', 32 ), '_post-domain-challenge',
+				null, null, 'cloudflare-saas', 'cf-zone:a', null
+			)
+		);
+	}
+
+	public function test_saving_writes_every_column_it_claims_to(): void {
+		// A prepared statement whose values drift from its columns fails silently
+		// in the direction of writing the wrong thing, so the round trip is the
+		// assertion: everything set comes back.
+		$saved = $this->repo->save(
+			new Mapping(
+				0, 'roundtrip.test', null, 42, 1,
+				VerificationState::UNVERIFIED, ActivationState::INACTIVE, SslState::ACTIVE,
+				null, str_repeat( 'm', 32 ), '_pd',
+				\PostDomain\Mapping\OwnershipOrigin::ADOPTED, 'install-z',
+				'cloudflare-saas', 'cf-zone:z', 'ref-z', 'http'
+			)
+		);
+
+		$after = $this->repo->by_id( $saved->id );
+
+		$this->assertSame( 'roundtrip.test', $after?->host );
+		$this->assertSame( \PostDomain\Mapping\OwnershipOrigin::ADOPTED, $after?->ssl_ownership_origin );
+		$this->assertSame( 'install-z', $after?->ssl_owner_installation_id );
+		$this->assertSame( 'cloudflare-saas', $after?->ssl_provider );
+		$this->assertSame( 'cf-zone:z', $after?->ssl_provider_environment );
+		$this->assertSame( 'ref-z', $after?->ssl_ref );
+		$this->assertSame( 'http', $after?->ssl_method );
+		$this->assertSame( SslState::ACTIVE, $after?->ssl_state );
+	}
+
+	public function test_a_bound_resource_with_its_environment_is_accepted(): void {
+		$saved = $this->repo->save(
+			new Mapping(
+				0, 'example.test', null, 42, 1,
+				VerificationState::UNVERIFIED, ActivationState::INACTIVE, SslState::NONE,
+				null, str_repeat( 'l', 32 ), '_post-domain-challenge',
+				\PostDomain\Mapping\OwnershipOrigin::CREATED, 'install-a', 'cloudflare-saas', 'cf-zone:a', 'ref-1'
+			)
+		);
+
+		$this->assertSame( 'cf-zone:a', $this->repo->by_id( $saved->id )?->ssl_provider_environment );
 	}
 
 	public function test_an_illegal_state_transition_is_rejected(): void {
@@ -1179,6 +1247,8 @@ final class StaleRevision extends \RuntimeException {}
 
 Replace `DbRepository::save()` with:
 
+<!-- covered-by: RepositoryWriteTest, InvariantTest -->
+
 ```php
 	public function save( Mapping $m ): Mapping {
 		global $wpdb;
@@ -1201,6 +1271,7 @@ Replace `DbRepository::save()` with:
 			'ssl_ownership_origin'      => $m->ssl_ownership_origin?->value,
 			'ssl_owner_installation_id' => $m->ssl_owner_installation_id,
 			'ssl_provider'              => $m->ssl_provider,
+			'ssl_provider_environment'  => $m->ssl_provider_environment,
 			'ssl_ref'                   => $m->ssl_ref,
 			'ssl_method'                => $m->ssl_method,
 			'ssl_mutation_token'        => $m->ssl_mutation_token,
@@ -1305,6 +1376,14 @@ Replace `DbRepository::save()` with:
 			throw new InvalidMapping( 'The six lease columns move together.' );
 		}
 
+		// A bound resource must say which environment it lives in, and an unbound
+		// one must not claim an environment it has no resource in. Without this,
+		// an ordinary read would fall back to current configuration and could ask
+		// the wrong account about somebody else's certificate (spec §12.6).
+		if ( ( null === $m->ssl_ref ) !== ( null === $m->ssl_provider_environment ) ) {
+			throw new InvalidMapping( 'A bound provider resource carries its provider environment, and only a bound one does.' );
+		}
+
 		$owned = array(
 			null !== $m->ssl_ownership_origin,
 			null !== $m->ssl_owner_installation_id,
@@ -1393,8 +1472,10 @@ until that owner commits, so calling it committed would be false (spec §12.3).
 callers need different answers to them.** A CAS that lost means another owner has
 the row — discard and move on. A transaction that could not be started and an
 event that could not be inserted both mean the write definitely did not land. A
-`COMMIT` that was not confirmed means **nobody here knows** whether it landed, so
-the only honest next step is to re-read. Collapsing these into `false` would let a
+`COMMIT` that was not confirmed means **nobody here knows** whether it landed —
+and this connection cannot find out, because while the transaction is unresolved
+it sees its own uncommitted writes. The only honest next step is to claim nothing
+and let a later pass decide. Collapsing these into `false` would let a
 caller report a fenced worker, a failed database write, and an unknown outcome
 identically, which is exactly the confusion the fencing rules exist to prevent. `START TRANSACTION`, `COMMIT`, and `ROLLBACK` results are
 therefore checked rather than assumed, and a transition never begins when the
@@ -1706,7 +1787,11 @@ final class AtomicTransition {
 				// committed. No rollback is attempted, because rolling back a
 				// transaction that already committed is meaningless and rolling
 				// back one that did not is what the connection will do anyway.
-				// The caller re-reads; recovery and reconciliation settle the rest.
+				//
+				// Callers must NOT re-read this connection to decide what happened:
+				// while the transaction is unresolved it shows them their own
+				// uncommitted writes. A later request, cron pass, or reconciliation
+				// — each with its own committed view — is what settles it.
 				return new TransitionResult( TransitionOutcome::COMMIT_UNCERTAIN, 'COMMIT was not confirmed; the outcome is unknown' );
 			}
 
@@ -1757,8 +1842,10 @@ enum TransitionOutcome: string {
 
 	/**
 	 * The commit was not confirmed, or a rollback failed. The transition may or
-	 * may not have landed and this process cannot tell. Never success, never
-	 * fencing, and never a reason to repeat a provider call: re-read instead.
+	 * may not have landed and this process cannot tell — and cannot find out by
+	 * reading its own connection, which may be showing it its own uncommitted
+	 * work. Never success, never fencing, and never a reason to repeat a provider
+	 * call. A later pass, on a connection with a committed view, decides.
 	 */
 	case COMMIT_UNCERTAIN = 'commit_uncertain';
 }
@@ -2350,6 +2437,8 @@ final class AliasResolver {
 ```
 
 Replace `DbRepository::delete()` with:
+
+<!-- covered-by: AliasTest -->
 
 ```php
 	public function delete( int $id ): void {

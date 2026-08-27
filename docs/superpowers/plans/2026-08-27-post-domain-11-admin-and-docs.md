@@ -417,6 +417,8 @@ Expected: PASS — 6 tests
 
 Append to `tests/integration/Admin/AdminScreensTest.php`:
 
+<!-- covered-by: AdminScreensTest -->
+
 ```php
 	public function test_the_selection_offers_only_registered_drivers(): void {
 		\PostDomain\Ssl\DriverFactory::reset();
@@ -945,6 +947,7 @@ final class DiagnosticsTest extends WP_UnitTestCase {
 				'ssl_driver',
 				'long_recoveries',
 				'blocked_recoveries',
+				'drifted_resources',
 			) as $key
 		) {
 			$this->assertArrayHasKey( $key, $checks, "missing diagnostic {$key}" );
@@ -1004,6 +1007,36 @@ final class DiagnosticsTest extends WP_UnitTestCase {
 
 		$this->assertSame( 'error', $check['status'] );
 		$this->assertStringContainsString( 'orphaned.test', $check['detail'] );
+		$this->assertStringContainsString( 'cf-zone:the-old-zone', $check['detail'] );
+	}
+
+	public function test_a_certificate_in_an_unconfigured_environment_is_surfaced(): void {
+		global $wpdb;
+
+		$mapping = ( new DbRepository() )->save(
+			new Mapping(
+				0, 'moved.test', null, self::factory()->post->create(), 1,
+				VerificationState::VERIFIED, ActivationState::ACTIVE, SslState::ACTIVE,
+				null, str_repeat( 'd', 32 ), '_post-domain-challenge'
+			)
+		);
+
+		$wpdb->update( // phpcs:ignore WordPress.DB
+			Schema::domains_table(),
+			array(
+				'ssl_provider'             => 'cloudflare-saas',
+				'ssl_provider_environment' => 'cf-zone:the-old-zone',
+				'ssl_ref'                  => 'ref-1',
+			),
+			array( 'id' => $mapping->id )
+		);
+
+		\PostDomain\Ssl\DriverFactory::reset();
+
+		$check = Diagnostics::checks()['drifted_resources'];
+
+		$this->assertSame( 'warning', $check['status'] );
+		$this->assertStringContainsString( 'moved.test', $check['detail'] );
 		$this->assertStringContainsString( 'cf-zone:the-old-zone', $check['detail'] );
 	}
 
@@ -1330,7 +1363,44 @@ final class Diagnostics {
 			'ssl_driver'           => self::ssl_driver(),
 			'long_recoveries'      => self::long_recoveries(),
 			'blocked_recoveries'   => self::blocked_recoveries(),
+			'drifted_resources'    => self::drifted_resources(),
 		);
+	}
+
+	/**
+	 * Certificates that exist in an account this site is no longer pointed at.
+	 * They are not fenced and nothing is wrong with them — they simply cannot be
+	 * read or changed from here, and their last known state is now frozen.
+	 *
+	 * @return array{status: string, detail: string}
+	 */
+	private static function drifted_resources(): array {
+		$drifted = array();
+
+		foreach ( ( new DbRepository() )->all() as $mapping ) {
+			if ( null === $mapping->ssl_ref ) {
+				continue;
+			}
+
+			$driver = \PostDomain\Ssl\BoundResource::driver_for( $mapping );
+
+			if ( ! $driver instanceof \PostDomain\Ssl\DriverUnavailable ) {
+				continue;
+			}
+
+			$drifted[] = sprintf(
+				'%s: certificate lives in "%s" (%s)',
+				$mapping->host,
+				(string) $mapping->ssl_provider_environment,
+				$driver->reason
+			);
+		}
+
+		if ( array() === $drifted ) {
+			return array( 'status' => 'ok', 'detail' => __( 'Every bound certificate is readable from the configured provider.', 'post-domain' ) );
+		}
+
+		return array( 'status' => 'warning', 'detail' => implode( '; ', $drifted ) );
 	}
 
 	/**
@@ -1624,7 +1694,7 @@ final class Diagnostics {
 - [ ] **Step 4: Run the test to verify it passes**
 
 Run: `composer test:integration -- --filter DiagnosticsTest`
-Expected: PASS — 13 tests
+Expected: PASS — 14 tests
 
 - [ ] **Step 5: Commit**
 
@@ -1693,6 +1763,7 @@ final class ReadmeTest extends TestCase {
 			'no silent no-op'     => array( 'pd_ssl_not_configured' ),
 			'event atomicity'     => array( 'pd_schema_engine' ),
 			'provider binding'    => array( 'environment' ),
+			'resource binding'    => array( 'does not move because the plugin was repointed' ),
 			'dcv default'         => array( 'txt' ),
 			'apex entitlement'    => array( 'BYOIP' ),
 			'dns neutrality'      => array( 'authoritative DNS' ),
@@ -1802,11 +1873,17 @@ below is required; the test above pins the phrases that must appear.
     queries nothing and says which driver and environment to restore. Restore it
     and recovery resumes; the identity shown is a zone or account name, never a
     credential.
+24. **Changing provider configuration after provisioning** — a certificate does not
+    move because the plugin was repointed. Each bound mapping records the
+    environment its resource lives in, and while the configured driver points
+    somewhere else the plugin reads nothing about it, changes nothing, and freezes
+    the last known state rather than adopting an answer from an account that has
+    never heard of it. Diagnostics lists every such certificate.
 
 - [ ] **Step 4: Run the test to verify it passes**
 
 Run: `vendor/bin/phpunit --testsuite unit --filter ReadmeTest`
-Expected: PASS — 27 tests
+Expected: PASS — 28 tests
 
 - [ ] **Step 5: Commit**
 
@@ -2053,7 +2130,8 @@ composer lint && composer analyse && composer test && composer test:integration
 Plus: `ReadmeTest` passes for every required topic, `DiagnosticsTest` proves no
 server-side probe exists, that both an unselected and an unregistered SSL driver
 are surfaced, that a recovery blocked on configuration names the driver and
-environment to restore, and that no credential appears in any check, `AdminScreensTest` proves the driver selection offers only
+environment to restore, that a certificate bound to an unconfigured environment is
+listed rather than silently unreadable, and that no credential appears in any check, `AdminScreensTest` proves the driver selection offers only
 registered drivers and resets the memoized registry on save, and `AcceptanceTest`
 passes end to end.
 

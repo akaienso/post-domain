@@ -1817,7 +1817,7 @@ final class CloudflareSaasDriverTest extends WP_UnitTestCase {
 
 	private function context( ?string $ref = null ): SslResourceContext {
 		return new SslResourceContext(
-			12, 'mapped.test', 'install-a', 'cloudflare-saas', $ref, null, null,
+			12, 'mapped.test', 'install-a', 'cloudflare-saas', null === $ref ? null : 'cf-zone:zone-1', $ref, null, null,
 			'_post-domain-challenge.mapped.test', 'post-domain-verify=abc', 3, str_repeat( '1', 32 ), 'txt'
 		);
 	}
@@ -2497,8 +2497,11 @@ use PostDomain\Mapping\DbRepository;
 use PostDomain\Mapping\Mapping;
 use PostDomain\Mapping\SslState;
 use PostDomain\Mapping\VerificationState;
+use PostDomain\Mapping\OwnershipOrigin;
+use PostDomain\Ssl\BoundResource;
 use PostDomain\Ssl\CloudflareSaasDriver;
 use PostDomain\Ssl\Credentials;
+use PostDomain\Ssl\Environment;
 use PostDomain\Ssl\DriverFactory;
 use PostDomain\Ssl\DriverUnavailable;
 use PostDomain\Support\Schema;
@@ -2625,6 +2628,31 @@ final class CloudflareRegistrationTest extends WP_UnitTestCase {
 		$this->assertNotSame( $first, $second, 'recovery has to be able to tell these apart' );
 	}
 
+	public function test_a_provisioned_mapping_records_the_zone_it_lives_in(): void {
+		$this->configure();
+
+		// A resource bound in zone-1 stays readable only while zone-1 is configured.
+		$bound = $this->repo->save(
+			new Mapping(
+				0, 'bound.test', null, self::factory()->post->create(), 1,
+				VerificationState::VERIFIED, ActivationState::ACTIVE, SslState::ACTIVE,
+				null, str_repeat( 'b', 32 ), '_post-domain-challenge',
+				OwnershipOrigin::CREATED, Environment::installation_id(),
+				'cloudflare-saas', 'cf-zone:zone-1', 'ref-1'
+			)
+		);
+
+		$this->assertInstanceOf( CloudflareSaasDriver::class, BoundResource::driver_for( $bound ) );
+
+		$this->configure( array( 'zone_id' => 'zone-2' ) );
+
+		$refusal = BoundResource::driver_for( $this->repo->by_id( $bound->id ) );
+
+		$this->assertInstanceOf( DriverUnavailable::class, $refusal );
+		$this->assertSame( 'provider_environment_changed', $refusal->reason );
+		$this->assertSame( 'cf-zone:zone-1', $refusal->driver_id, 'the refusal names what to restore' );
+	}
+
 	public function test_rest_and_cron_resolve_the_same_driver_instance(): void {
 		$this->configure();
 
@@ -2687,7 +2715,7 @@ Replace `DriverFactory::built_in_drivers()` with:
 - [ ] **Step 4: Run the test to verify it passes**
 
 Run: `composer test:integration -- --filter CloudflareRegistrationTest`
-Expected: PASS — 11 tests (including the three missing-credential cases)
+Expected: PASS — 12 tests (including the three missing-credential cases)
 
 - [ ] **Step 5: Run the full suite**
 

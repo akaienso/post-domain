@@ -31,9 +31,13 @@ Inherit Plans 01–07, and add:
   same fact as a mutation that took effect.
 - **Only `CAS_LOST` is fencing.** A transaction that could not start, an event
   that could not be written, and a `COMMIT` that was not confirmed are database
-  failures, not another worker. They are reported as their own outcome, they never
-  re-issue a provider call, and where the local state is genuinely unknown the row
-  is **re-read** rather than assumed.
+  failures, not another worker. They are reported as their own outcome and they
+  never re-issue a provider call.
+- **An unconfirmed `COMMIT` is never resolved from the same connection.** If the
+  transaction is still open, that connection sees its own uncommitted writes — a
+  deleted row looks gone and may still roll back. A re-read there is diagnostic at
+  most. Nothing reports success, and a later request, cron pass, recovery pass, or
+  reconciliation — with its own committed view — settles what actually happened.
 - **Every service returns `MutationResult`** (Plan 07 Task 4), which carries an
   `SslStatus` only for `COMMITTED`. `FENCED` and `CONFIRMED_NOT_PERSISTED` are
   told apart by re-reading the row: a replaced token or a `RECOVERING` phase
@@ -45,6 +49,14 @@ Inherit Plans 01–07, and add:
   before the CAS that establishes it.
 - **Drivers come from `DriverFactory`** and nowhere else, so REST, cron,
   reconciliation, and recovery cannot disagree about which driver owns a row.
+- **Anything touching an already-bound resource resolves through
+  `BoundResource::driver_for()`**, which additionally proves the driver is still
+  pointed at the environment the resource lives in. A drifted binding produces
+  zero provider reads and zero provider mutations, and changes no local state.
+- **A successful create or adoption promotes the lease's environment** into
+  `ssl_provider_environment` in the same CAS that writes `ssl_provider` and
+  `ssl_ref` — including a recovered one, which promotes the lease binding rather
+  than anything read from current configuration.
 - **Every CAS result is checked.** A zero-row write is never counted, reported,
   or logged as though it had happened.
 - **Adoption is never automatic** (spec §14.7).
@@ -104,7 +116,7 @@ final class CreateRecoveryTest extends TestCase {
 
 	private function context( ?string $ref = null ): SslResourceContext {
 		return new SslResourceContext(
-			12, 'mapped.test', 'install-a', 'test-driver', $ref, null, null,
+			12, 'mapped.test', 'install-a', 'test-driver', null === $ref ? null : 'test-driver:default', $ref, null, null,
 			'_post-domain-challenge.mapped.test', 'post-domain-verify=abc', 'abc', 3
 		);
 	}
@@ -382,7 +394,7 @@ final class CreateServiceTest extends WP_UnitTestCase {
 				0, 'mapped.test', null, self::factory()->post->create(), 1,
 				VerificationState::VERIFIED, ActivationState::ACTIVE, SslState::NONE,
 				null, str_repeat( 'a', 32 ), '_post-domain-challenge',
-				null, null, 'recording', null
+				null, null, 'recording', null, null
 			)
 		);
 	}
@@ -563,6 +575,31 @@ final class CreateServiceTest extends WP_UnitTestCase {
 
 		$this->assertNull( $result->status );
 		$this->assertFalse( $result->succeeded() );
+	}
+
+	public function test_a_successful_create_records_where_the_resource_lives(): void {
+		$m = $this->mapping();
+
+		CreateService::for_tests( RecordingDriver::succeeding( 'ref-1' ), $this->proof( DnsOutcome::MATCH ) )
+			->provision( $m );
+
+		$after = $this->repo->by_id( $m->id );
+
+		$this->assertSame(
+			'recording:default',
+			$after?->ssl_provider_environment,
+			'promoted from the lease, in the same CAS as the reference'
+		);
+		$this->assertNull( $after?->ssl_mutation_environment, 'the mutation binding is over' );
+	}
+
+	public function test_a_recovered_create_promotes_the_lease_environment(): void {
+		$m = $this->mapping();
+
+		CreateService::for_tests( RecordingDriver::ambiguous_then_marked( 'ref-9' ), $this->proof( DnsOutcome::MATCH ) )
+			->provision( $m );
+
+		$this->assertSame( 'recording:default', $this->repo->by_id( $m->id )?->ssl_provider_environment );
 	}
 
 	public function test_a_fenced_worker_writes_nothing(): void {
@@ -820,10 +857,13 @@ final class CreateService {
 			return $this->apply(
 				$authorized,
 				$gated,
+				// The environment is promoted from the lease, never re-read from
+				// configuration: this resource lives where the request went.
 				LeaseOutcome::bound(
 					$status->state,
 					$status->ref,
-					$authorized['driver']->id(),
+					$authorized['lease']->driver,
+					$authorized['lease']->environment,
 					OwnershipOrigin::CREATED,
 					$authorized['context']->installation_id
 				),
@@ -840,7 +880,8 @@ final class CreateService {
 			CreateRecovery::BIND           => LeaseOutcome::bound(
 				SslState::REQUESTED,
 				(string) $identity->observed_ref,
-				$authorized['driver']->id(),
+				$authorized['lease']->driver,
+				$authorized['lease']->environment,
 				OwnershipOrigin::CREATED,
 				$authorized['context']->installation_id
 			),
@@ -915,7 +956,7 @@ final class CreateService {
 - [ ] **Step 4: Run the test to verify it passes**
 
 Run: `composer test:integration -- --filter CreateServiceTest`
-Expected: PASS — 17 tests
+Expected: PASS — 19 tests
 
 - [ ] **Step 5: Commit**
 
@@ -1000,7 +1041,7 @@ final class AdoptionTest extends WP_UnitTestCase {
 				0, 'mapped.test', null, self::factory()->post->create(), 1,
 				VerificationState::VERIFIED, ActivationState::ACTIVE, SslState::FAILED,
 				null, str_repeat( 'a', 32 ), '_post-domain-challenge',
-				null, null, 'recording', null
+				null, null, 'recording', null, null
 			)
 		);
 	}
@@ -1116,6 +1157,17 @@ final class AdoptionTest extends WP_UnitTestCase {
 		);
 
 		remove_all_actions( 'pd_test_after_provider_call' );
+	}
+
+	public function test_a_successful_adoption_records_where_the_resource_lives(): void {
+		$m = $this->mapping();
+
+		AdoptionService::for_tests(
+			RecordingDriver::ambiguous_then_unmarked( 'ref-9' ),
+			$this->proof( DnsOutcome::MATCH )
+		)->take_ownership( $m, array( 'confirm' => true ) );
+
+		$this->assertSame( 'recording:default', $this->repo->by_id( $m->id )?->ssl_provider_environment );
 	}
 
 	public function test_provisioning_never_adopts(): void {
@@ -1334,7 +1386,8 @@ final class AdoptionService {
 				LeaseOutcome::adopted(
 					$status->state,
 					$authorized['observed_ref'],
-					$authorized['driver']->id(),
+					$authorized['lease']->driver,
+					$authorized['lease']->environment,
 					$authorized['context']->installation_id,
 					get_current_user_id()
 				)
@@ -1366,7 +1419,7 @@ final class AdoptionService {
 - [ ] **Step 4: Run the test to verify it passes**
 
 Run: `composer test:integration -- --filter AdoptionTest`
-Expected: PASS — 8 tests
+Expected: PASS — 9 tests
 
 - [ ] **Step 5: Commit**
 
@@ -1491,6 +1544,34 @@ final class MethodChangeTest extends WP_UnitTestCase {
 			$this->repo->by_id( $m->id )?->ssl_method,
 			'local state follows the provider, not the request'
 		);
+	}
+
+	public function test_a_method_change_against_a_drifted_environment_sends_nothing(): void {
+		$driver = RecordingDriver::confirming_method( 'http' )->in_environment( 'recording:somewhere-else' );
+		$m      = $this->mapping();
+
+		$result = MethodChangeService::for_tests( $driver, $this->proof( DnsOutcome::MATCH ) )->change( $m, 'http' );
+
+		$this->assertSame( MutationDisposition::REFUSED, $result->disposition );
+		$this->assertSame( 'provider_environment_changed', $result->refusal?->precondition );
+		$this->assertSame( 0, $driver->method_calls );
+		$this->assertSame( 'txt', $this->repo->by_id( $m->id )?->ssl_method );
+	}
+
+	public function test_a_method_change_resumes_once_the_environment_is_restored(): void {
+		$m = $this->mapping();
+
+		MethodChangeService::for_tests(
+			RecordingDriver::confirming_method( 'http' )->in_environment( 'recording:somewhere-else' ),
+			$this->proof( DnsOutcome::MATCH )
+		)->change( $m, 'http' );
+
+		remove_all_filters( 'pd_ssl_drivers' );
+
+		MethodChangeService::for_tests( RecordingDriver::confirming_method( 'http' ), $this->proof( DnsOutcome::MATCH ) )
+			->change( $this->repo->by_id( $m->id ), 'http' );
+
+		$this->assertSame( 'http', $this->repo->by_id( $m->id )?->ssl_method );
 	}
 
 	public function test_an_unsupported_method_is_refused_without_calling_the_provider(): void {
@@ -1814,7 +1895,7 @@ final class MethodChangeService {
 - [ ] **Step 4: Run the test to verify it passes**
 
 Run: `composer test:integration -- --filter MethodChangeTest`
-Expected: PASS — 9 tests
+Expected: PASS — 11 tests
 
 - [ ] **Step 5: Commit**
 
@@ -1838,7 +1919,7 @@ leaves ssl_method exactly as it was, and a fenced worker persists nothing."
 - Consumes: `DeletionAuthorizer`, `MutationGate`, `MutationLease` (Plan 07), `MappingRepository` (Plan 02).
 - Produces:
   - `DeletionService::request( Mapping $m ): bool` — a CAS write on the expected revision that stops serving and, when a provider resource exists, moves to `pending_removal`; when none exists it takes a `RESERVED` lease and deletes under it.
-  - `DeletionService::process( Mapping $m ): string` — `removed`, `pending`, `transient`, `failed`, `refused`, `fenced`, or `deferred`. `deferred` means the local write could not be established: the provider is not called again, the row is re-read, and the next pass decides. After an unconfirmed `COMMIT` the re-read is what distinguishes a row that is already gone from one that is not.
+  - `DeletionService::process( Mapping $m ): string` — `removed`, `pending`, `transient`, `failed`, `refused`, `fenced`, or `deferred`. `deferred` means the local outcome could not be **established**: the provider is not called again and no success is claimed. It covers an unconfirmed `COMMIT` in particular, where this connection may be looking at its own uncommitted delete and so cannot tell whether the row survived; a later request or cron pass, on a connection with its own committed view, settles it.
   - `ForceLocalDelete::run( Mapping $m ): bool`.
 
 Every deletion path is fenced by the exact lease. A failed finalize means the
@@ -1905,7 +1986,7 @@ final class DeletionServiceTest extends WP_UnitTestCase {
 				0, 'mapped.test', null, self::factory()->post->create(), 1,
 				VerificationState::VERIFIED, ActivationState::ACTIVE, SslState::ACTIVE,
 				null, str_repeat( 'a', 32 ), '_post-domain-challenge',
-				OwnershipOrigin::CREATED, Environment::installation_id(), 'recording', 'ref-1'
+				OwnershipOrigin::CREATED, Environment::installation_id(), 'recording', 'recording:default', 'ref-1'
 			)
 		);
 	}
@@ -2008,26 +2089,67 @@ final class DeletionServiceTest extends WP_UnitTestCase {
 		$this->assertNotNull( $this->repo->by_id( $m->id ) );
 	}
 
-	public function test_an_unconfirmed_commit_reports_the_state_it_re_reads_not_a_guess(): void {
+	public function test_an_unconfirmed_commit_never_reports_removed_even_when_the_row_looks_gone(): void {
 		$m       = $this->owned();
 		$service = DeletionService::for_tests( RecordingDriver::removing( RemovalOutcome::REMOVED ), $this->proof( DnsOutcome::MATCH ) );
 
 		$service->request( $m );
 
-		// The delete lands, but the client never sees the COMMIT succeed.
+		// The delete runs and the transaction stays open, so THIS connection sees
+		// its own uncommitted delete: the row looks gone and may still roll back.
 		add_filter( 'query', $fail = static fn( string $q ): string => 'COMMIT' === $q ? 'SELECT bad_syntax FROM' : $q );
 
 		$outcome = $service->process( $this->repo->by_id( $m->id ) );
+		$looks   = $this->repo->by_id( $m->id );
 
 		remove_filter( 'query', $fail );
 
-		// Whichever way the server went, the answer is a re-read, never a claim.
-		$this->assertContains( $outcome, array( 'removed', 'deferred' ) );
 		$this->assertSame(
-			null === $this->repo->by_id( $m->id ) ? 'removed' : 'deferred',
+			'deferred',
 			$outcome,
-			'the report must match what the row actually says now'
+			'a same-connection view of an unresolved transaction is not proof of anything'
 		);
+		$this->assertNull( $looks, 'the row does appear gone from here — which is exactly the trap' );
+	}
+
+	public function test_a_rollback_after_an_unconfirmed_commit_restores_the_row(): void {
+		global $wpdb;
+
+		$m       = $this->owned();
+		$service = DeletionService::for_tests( RecordingDriver::removing( RemovalOutcome::REMOVED ), $this->proof( DnsOutcome::MATCH ) );
+
+		$service->request( $m );
+
+		add_filter( 'query', $fail = static fn( string $q ): string => 'COMMIT' === $q ? 'SELECT bad_syntax FROM' : $q );
+		$outcome = $service->process( $this->repo->by_id( $m->id ) );
+		remove_filter( 'query', $fail );
+
+		$wpdb->query( 'ROLLBACK' ); // phpcs:ignore WordPress.DB
+
+		$this->assertSame( 'deferred', $outcome );
+		$this->assertNotNull(
+			$this->repo->by_id( $m->id ),
+			'reporting removed would have been a lie about a row that came back'
+		);
+	}
+
+	public function test_a_commit_that_actually_succeeded_is_settled_by_a_later_pass(): void {
+		global $wpdb;
+
+		$m       = $this->owned();
+		$service = DeletionService::for_tests( RecordingDriver::removing( RemovalOutcome::REMOVED ), $this->proof( DnsOutcome::MATCH ) );
+
+		$service->request( $m );
+
+		add_filter( 'query', $fail = static fn( string $q ): string => 'COMMIT' === $q ? 'SELECT bad_syntax FROM' : $q );
+		$outcome = $service->process( $this->repo->by_id( $m->id ) );
+		remove_filter( 'query', $fail );
+
+		// The server did apply it; a later request commits what is outstanding.
+		$wpdb->query( 'COMMIT' ); // phpcs:ignore WordPress.DB
+
+		$this->assertSame( 'deferred', $outcome, 'still no success claimed at the time' );
+		$this->assertNull( $this->repo->by_id( $m->id ), 'and the next pass simply finds nothing to do' );
 	}
 
 	public function test_an_unconfirmed_commit_never_re_issues_the_provider_deletion(): void {
@@ -2042,6 +2164,18 @@ final class DeletionServiceTest extends WP_UnitTestCase {
 		remove_filter( 'query', $fail );
 
 		$this->assertSame( 1, $driver->remove_calls, 'the provider already confirmed; asking again proves nothing' );
+	}
+
+	public function test_a_deletion_against_a_drifted_environment_sends_nothing(): void {
+		$driver  = RecordingDriver::removing( RemovalOutcome::REMOVED )->in_environment( 'recording:somewhere-else' );
+		$m       = $this->owned();
+		$service = DeletionService::for_tests( $driver, $this->proof( DnsOutcome::MATCH ) );
+
+		$service->request( $m );
+
+		$this->assertSame( 'refused', $service->process( $this->repo->by_id( $m->id ) ) );
+		$this->assertSame( 0, $driver->remove_calls, 'zone B has no certificate of ours to delete' );
+		$this->assertNotNull( $this->repo->by_id( $m->id ) );
 	}
 
 	public function test_a_fenced_worker_does_not_hard_delete(): void {
@@ -2258,9 +2392,10 @@ final class ForceLocalDelete {
 			)
 		);
 
+		// committed() alone is enough here for the same reason as the local delete:
+		// every non-committed outcome means this caller cannot claim the row is
+		// gone, and the response to all of them is identical.
 		if ( ! $deleted->committed() ) {
-			// Either cause means the row is still here. The release is itself
-			// owner-pinned, so it is a no-op if the lease is no longer ours.
 			$lease->release_reserved( $held );
 
 			return false;
@@ -2415,11 +2550,14 @@ final class DeletionService {
 				return 'fenced';
 			}
 
-			// An unconfirmed COMMIT leaves two possibilities and no way to choose
-			// between them from here: the row may be gone, or it may not. Re-read
-			// rather than assume, and never re-issue the provider deletion — the
-			// provider already confirmed the resource is gone.
-			return null === $this->repo->by_id( $mapping->id ) ? 'removed' : 'deferred';
+			// An unconfirmed COMMIT cannot be settled from this connection. If the
+			// transaction is still open, this connection sees its OWN uncommitted
+			// delete: the row looks gone and may still roll back. A re-read here is
+			// therefore diagnostic at most, never proof of durability. Report
+			// nothing, re-issue nothing — the provider already confirmed removal —
+			// and let a later pass, whose connection has its own committed view,
+			// decide whether the row survived.
+			return 'deferred';
 		}
 
 		$outcome = RemovalOutcome::FAILED === $result->outcome
@@ -2478,9 +2616,14 @@ final class DeletionService {
 			)
 		);
 
+		// committed() alone is enough here, and only here, because every
+		// non-committed outcome has the same externally safe behaviour: no row was
+		// deleted that this caller can rely on, so it reports failure and releases
+		// its own reservation. Nothing distinguishes a lost CAS from a database
+		// failure in what the caller must then do.
 		if ( ! $deleted->committed() ) {
-			// Either cause means the row is still here. The release is itself
-			// owner-pinned, so it is a no-op if the lease is no longer ours.
+			// The release is itself owner-pinned, so it is a no-op if the lease is
+			// no longer ours.
 			$this->lease->release_reserved( $held );
 		}
 
@@ -2523,7 +2666,7 @@ final class DeletionService {
 - [ ] **Step 4: Run the test to verify it passes**
 
 Run: `composer test:integration -- --filter DeletionServiceTest`
-Expected: PASS — 28 tests (including the two six-case lease-state providers)
+Expected: PASS — 31 tests (including the two six-case lease-state providers)
 
 - [ ] **Step 5: Commit**
 
@@ -2543,13 +2686,13 @@ resource still takes a lease before deleting, and a fenced worker returns
 **Files:**
 - Create: `src/Ssl/DriverRecoveryResolver.php`, `src/Ssl/Reconciler.php`
 - Modify: `src/Plugin.php`
-- Test: `tests/integration/Ssl/DriverRecoveryResolverTest.php`, `tests/integration/Ssl/ReconcilerTest.php`
+- Test: `tests/integration/Ssl/DriverRecoveryResolverTest.php`, `tests/integration/Ssl/ReconcilerTest.php`, `tests/integration/Ssl/SweepTest.php`
 
 **Interfaces:**
 - Consumes: `RecoveryResolver`, `LeaseRecovery`, `CreateRecovery`, `DriverFactory` (Plan 07); `AtomicTransition` (Plan 02).
 - Produces:
   - `PostDomain\Ssl\DriverRecoveryResolver` implementing `RecoveryResolver`, dispatching by `MutationKind` and resolving its driver through `DriverFactory`.
-  - `PostDomain\Ssl\Reconciler::run( Mapping[] $mappings ): array{updated: int, divergences: int, skipped: int}` — groups mappings by their resolved driver, so a site running more than one provider reconciles correctly.
+  - `PostDomain\Ssl\Reconciler::run( Mapping[] $mappings ): array{updated: int, divergences: int, skipped: int, drifted: int}` — groups mappings by their **bound** driver (via `BoundResource`), so a site running more than one provider reconciles correctly and a row whose environment has drifted is counted and left alone rather than read.
   - `Plugin::sweep_ssl(): void` wiring recovery and reconciliation through the same factory REST uses.
 
 - [ ] **Step 1: Write the failing test**
@@ -2807,6 +2950,7 @@ final class ReconcilerTest extends WP_UnitTestCase {
 
 	/** Installs a driver the way a site would, through the one factory. */
 	private function install( SslDriver $driver ): void {
+
 		add_filter(
 			'pd_ssl_drivers',
 			static function ( array $drivers ) use ( $driver ): array {
@@ -2820,13 +2964,21 @@ final class ReconcilerTest extends WP_UnitTestCase {
 	}
 
 	/** @param array<string, SslStatus> $statuses */
-	private function driver( array $statuses, bool $complete ): SslDriver {
-		return new class( $statuses, $complete ) implements SslDriver {
+	private function driver( array $statuses, bool $complete, string $environment = 'recon:default' ): SslDriver {
+		return new class( $statuses, $complete, $environment ) implements SslDriver {
 			/** @param array<string, SslStatus> $statuses */
-			public function __construct( private readonly array $statuses, private readonly bool $complete ) {}
+			public function __construct(
+				private readonly array $statuses,
+				private readonly bool $complete,
+				private readonly string $environment
+			) {}
 
 			public function id(): string {
 				return 'recon';
+			}
+
+			public function environment_id(): string {
+				return $this->environment;
 			}
 
 			public function capabilities(): DriverCapabilities {
@@ -2884,7 +3036,7 @@ final class ReconcilerTest extends WP_UnitTestCase {
 				0, 'mapped.test', null, self::factory()->post->create(), 1,
 				VerificationState::VERIFIED, ActivationState::ACTIVE, $state,
 				null, str_repeat( 'a', 32 ), '_post-domain-challenge',
-				OwnershipOrigin::CREATED, Environment::installation_id(), 'recon', 'ref-1'
+				OwnershipOrigin::CREATED, Environment::installation_id(), 'recon', 'recon:default', 'ref-1'
 			)
 		);
 
@@ -3031,6 +3183,36 @@ final class ReconcilerTest extends WP_UnitTestCase {
 		);
 	}
 
+	public function test_a_bound_resource_in_another_environment_is_never_read(): void {
+		$m      = $this->mapping( SslState::ACTIVE );
+		$this->install( $this->driver( array( 'mapped.test' => new SslStatus( SslState::FAILED, 'ref-1' ) ), true, 'recon:somewhere-else' ) );
+
+		$result = Reconciler::run( array( $this->repo->by_id( $m->id ) ) );
+
+		$this->assertSame( 0, $result['updated'] );
+		$this->assertSame( 1, $result['drifted'] );
+		$this->assertSame(
+			SslState::ACTIVE,
+			$this->repo->by_id( $m->id )?->ssl_state,
+			'zone B has never heard of this certificate; its answer is evidence about nothing'
+		);
+	}
+
+	public function test_reconciliation_resumes_once_the_environment_is_restored(): void {
+		$m = $this->mapping( SslState::PENDING_VALIDATION );
+
+		$this->install( $this->driver( array(), true, 'recon:somewhere-else' ) );
+		Reconciler::run( array( $this->repo->by_id( $m->id ) ) );
+
+		remove_all_filters( 'pd_ssl_drivers' );
+		$this->install( $this->driver( array( 'mapped.test' => new SslStatus( SslState::ACTIVE, 'ref-1' ) ), true ) );
+
+		$result = Reconciler::run( array( $this->repo->by_id( $m->id ) ) );
+
+		$this->assertSame( 1, $result['updated'] );
+		$this->assertSame( SslState::ACTIVE, $this->repo->by_id( $m->id )?->ssl_state );
+	}
+
 	public function test_a_mapping_whose_driver_is_unavailable_is_skipped(): void {
 		$m = $this->mapping( SslState::PENDING_VALIDATION );
 
@@ -3106,6 +3288,10 @@ final class DriverRecoveryResolver implements RecoveryResolver {
 		string $recovery_token,
 		SslDriver $driver
 	): RecoveryOutcome {
+		// The environment a recovered create or adoption promotes is the one the
+		// lease bound, which is the one this driver was just proven to still be
+		// pointed at. Never the current selection.
+		$environment = (string) $mapping->ssl_mutation_environment;
 		$name = Challenge::record_name( $mapping->challenge_label, $mapping->host );
 
 		if ( null === $name ) {
@@ -3126,8 +3312,8 @@ final class DriverRecoveryResolver implements RecoveryResolver {
 		}
 
 		return match ( $kind ) {
-			MutationKind::CREATE => $this->resolve_create( $identity, $context, $driver ),
-			MutationKind::ADOPT  => $this->resolve_adopt( $identity, $context, $driver ),
+			MutationKind::CREATE => $this->resolve_create( $identity, $context, $driver, $environment ),
+			MutationKind::ADOPT  => $this->resolve_adopt( $identity, $context, $driver, $environment ),
 			MutationKind::METHOD => $this->resolve_method( $driver, $context ),
 			MutationKind::REMOVE => $this->resolve_remove( $identity ),
 		};
@@ -3136,7 +3322,8 @@ final class DriverRecoveryResolver implements RecoveryResolver {
 	private function resolve_create(
 		IdentityResult $identity,
 		SslResourceContext $ctx,
-		SslDriver $driver
+		SslDriver $driver,
+		string $environment
 	): RecoveryOutcome {
 		$decision = CreateRecovery::decide( $identity, $ctx );
 
@@ -3146,6 +3333,7 @@ final class DriverRecoveryResolver implements RecoveryResolver {
 					SslState::REQUESTED,
 					(string) $identity->observed_ref,
 					$driver->id(),
+					$environment,
 					OwnershipOrigin::CREATED,
 					$ctx->installation_id
 				),
@@ -3178,7 +3366,8 @@ final class DriverRecoveryResolver implements RecoveryResolver {
 	private function resolve_adopt(
 		IdentityResult $identity,
 		SslResourceContext $ctx,
-		SslDriver $driver
+		SslDriver $driver,
+		string $environment
 	): RecoveryOutcome {
 		if ( null === $identity->observed_ref || $identity->observed_hostname !== $ctx->host ) {
 			return RecoveryOutcome::apply( LeaseOutcome::checked(), 'adoption did not take effect' );
@@ -3196,6 +3385,7 @@ final class DriverRecoveryResolver implements RecoveryResolver {
 				SslState::REQUESTED,
 				$identity->observed_ref,
 				$driver->id(),
+				$environment,
 				$ctx->installation_id,
 				0
 			),
@@ -3252,10 +3442,10 @@ final class Reconciler {
 
 	/**
 	 * @param Mapping[] $mappings
-	 * @return array{updated: int, divergences: int, skipped: int}
+	 * @return array{updated: int, divergences: int, skipped: int, drifted: int}
 	 */
 	public static function run( array $mappings ): array {
-		$totals = array( 'updated' => 0, 'divergences' => 0, 'skipped' => 0 );
+		$totals = array( 'updated' => 0, 'divergences' => 0, 'skipped' => 0, 'drifted' => 0 );
 
 		/** @var array<string, array{driver: SslDriver, mappings: Mapping[]}> $groups */
 		$groups = array();
@@ -3269,10 +3459,17 @@ final class Reconciler {
 				continue;
 			}
 
-			$driver = DriverFactory::for_mapping( $mapping );
+			// BoundResource, not DriverFactory: a bound row whose driver now points
+			// at a different account must not be asked about, and the wrong
+			// account's answer must not become local state.
+			$driver = BoundResource::driver_for( $mapping );
 
 			if ( $driver instanceof DriverUnavailable ) {
 				++$totals['skipped'];
+
+				if ( 'provider_environment_changed' === $driver->reason ) {
+					++$totals['drifted'];
+				}
 
 				continue;
 			}
@@ -3381,8 +3578,10 @@ final class Reconciler {
 				)
 			);
 
-			// Both non-commit causes mean the same thing here: this batch read did
-			// not change the row, so it is not counted and nothing is logged.
+			// committed() alone is enough here: every non-committed outcome means
+			// this batch read did not change the row, so it is not counted and
+			// nothing is logged. A reconciliation pass has nothing else to do
+			// about a lost CAS that it would not also do about a failed write.
 			if ( $applied->committed() ) {
 				++$updated;
 			} else {
@@ -3405,7 +3604,10 @@ Add to `src/Plugin.php`, inside `boot()`:
 		add_action( 'pd_ssl_sweep', array( $plugin, 'sweep_ssl' ) );
 ```
 
-and the method:
+and the method — covered by `SweepTest` in Step 5, because a fragment cannot be
+linted and this one wires recovery to cron:
+
+<!-- covered-by: SweepTest -->
 
 ```php
 	public function sweep_ssl(): void {
@@ -3428,17 +3630,149 @@ and the method:
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `composer test:integration -- --filter DriverRecoveryResolverTest && composer test:integration -- --filter ReconcilerTest`
-Expected: PASS — 12 and 11 tests
+Expected: PASS — 12 and 13 tests
 
-- [ ] **Step 5: Run the full suite**
+- [ ] **Step 5: Test the sweep wiring itself**
+
+`Plugin::sweep_ssl()` is prescribed as a fragment — it adds a method to an
+existing class — so `composer lint:plans` cannot inspect it. It is also the only
+place recovery and reconciliation are actually wired to cron, which makes it
+exactly the kind of example that must not go uncovered.
+
+Create `tests/integration/Ssl/SweepTest.php`:
+
+```php
+<?php
+declare( strict_types = 1 );
+
+namespace PostDomain\Tests\Integration\Ssl;
+
+use PostDomain\Mapping\ActivationState;
+use PostDomain\Mapping\DbRepository;
+use PostDomain\Mapping\Mapping;
+use PostDomain\Mapping\SslState;
+use PostDomain\Mapping\VerificationState;
+use PostDomain\Plugin;
+use PostDomain\Ssl\DriverFactory;
+use PostDomain\Ssl\Environment;
+use PostDomain\Ssl\MutationKind;
+use PostDomain\Support\Schema;
+use PostDomain\Tests\Integration\Ssl\Fixtures\RecordingDriver;
+use WP_UnitTestCase;
+
+final class SweepTest extends WP_UnitTestCase {
+
+	private DbRepository $repo;
+
+	private RecordingDriver $driver;
+
+	public function set_up(): void {
+		parent::set_up();
+		Schema::install();
+		Environment::remember_primary_host();
+		delete_option( 'pd_settings' );
+		DriverFactory::reset();
+
+		$this->repo   = new DbRepository();
+		$this->driver = RecordingDriver::ambiguous_then_absent();
+
+		add_filter(
+			'pd_ssl_drivers',
+			fn( array $drivers ): array => array_merge( $drivers, array( $this->driver ) )
+		);
+		update_option( 'pd_settings', array( 'ssl_driver' => 'recording' ), false );
+		DriverFactory::reset();
+	}
+
+	public function tear_down(): void {
+		remove_all_filters( 'pd_ssl_drivers' );
+		delete_option( 'pd_settings' );
+		DriverFactory::reset();
+		parent::tear_down();
+	}
+
+	private function expired_lease(): Mapping {
+		global $wpdb;
+
+		$m = $this->repo->save(
+			new Mapping(
+				0, 'sweep.test', null, self::factory()->post->create(), 1,
+				VerificationState::VERIFIED, ActivationState::ACTIVE, SslState::REQUESTED,
+				null, str_repeat( 'a', 32 ), '_post-domain-challenge'
+			)
+		);
+
+		$wpdb->update( // phpcs:ignore WordPress.DB
+			Schema::domains_table(),
+			array(
+				'ssl_mutation_token'       => str_repeat( '1', 32 ),
+				'ssl_mutation_kind'        => MutationKind::CREATE->value,
+				'ssl_mutation_phase'       => 'in_flight',
+				'ssl_mutation_expires_at'  => gmdate( 'Y-m-d H:i:s', time() - 600 ),
+				'ssl_mutation_driver'      => 'recording',
+				'ssl_mutation_environment' => 'recording:default',
+			),
+			array( 'id' => $m->id )
+		);
+
+		return $this->repo->by_id( $m->id );
+	}
+
+	public function test_the_sweep_hook_is_registered(): void {
+		Plugin::boot();
+
+		$this->assertNotFalse( has_action( 'pd_ssl_sweep' ) );
+	}
+
+	public function test_the_sweep_recovers_an_expired_lease(): void {
+		$m = $this->expired_lease();
+
+		( new Plugin() )->sweep_ssl();
+
+		$after = $this->repo->by_id( $m->id );
+
+		$this->assertNull( $after?->ssl_mutation_token, 'a conclusive absence releases the lease' );
+		$this->assertSame( 0, $this->driver->create_calls, 'recovery reads; it never re-issues' );
+	}
+
+	public function test_the_sweep_builds_no_registry_of_its_own(): void {
+		$source = (string) file_get_contents( dirname( __DIR__, 3 ) . '/src/Plugin.php' );
+
+		$this->assertStringNotContainsString(
+			'new \\PostDomain\\Ssl\\SslDriverRegistry',
+			$source,
+			'cron and REST must resolve drivers through the same factory'
+		);
+	}
+
+	public function test_the_sweep_leaves_an_unleased_row_to_reconciliation(): void {
+		$m = $this->repo->save(
+			new Mapping(
+				0, 'plain.test', null, self::factory()->post->create(), 1,
+				VerificationState::VERIFIED, ActivationState::ACTIVE, SslState::NONE,
+				null, str_repeat( 'b', 32 ), '_post-domain-challenge'
+			)
+		);
+
+		( new Plugin() )->sweep_ssl();
+
+		$this->assertNotNull( $this->repo->by_id( $m->id ) );
+	}
+}
+```
+
+Run: `composer test:integration -- --filter SweepTest`
+Expected: PASS — 4 tests
+
+- [ ] **Step 6: Run the full suite**
 
 Run: `composer lint && composer analyse && composer test && composer test:integration`
 Expected: PASS
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
-git add src/Ssl/DriverRecoveryResolver.php src/Ssl/Reconciler.php src/Plugin.php tests/integration/Ssl/DriverRecoveryResolverTest.php tests/integration/Ssl/ReconcilerTest.php
+git add src/Ssl/DriverRecoveryResolver.php src/Ssl/Reconciler.php src/Plugin.php tests/integration/Ssl/DriverRecoveryResolverTest.php tests/integration/Ssl/ReconcilerTest.php tests/integration/Ssl/SweepTest.php
 git commit -m "Resolve fenced mutations by kind, reading only
 
 Recovery calls status() and identify() and nothing else; the reconciler adopts

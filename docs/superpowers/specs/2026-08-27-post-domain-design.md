@@ -936,6 +936,7 @@ verify_lease_expires_at  DATETIME          NULL
 resolver_class           VARCHAR(191)      NULL
 
 ssl_provider             VARCHAR(60)       NULL
+ssl_provider_environment VARCHAR(190)      NULL          -- environment the bound resource lives in
 ssl_ref                  VARCHAR(191)      NULL
 ssl_ownership_origin     VARCHAR(10)       NULL          -- 'created' | 'adopted' | NULL
 ssl_owner_installation_id CHAR(36)         NULL
@@ -1094,6 +1095,13 @@ neither commits nor rolls anything back in either state. Three outcomes:
 | a transaction already open | **refuse before running the transition**; report it and leave the ambient transaction untouched |
 | the probe itself fails | **refuse before running the transition** — an undetectable session is not a safe one |
 
+An unconfirmed `COMMIT` is a third case and a different one: the write may or may
+not have landed, and the connection that issued it cannot find out, because while
+its transaction is unresolved it is shown its own uncommitted work. Nothing is
+reported as success, no provider call is repeated, and the outcome is settled by a
+later request, cron pass, or reconciliation — each on a connection with a
+committed view.
+
 Refusing rather than nesting via savepoints is deliberate. A savepoint released inside
 somebody else's transaction leaves the plugin's write undurable until that owner commits,
 so reporting it as committed would be a lie; and rolling back to a savepoint on failure
@@ -1160,6 +1168,71 @@ Every lease column moves together. When `ssl_mutation_token` is `NULL`, `kind`, 
 `expires_at`, `driver`, and `environment` are all `NULL`; when it is set, all five are
 present, and only declared `MutationKind` and `MutationPhase` values are accepted by the
 repository.
+
+#### The provider environment a resource lives in
+
+`ssl_provider` says which **driver** owns a bound resource. It does not say which
+**account, zone, or endpoint** that resource lives in, and a driver id is not an
+environment: one Cloudflare driver can be pointed at a different zone tomorrow.
+Reading provider state through current configuration is therefore unsafe for a
+bound resource, not only for a mutation in flight:
+
+1. A custom hostname is created in zone A.
+2. An operator repoints the plugin at zone B.
+3. `Reconciler` resolves `cloudflare-saas` from current configuration.
+4. It asks zone B about a resource that lives in zone A.
+5. Zone B says "absent", and that is recorded as truth about zone A's resource.
+
+Being unleased does not make that read safe. It only means no mutation is in
+flight. The row therefore carries its own answer, for the whole life of the
+binding:
+
+**`ssl_provider_environment`** — the non-secret `SslDriver::environment_id()` of
+the environment the bound resource actually lives in.
+
+Its lifecycle is exact:
+
+| Moment | Effect |
+|---|---|
+| no provider resource bound | `NULL`, with `ssl_provider` and `ssl_ref` |
+| create finalized successfully | written in the **same CAS** as `ssl_provider` and `ssl_ref`, promoted from `ssl_mutation_environment` |
+| adoption finalized successfully | likewise |
+| create or adoption recovered | likewise, promoted from the lease's binding, never from current configuration |
+| status, identify, reconcile, method change, deletion attempts | **retained unchanged** |
+| provider binding deliberately cleared | cleared with `ssl_provider`, `ssl_ref`, and ownership provenance |
+| clone resolution (§14.9) | cleared with them |
+| mapping deleted | gone with the row |
+
+It is **never** derived from the event log and **never** silently replaced by
+current configuration.
+
+**The rule for every access to a bound resource.** Resolve the driver named by
+`ssl_provider`, compare its current `environment_id()` with
+`ssl_provider_environment`, and if they differ — or the driver is not registered —
+then:
+
+- perform **no provider read and no provider mutation**;
+- change no local provider state;
+- report a named configuration-drift condition identifying the driver and the
+  environment that must be restored;
+- treat an absence, a difference, or any other answer from the currently
+  configured environment as **evidence about nothing**.
+
+This governs `status()`, `identify()`, `reconcile()`, validation planning wherever
+it consults provider state, adoption of an already-identified resource, method
+changes, deletion authorization, deletion execution, recovery, Admin, REST, CLI,
+and Diagnostics.
+
+**How the two bindings relate.** The mutation lease binds the environment a
+mutation *began against*; the resource binding records the environment a resource
+*lives in*. A first create or an unbound adoption has no resource binding yet, so
+the lease binds the currently selected environment, and successful finalization
+**promotes** it. Every later mutation against an existing resource works the other
+way round: `ssl_mutation_driver` comes from the stored `ssl_provider`,
+`ssl_mutation_environment` comes from the stored `ssl_provider_environment`, and
+the currently configured driver must match **both** before the lease is acquired
+or the provider is touched. No current default setting may reinterpret a bound
+resource.
 
 #### The provider environment a mutation began against
 
@@ -1307,6 +1380,7 @@ cleared in **one** atomic CAS, not two independent steps:
 UPDATE {prefix}pd_domains
    SET <confirmed state, ssl_ref, ownership provenance, ssl_method, ssl_error,
         removal outcome, ssl_provider_state, ssl_checked_at …>,
+       ssl_provider_environment = :promoted_environment,   -- on create/adopt only
        ssl_mutation_token = NULL, ssl_mutation_kind = NULL,
        ssl_mutation_phase = NULL, ssl_mutation_expires_at = NULL,
        ssl_mutation_driver = NULL, ssl_mutation_environment = NULL,
@@ -2647,7 +2721,8 @@ phase, including expired `RESERVED` leases awaiting a no-read clear and rows stu
 `RECOVERING` because provider state is still incomplete or transient; **rows fenced in
 `RECOVERING` because the driver or provider environment they began against is no longer
 configured, naming the `ssl_mutation_driver` and `ssl_mutation_environment` an operator
-must restore**; apex configuration status; the environment-mismatch banner.
+must restore, and separately the bound resources whose `ssl_provider_environment` no
+longer matches the configured driver — which are not fenced, merely unreadable**; apex configuration status; the environment-mismatch banner.
 
 ### 16.2 Operator flows
 
@@ -2667,6 +2742,12 @@ adoption workflow. Nothing is bound automatically.
 mutation is unresolved, the detail screen names the driver and environment identity the
 mutation began against and says plainly that the outcome cannot be learned until that
 configuration is restored. The plugin queries nothing in the meantime.
+
+*Provider reconfigured after provisioning*: a certificate that already exists in one
+account does not move because the plugin was repointed at another. The detail screen names
+the environment the resource lives in, reports that its state cannot be refreshed, and
+leaves the last known state alone. Nothing is asked of the new account about it, because
+the new account has never heard of it.
 
 *Move / restore / clone*: the blocking banner forces the choice before any provider
 mutation runs.
@@ -2757,7 +2838,9 @@ Cloudflare client):**
   plugin, and the caller's transaction and its unrelated writes survive intact
 - a failed transaction probe stops the transition before it begins
 - an uncertain `COMMIT` is never reported as success and never triggers an immediate
-  repeat of the provider mutation; local state is re-read before anything else is decided
+  repeat of the provider mutation, and is **never resolved by re-reading the same
+  connection** — while the transaction is unresolved that connection sees its own
+  uncommitted writes, so a later pass with a committed view settles it
 - transient recovery results cause another bounded read, never another provider mutation
 - the driver id and provider-environment identity are written into the lease **before**
   any provider call, pinned by the consumption CAS, inherited unchanged through recovery
@@ -2768,6 +2851,17 @@ Cloudflare client):**
   `RECOVERING`, and the report names the driver and environment to restore
 - the same mutation resolves normally once the original configuration is restored
 - an already-bound mapping is likewise unaffected by a change to the configured default
+- a successful create or adoption promotes the mutation environment into
+  `ssl_provider_environment` in the same CAS that writes `ssl_provider` and `ssl_ref`
+- with a bound resource and a drifted configuration, `status()`, `identify()`,
+  `reconcile()`, validation planning, method change, deletion authorization, and
+  deletion execution all perform **zero** provider reads and **zero** provider
+  mutations, and change no local provider state
+- restoring the original environment lets every one of those resume
+- clone resolution clears `ssl_provider_environment` with `ssl_provider`,
+  `ssl_ref`, and the ownership columns
+- REST and Diagnostics distinguish the durable resource environment from the
+  environment of a mutation currently in flight
 - the lease TTL and recovery grace exceed the driver's provider HTTP timeout by the
   documented margin
 - an expired worker unable to clear a newer worker's lease
