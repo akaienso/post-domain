@@ -1140,7 +1140,8 @@ mapping's mutation window; authorization checks may run; provider **reads** and 
 DNS proof may run; **no provider mutation has begun and no mutating driver method has been
 invoked.**
 
-**Acquire** — atomic CAS against the expected revision, refusing while any lease is live:
+**Acquire** — atomic CAS against the expected revision, permitted **only when the row
+carries no lease at all**:
 
 ```sql
 UPDATE {prefix}pd_domains
@@ -1148,8 +1149,19 @@ UPDATE {prefix}pd_domains
        ssl_mutation_phase = 'reserved', ssl_mutation_expires_at = :exp,
        revision = revision + 1, updated_at = :now
  WHERE id = :id AND revision = :rev
-   AND ( ssl_mutation_expires_at IS NULL OR ssl_mutation_expires_at <= :now )
+   AND ssl_mutation_token IS NULL      -- and therefore kind, phase, expiry are NULL too
 ```
+
+**Expiry never makes a row available to a normal worker.** A non-null
+`ssl_mutation_token` blocks ordinary acquisition regardless of phase and regardless of
+whether the lease has expired. Expiry transfers responsibility to `LeaseRecovery`
+(below) and nothing else; an expired lease is a row awaiting recovery, not a free row.
+The acquisition CAS therefore never replaces an existing token — an ordinary worker that
+could overwrite an expired `IN_FLIGHT` token would be starting a second external
+operation whose predecessor may already have reached the provider.
+
+The same no-lease requirement governs the `RESERVED` lease taken for force-local-delete
+and for a local delete where no provider resource exists (§14.15).
 
 `Ssl\MutationGate` is the only component that performs this transition, and the
 authorizers produce a `MutationAuthorization` only while the matching lease is still
@@ -1230,8 +1242,9 @@ leaves reconciliation to the recovery owner.
 
 #### What the lease blocks
 
-While a lease is held by another token — in any phase — every path (REST, Admin, cron,
-reconciliation, CLI) refuses or defers any write that changes a field bound into an
+While a lease exists on the row — held by another token, in any phase, **expired or
+not** — every path (REST, Admin, cron, reconciliation, CLI) refuses or defers any write
+that changes a field bound into an
 authorization: `host`, `challenge` (rotation), `ssl_provider`, `ssl_ref`, `ssl_method`,
 the ownership columns, adoption, removal, force-local-delete, and any further provider
 mutation. The refusal is `pd_mutation_in_progress` (409) and it **never touches the
@@ -1240,11 +1253,42 @@ provider**.
 Writes that are not bound into an authorization — `activation_state`, `title`,
 `favicon_attachment_id` — and all read-only diagnostics remain permitted.
 
-**Queue selection** excludes leased rows:
+**Ordinary queue selection excludes every leased row**, in any phase, expired or not.
+Verification, SSL mutation, reconciliation, deletion, Admin, REST, and CLI work all use
+the same no-lease condition:
 
 ```sql
-… AND ( ssl_mutation_expires_at IS NULL OR ssl_mutation_expires_at <= :utc_now )
+… AND ssl_mutation_token IS NULL
 ```
+
+This is deliberately not an expiry test. Ordinary work skips all leased rows; only
+`LeaseRecovery` selects on expiry, and only it may transition an expired lease.
+
+#### LeaseRecovery — the only claimant of expired leases
+
+`Ssl\LeaseRecovery` runs as its own pass in `pd_ssl_sweep` with its own selector, which
+is the **only** query in the plugin that keys on lease expiry:
+
+```sql
+SELECT … FROM {prefix}pd_domains
+ WHERE ssl_mutation_token IS NOT NULL
+   AND ssl_mutation_expires_at <= :utc_now
+ ORDER BY ssl_mutation_expires_at ASC
+ LIMIT :batch
+```
+
+It then dispatches on the **persisted phase**, and no other component may perform any of
+these transitions:
+
+| Expired phase | Recovery action |
+|---|---|
+| `RESERVED` | clear it with the phase-pinned CAS below, **without a provider read**. Only after that cleanup succeeds does the row become eligible for ordinary acquisition. |
+| `IN_FLIGHT` | replace the token and enter `RECOVERING` **before** reading provider state. Never start a new mutation. |
+| `RECOVERING` | replace the recovery token before continuing bounded provider reads. Never start a new mutation. |
+
+A normal acquisition performs none of these. Expired `IN_FLIGHT` and `RECOVERING` rows
+stay fenced from any new mutation until their external outcome is resolved, and the only
+route back to a lease-free row is a successful recovery transition.
 
 #### Recovering an expired RESERVED lease — nothing was sent
 
@@ -1265,7 +1309,9 @@ This races safely with the begin-mutation transition: if the owning worker reach
 `IN_FLIGHT` first, the cleanup CAS matches nothing; if cleanup clears the `RESERVED`
 lease first, the begin-mutation CAS matches nothing and **no provider call occurs**.
 Exactly one side wins. An expired `RESERVED` lease is never treated as evidence that a
-provider mutation may have happened.
+provider mutation may have happened — and, equally, it is never treated as an absent
+lease: until this cleanup succeeds the row is still leased, and ordinary acquisition
+against it affects zero rows.
 
 #### Recovering an expired IN_FLIGHT lease — fence first, then read
 
@@ -1494,16 +1540,20 @@ might otherwise claim.
 ### 13.5 Queue, budget, and leases
 
 **Due-work queries** select directly on persisted next-attempt columns — no table
-scans, no heuristics — and exclude rows under a live provider-mutation lease:
+scans, no heuristics — and exclude **every** row carrying a provider-mutation lease, in
+any phase, expired or not:
 
 ```sql
 SELECT … FROM {prefix}pd_domains
 WHERE verification_state IN (…) AND integrity_error IS NULL
   AND verify_next_attempt_at IS NOT NULL AND verify_next_attempt_at <= :utc_now
-  AND ( ssl_mutation_expires_at IS NULL OR ssl_mutation_expires_at <= :utc_now )
+  AND ssl_mutation_token IS NULL
 ORDER BY verify_next_attempt_at ASC
 LIMIT :batch
 ```
+
+The lease condition is a no-lease test, not an expiry test. An expired lease still blocks
+ordinary work; only `LeaseRecovery` (§12.6) selects on expiry.
 
 Every transition sets the next attempt explicitly: `pending` +15 min; `verified` +24 h;
 transient backoff +30 min growing exponentially to a 6 h cap; SSL transient honours
@@ -1533,7 +1583,7 @@ event. This lease is distinct from, and independent of, the provider-mutation le
 |---|---|---|
 | `pd_verify_pending` | 15 min | due `pending` rows, batched |
 | `pd_verify_established` | hourly sweep, ~daily per row | due `verified` and transient-backoff rows |
-| `pd_ssl_sweep` | 15 min | `requested`, `pending_validation`, `pending_removal`, stale `active`, plus expired-lease recovery |
+| `pd_ssl_sweep` | 15 min | two selectors: ordinary due work on lease-free rows, and `LeaseRecovery` on rows whose lease has expired |
 | `pd_maintenance` | daily | event pruning, orphan-alias check, full `Reconciler` pass, dangling-target scan |
 
 WP-Cron is unreliable on low-traffic sites. The README documents the system-cron
@@ -1776,11 +1826,13 @@ effect on deletability.
 **Forced local deletion** (`DELETE …?force=true`) removes the **local row only**, writes
 an event recording that a provider resource may have been left behind, and **never**
 bypasses this gate or issues a provider deletion. It issues no provider mutation, but it
-must still atomically prove that none is in flight: it acquires a `RESERVED` lease and
-deletes the row under a CAS that requires that lease's token, kind, and phase. A row in
-`IN_FLIGHT` or `RECOVERING` cannot be force-deleted — the acquire refuses with
-`pd_mutation_in_progress`, so a local delete can never orphan a request that is still
-outstanding at the provider.
+must still atomically prove that none is in flight: it acquires a `RESERVED` lease —
+which, like every ordinary acquisition, requires `ssl_mutation_token IS NULL` and so
+**cannot overwrite any existing lease, expired included** — and deletes the row under a
+CAS that requires that lease's token, kind, and phase. A row in `IN_FLIGHT` or
+`RECOVERING`, or one holding an expired lease of any phase, cannot be force-deleted: the
+acquire refuses with `pd_mutation_in_progress`, so a local delete can never orphan a
+request that is still outstanding at the provider.
 
 ### 14.6 Creation and ambiguous-create recovery
 
@@ -2223,8 +2275,8 @@ The daily `Reconciler` calls `reconcile()` with `SslResourceContext` objects, in
 and adopts provider truth for **state**, with four hard rules: a local/provider mismatch
 never triggers a delete at the provider; a transient response changes nothing;
 reconciliation **never adopts ownership** of anything; and it never auto-patches a
-divergent validation method. It skips rows under a live mutation lease in any phase, and
-it never claims recovery of an expired one — that is `LeaseRecovery`'s job in
+divergent validation method. It skips every row carrying a mutation lease — any phase,
+expired or not — and it never claims an expired one; that is `LeaseRecovery`'s job in
 `pd_ssl_sweep`, which fences before reading. Divergences —
 state, method, marker support, unbound-but-present resources — are written as events and
 surfaced in Diagnostics, so an operator sees "we think active, Cloudflare says pending"
@@ -2398,7 +2450,7 @@ computed on the resource and on its own route.
 | `PATCH` | `/domains/{id}` | `post_id`, `activation_state`, `title`, `favicon_attachment_id` only |
 | `DELETE` | `/domains/{id}` | 202 + durable removal; `?force=true` removes locally only |
 | `POST` | `/domains/{id}/verify` | on-demand check; rate-limited 1/min per mapping |
-| `POST` | `/domains/{id}/challenge` | rotates; resets verification; refused under a live lease |
+| `POST` | `/domains/{id}/challenge` | rotates; resets verification; refused while the row carries any lease |
 | `GET` | `/domains/{id}/plan` | returns a `ValidationPlan` |
 | `POST` | `/domains/{id}/ssl` | provision — `create()` under a `CREATE` lease |
 | `PATCH` | `/domains/{id}/ssl` | `{method}` — explicit DCV method change (§14.10) |
@@ -2411,7 +2463,8 @@ computed on the resource and on its own route.
 invariant 1: there is no request that makes a mapping verified. `verification`, `ssl`
 state, ownership columns, `revision`, and `deletion` are read-only there. `post_id` on an
 alias row returns `pd_alias_no_target`. Every `…/ssl` mutation and `…/challenge` requires
-`If-Match` and acquires the mutation lease; a live lease held elsewhere returns
+`If-Match` and acquires the mutation lease, which requires a lease-free row; any
+existing lease — including an expired one awaiting recovery — returns
 `pd_mutation_in_progress`.
 
 ### 15.3 Errors
@@ -2547,8 +2600,21 @@ leaving posts untouched.
 **Lease and authorization (integration, against a fake driver and a recorded-fixture
 Cloudflare client):**
 
-- lease acquisition refused while another lease is live in any phase, with no provider
-  call
+- lease acquisition refused while any lease exists, in any phase, with no provider call
+- **normal acquisition against an expired `RESERVED` lease affects zero rows**
+- **normal acquisition against an expired `IN_FLIGHT` lease affects zero rows and causes
+  zero provider mutations**
+- **normal acquisition against an expired `RECOVERING` lease affects zero rows and causes
+  zero provider mutations**
+- ordinary queues — verification, SSL, reconciliation, deletion, Admin, REST, CLI — skip
+  leased rows in all three phases, unexpired and expired alike
+- only the dedicated `LeaseRecovery` selector claims expired leases; no ordinary query
+  keys on lease expiry
+- an expired `RESERVED` row becomes ordinarily eligible **only after** its no-read
+  cleanup CAS succeeds
+- expired `IN_FLIGHT` and `RECOVERING` rows cannot become ordinarily eligible by token
+  overwrite
+- force-local-delete cannot overwrite any existing lease, including an expired one
 - **no provider mutation occurs while the lease is only `RESERVED`** — the driver's
   mutating methods are never entered
 - the `RESERVED → IN_FLIGHT` CAS consumes the authorization **before** the driver is
@@ -2573,7 +2639,6 @@ Cloudflare client):**
 - the lease TTL and recovery grace exceed the driver's provider HTTP timeout by the
   documented margin
 - an expired worker unable to clear a newer worker's lease
-- queue selection skipping leased rows in every phase
 - each of the deletion preconditions failing individually, producing a refusal with no
   provider mutation
 - authorization rejected after a concurrent revision bump, and when host, provider, ref,
@@ -2656,9 +2721,10 @@ A README covering:
   in columns rather than in the event log, and that events are history only
 - the provider-mutation lease and its phases: what `RESERVED`, `IN_FLIGHT`, and
   `RECOVERING` mean, what the lease blocks, why challenge rotation and method changes are
-  refused while one is held, why an expired `RESERVED` lease is safe to clear without
-  contacting the provider while an expired `IN_FLIGHT` one is not, and what a row stuck
-  in `RECOVERING` is telling an operator
+  refused while one is held, that an expired lease still blocks ordinary work rather than
+  freeing the row, why an expired `RESERVED` lease is safe to clear without contacting
+  the provider while an expired `IN_FLIGHT` one is not, and what a row stuck in
+  `RECOVERING` is telling an operator
 - the authorization model: what a provider mutation requires, why cached verification is
   not enough, and what each refusal means
 - creation ambiguity: why a marker-free create-then-timeout may require explicit adoption
