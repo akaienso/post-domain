@@ -1777,39 +1777,51 @@ hijacked by whichever plugin autoloads its copy of the same library first."
 ### Task 10: Mechanically validating the plans' own PHP examples
 
 **Files:**
-- Create: `bin/check-plan-examples.php`
+- Create: `bin/check-plan-examples.php`, `tests/fixtures/plan-examples/` (six deliberately broken fixtures)
 - Modify: `composer.json` (add the `lint:plans` script), `.github/workflows/ci.yml`
 - Test: `tests/unit/PlanExamplesTest.php`
 
 **Interfaces:**
 - Consumes: nothing at runtime — this is a developer tool, like the schema generator.
-- Produces: `composer lint:plans`, which fails on a plan example that will not parse or that references a `PostDomain\` class no plan defines.
+- Produces: `composer lint:plans`, which fails on any of the six defect classes below and prints exactly what it did and did not inspect.
 
 Every task in this suite prescribes exact PHP, and a worker will paste it. A
-missing `use` statement or a signature that drifted between plans is then found
-by a human at implementation time, one task at a time. This checks it in one
-command before any of it is written.
+missing `use` statement or a signature that drifted between plans is otherwise
+found by a human at implementation time, one task at a time.
 
-The check is deliberately modest, because over-promising here is worse than
-under-promising:
+**What it detects — and nothing beyond this:**
 
-- **Complete files** — fenced `php` blocks whose first line is `<?php` — are
-  written to a temporary file and passed through `php -l`.
-- **Fragments** (method bodies, `composer.json` additions, snippets introduced by
-  "Add to …") are **not** linted. They are counted and reported, so a run that
-  covers little is visibly a run that covers little rather than a silent pass.
-- **Duplicate declarations** fail the check, unless the block is introduced by
-  a "Replace `src/…` with" line — the one form in which a later plan
-  deliberately restates a type an earlier plan created.
-- **Symbol resolution** is checked across the whole suite, in both forms the
-  plans use: every `use PostDomain\…;` and every fully qualified
-  `\PostDomain\…` written inline must name a class, interface, enum, or trait
-  that some block in some plan declares. That is what catches a `Reconciler` calling
-  `AtomicTransition` it never imported, a constructor argument left over from a
-  retired design, or a class two plans spell differently.
+| Class | Rule |
+|---|---|
+| `syntax` | a complete example (one whose first line is `<?php`) fails `php -l` |
+| `unresolved-import` | a `use PostDomain\…;` naming a type no example declares |
+| `unresolved-fq` | an inline `\PostDomain\…` naming a type no example declares |
+| `missing-import` | a bare `ShortName` that some example declares under a namespace this example neither imports nor lives in |
+| `duplicate-import` | the same `use` twice in one example |
+| `duplicate-declaration` | the same type declared twice, unless the second is introduced by a `Replace \`src/…\` with` line |
+| `arity` | a call to one of the pinned lease and context APIs with the wrong argument count |
 
-It cannot prove the code is correct. It can prove it parses and that its names
-resolve, which are exactly the failures that survived the last review.
+The `missing-import` rule is the one that matters most, because it is exactly the
+defect that reached review: `Reconciler` calling `AtomicTransition::commit()` with
+no import for it. Detecting that requires knowing every short name the suite
+declares and where each example's namespace sits, which is why the checker builds
+a declaration index before it inspects anything.
+
+**What it does not do,** stated plainly so nobody mistakes a pass for more than it
+is:
+
+- **Fragments are not inspected at all.** A block that does not begin with `<?php`
+  is a method body, a `composer.json` addition, or a YAML snippet. It is counted
+  **and listed by file, block number, and the line that introduces it**, so an
+  unvalidated example can be found rather than merely tallied.
+- **This task's own defect fixtures are not inspected**, because they are supposed
+  to be broken. They are introduced by the words `checker fixture` and appear in
+  the same skipped list, so the exemption is auditable and cannot be used to
+  quietly excuse a real example.
+- It does not type-check, resolve WordPress or PHP built-ins, verify that a method
+  exists on the class being called, or check argument *types* — only the arity of
+  a pinned list.
+- A clean run means "this parses and its names resolve", never "this is correct".
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1829,15 +1841,26 @@ final class PlanExamplesTest extends TestCase {
 		return dirname( __DIR__, 2 );
 	}
 
-	/** @return array{code: int, output: string} */
-	private function run(): array {
-		$output = (string) shell_exec(
-			'php ' . escapeshellarg( $this->root() . '/bin/check-plan-examples.php' ) . ' 2>&1; echo "EXIT:$?"'
-		);
+	/**
+	 * @param string[] $args
+	 * @return array{code: int, output: string}
+	 */
+	private function run( array $args = array() ): array {
+		$command = 'php ' . escapeshellarg( $this->root() . '/bin/check-plan-examples.php' );
+
+		foreach ( $args as $arg ) {
+			$command .= ' ' . escapeshellarg( $arg );
+		}
+
+		$output = (string) shell_exec( $command . ' 2>&1; echo "EXIT:$?"' );
 
 		preg_match( '/EXIT:(\d+)\s*$/', $output, $m );
 
 		return array( 'code' => (int) ( $m[1] ?? 1 ), 'output' => $output );
+	}
+
+	private function fixture( string $name ): array {
+		return $this->run( array( '--only=' . $this->root() . '/tests/fixtures/plan-examples/' . $name . '.md' ) );
 	}
 
 	public function test_every_prescribed_example_parses_and_resolves(): void {
@@ -1846,49 +1869,195 @@ final class PlanExamplesTest extends TestCase {
 		$this->assertSame( 0, $result['code'], $result['output'] );
 	}
 
-	public function test_the_report_states_how_much_it_actually_checked(): void {
+	public function test_the_report_states_what_it_inspected(): void {
 		$result = $this->run();
 
-		$this->assertMatchesRegularExpression( '/complete files linted: \d+/', $result['output'] );
-		$this->assertMatchesRegularExpression( '/fragments not linted: \d+/', $result['output'] );
-		$this->assertMatchesRegularExpression( '/symbols resolved: \d+/', $result['output'] );
+		$this->assertMatchesRegularExpression( '/complete examples inspected: \d+/', $result['output'] );
+		$this->assertMatchesRegularExpression( '/fragments NOT inspected: \d+/', $result['output'] );
+		$this->assertMatchesRegularExpression( '/types declared: \d+/', $result['output'] );
 	}
 
-	public function test_an_unresolvable_symbol_fails_the_check(): void {
-		$fixture = sys_get_temp_dir() . '/pd-plan-fixture-' . getmypid() . '.md';
+	public function test_every_skipped_fragment_is_listed_not_just_counted(): void {
+		$result = $this->run();
 
-		file_put_contents(
-			$fixture,
-			"# fixture\n\n```php\n<?php\nnamespace PostDomain\\Ssl;\n\nuse PostDomain\\Ssl\\NoSuchClass;\n\nfinal class Fixture {}\n```\n"
+		preg_match( '/fragments NOT inspected: (\d+)/', $result['output'], $m );
+
+		$listed = preg_match_all( '/^ {2}skipped /m', $result['output'] );
+
+		$this->assertSame(
+			(int) $m[1],
+			$listed,
+			'a count alone cannot tell an operator which examples went unchecked'
 		);
-
-		$output = (string) shell_exec(
-			'php ' . escapeshellarg( $this->root() . '/bin/check-plan-examples.php' )
-			. ' --only=' . escapeshellarg( $fixture ) . ' 2>&1; echo "EXIT:$?"'
-		);
-
-		unlink( $fixture );
-
-		$this->assertStringContainsString( 'NoSuchClass', $output );
-		$this->assertStringContainsString( 'EXIT:1', $output );
 	}
 
-	public function test_a_syntax_error_fails_the_check(): void {
-		$fixture = sys_get_temp_dir() . '/pd-plan-syntax-' . getmypid() . '.md';
+	/**
+	 * @dataProvider defect_fixtures
+	 */
+	public function test_each_defect_class_fails_the_check( string $fixture, string $marker ): void {
+		$result = $this->fixture( $fixture );
 
-		file_put_contents( $fixture, "# fixture\n\n```php\n<?php\nfinal class Broken {\n```\n" );
+		$this->assertSame( 1, $result['code'], $result['output'] );
+		$this->assertStringContainsString( $marker, $result['output'] );
+	}
 
-		$output = (string) shell_exec(
-			'php ' . escapeshellarg( $this->root() . '/bin/check-plan-examples.php' )
-			. ' --only=' . escapeshellarg( $fixture ) . ' 2>&1; echo "EXIT:$?"'
+	/** @return array<string, array{0: string, 1: string}> */
+	public static function defect_fixtures(): array {
+		return array(
+			'syntax error'        => array( 'syntax', '[syntax]' ),
+			'unresolved import'   => array( 'unresolved-import', '[unresolved-import]' ),
+			'missing import'      => array( 'missing-import', '[missing-import]' ),
+			'duplicate import'    => array( 'duplicate-import', '[duplicate-import]' ),
+			'duplicate type'      => array( 'duplicate-declaration', '[duplicate-declaration]' ),
+			'wrong arity'         => array( 'arity', '[arity]' ),
 		);
+	}
 
-		unlink( $fixture );
+	public function test_the_missing_import_fixture_reproduces_the_defect_that_reached_review(): void {
+		$result = $this->fixture( 'missing-import' );
 
-		$this->assertStringContainsString( 'EXIT:1', $output );
+		// The same shape as Reconciler calling AtomicTransition::commit() with no
+		// import for it: a known short name, used from another namespace, unimported.
+		$this->assertStringContainsString( 'AtomicTransition', $result['output'] );
+	}
+
+	public function test_a_replacement_block_is_not_a_duplicate_declaration(): void {
+		$result = $this->fixture( 'replacement' );
+
+		$this->assertSame( 0, $result['code'], $result['output'] );
 	}
 }
 ```
+
+Create the six defect fixtures plus one accepted-replacement fixture under
+`tests/fixtures/plan-examples/`. Each is a minimal Markdown file holding exactly
+the defect its name gives.
+
+**Each listing below is introduced with the words `checker fixture`, and the
+checker skips any example so introduced.** Without that, the fixtures would be
+scanned as though they were prescribed code and every one of them would — quite
+correctly — fail the check. They are still reported in the skipped list, so the
+exemption is visible rather than silent.
+
+checker fixture — `syntax.md`:
+
+````markdown
+```php
+<?php
+namespace PostDomain\Fixture;
+
+final class Broken {
+```
+````
+
+checker fixture — `unresolved-import.md`:
+
+````markdown
+```php
+<?php
+namespace PostDomain\Fixture;
+
+use PostDomain\Fixture\NoSuchClass;
+
+final class Importer {}
+```
+````
+
+checker fixture — `missing-import.md`:
+
+````markdown
+```php
+<?php
+namespace PostDomain\Support;
+
+final class AtomicTransition {}
+```
+
+```php
+<?php
+namespace PostDomain\Ssl;
+
+final class Reconciler {
+	public function run(): bool {
+		return AtomicTransition::commit();
+	}
+}
+```
+````
+
+checker fixture — `duplicate-import.md`:
+
+````markdown
+```php
+<?php
+namespace PostDomain\Fixture;
+
+final class Target {}
+```
+
+```php
+<?php
+namespace PostDomain\Other;
+
+use PostDomain\Fixture\Target;
+use PostDomain\Fixture\Target;
+
+final class Doubled {}
+```
+````
+
+checker fixture — `duplicate-declaration.md`:
+
+````markdown
+```php
+<?php
+namespace PostDomain\Fixture;
+
+final class Twice {}
+```
+
+```php
+<?php
+namespace PostDomain\Fixture;
+
+final class Twice {}
+```
+````
+
+checker fixture — `arity.md`:
+
+````markdown
+```php
+<?php
+namespace PostDomain\Fixture;
+
+final class Caller {
+	public function go( object $lease ): bool {
+		return $lease->finalize( 1, 2, 3 );
+	}
+}
+```
+````
+
+checker fixture — `replacement.md`:
+
+````markdown
+```php
+<?php
+namespace PostDomain\Fixture;
+
+final class Evolving {}
+```
+
+Replace `src/Fixture/Evolving.php` with the typed version:
+
+```php
+<?php
+namespace PostDomain\Fixture;
+
+final class Evolving {}
+```
+````
 
 - [ ] **Step 2: Run the test to verify it fails**
 
@@ -1902,8 +2071,10 @@ Create `bin/check-plan-examples.php`:
 ```php
 <?php
 /**
- * Parses the PHP examples in the plan documents and checks that they compile and
- * that every PostDomain symbol they import is declared somewhere in the suite.
+ * Checks the PHP examples in the plan documents: that they parse, that every
+ * PostDomain symbol they name resolves, that no type is declared twice outside an
+ * explicit replacement, and that calls to the pinned lease APIs have the right
+ * arity.
  *
  * Developer tool. Never loaded by the plugin, never reaches the network.
  *
@@ -1912,8 +2083,8 @@ Create `bin/check-plan-examples.php`:
 
 declare( strict_types = 1 );
 
-$pd_root  = dirname( __DIR__ );
-$pd_only  = null;
+$pd_root = dirname( __DIR__ );
+$pd_only = null;
 
 foreach ( array_slice( $argv, 1 ) as $pd_arg ) {
 	if ( str_starts_with( $pd_arg, '--only=' ) ) {
@@ -1921,115 +2092,267 @@ foreach ( array_slice( $argv, 1 ) as $pd_arg ) {
 	}
 }
 
+/**
+ * Argument counts for the APIs this correction series changed. A drift between
+ * two plans is otherwise invisible until someone pastes the older one.
+ */
+$pd_pinned = array(
+	'acquire'                => array( 4 ),
+	'consume'                => array( 1 ),
+	'finalize'               => array( 2 ),
+	'delete_row'             => array( 1 ),
+	'release_reserved'       => array( 1 ),
+	'clear_expired_reserved' => array( 1 ),
+	'claim_recovery'         => array( 1 ),
+	'extend_recovery'        => array( 2 ),
+	'from_mapping'           => array( 4, 5 ),
+	'binding_for'            => array( 3 ),
+	'open_window'            => array( 4 ),
+	'commit'                 => array( 2 ),
+);
+
 $pd_files = null === $pd_only
 	? glob( $pd_root . '/docs/superpowers/plans/*.md' )
 	: array( $pd_only );
 
-$pd_declared = array();
-$pd_imports  = array();
-$pd_complete = 0;
-$pd_fragment = 0;
-$pd_errors   = array();
-$pd_tmp      = tempnam( sys_get_temp_dir(), 'pd-example-' ) . '.php';
+$pd_blocks = array();
 
 foreach ( (array) $pd_files as $pd_file ) {
 	$pd_body = (string) file_get_contents( (string) $pd_file );
-	$pd_name = basename( (string) $pd_file );
 
-	preg_match_all( '/^```php\R(.*?)^```/ms', $pd_body, $pd_blocks, PREG_OFFSET_CAPTURE );
+	preg_match_all( '/^```php\R(.*?)^```/ms', $pd_body, $pd_found, PREG_OFFSET_CAPTURE );
 
-	foreach ( $pd_blocks[1] as $pd_index => $pd_capture ) {
-		list( $pd_block, $pd_offset ) = $pd_capture;
+	foreach ( $pd_found[1] as $pd_index => $pd_capture ) {
+		list( $pd_code, $pd_offset ) = $pd_capture;
 
-		// A block introduced by "Replace `src/...` with" deliberately restates a
-		// type an earlier plan created. Anything else declaring a name twice is
-		// two plans disagreeing about the same file.
-		$pd_lead      = substr( $pd_body, max( 0, $pd_offset - 200 ), 200 );
-		$pd_is_replace = str_contains( $pd_lead, 'Replace `' );
+		$pd_lead  = substr( $pd_body, max( 0, $pd_offset - 240 ), 240 );
+		$pd_lines = array_values( array_filter( array_map( 'trim', explode( "\n", $pd_lead ) ) ) );
 
-		if ( ! str_starts_with( ltrim( $pd_block ), '<?php' ) ) {
-			++$pd_fragment;
+		// A listing introduced as a "checker fixture" is a deliberately broken
+		// example this tool's own self-tests use. Scanning it would fail the run
+		// on defects that are the point. It is still reported as skipped.
+		$pd_fixture = str_contains( $pd_lead, 'checker fixture' );
 
-			continue;
-		}
+		$pd_blocks[] = array(
+			'file'     => basename( (string) $pd_file ),
+			'index'    => $pd_index + 1,
+			'code'     => $pd_code,
+			'complete' => str_starts_with( ltrim( $pd_code ), '<?php' ) && ! $pd_fixture,
+			'replace'  => str_contains( $pd_lead, 'Replace `' ),
+			'intro'    => substr( (string) end( $pd_lines ), 0, 70 ),
+		);
+	}
+}
 
-		++$pd_complete;
+$pd_errors   = array();
+$pd_declared = array();
+$pd_short    = array();
+$pd_complete = array();
+$pd_skipped  = array();
 
-		file_put_contents( $pd_tmp, $pd_block );
+foreach ( $pd_blocks as $pd_block ) {
+	if ( $pd_block['complete'] ) {
+		$pd_complete[] = $pd_block;
+	} else {
+		$pd_skipped[] = $pd_block;
+	}
+}
 
-		$pd_lint = array();
-		$pd_code = 0;
-		exec( 'php -l ' . escapeshellarg( $pd_tmp ) . ' 2>&1', $pd_lint, $pd_code );
+// Pass one: what does the suite declare, and where?
+foreach ( $pd_complete as $pd_key => $pd_block ) {
+	preg_match( '/^namespace\s+([^;]+);/m', $pd_block['code'], $pd_ns );
 
-		if ( 0 !== $pd_code ) {
+	$pd_namespace                    = isset( $pd_ns[1] ) ? trim( $pd_ns[1] ) : '';
+	$pd_complete[ $pd_key ]['ns']    = $pd_namespace;
+	$pd_where                        = sprintf( '%s block %d', $pd_block['file'], $pd_block['index'] );
+
+	preg_match_all( '/^(?:final\s+|abstract\s+)?(?:class|interface|trait|enum)\s+(\w+)/m', $pd_block['code'], $pd_types );
+
+	$pd_complete[ $pd_key ]['types'] = $pd_types[1];
+
+	foreach ( $pd_types[1] as $pd_type ) {
+		$pd_fqn = '' === $pd_namespace ? $pd_type : $pd_namespace . '\\' . $pd_type;
+
+		if ( isset( $pd_declared[ $pd_fqn ] ) && ! $pd_block['replace'] ) {
 			$pd_errors[] = sprintf(
-				'%s block %d: %s',
-				$pd_name,
-				$pd_index + 1,
-				implode( ' ', $pd_lint )
+				'[duplicate-declaration] %s redeclares %s, first declared in %s',
+				$pd_where,
+				$pd_fqn,
+				$pd_declared[ $pd_fqn ]
 			);
 		}
 
-		// Declarations: namespace + declared type names in this block.
-		preg_match( '/^namespace\s+([^;]+);/m', $pd_block, $pd_ns );
-		$pd_namespace = isset( $pd_ns[1] ) ? trim( $pd_ns[1] ) : '';
+		$pd_declared[ $pd_fqn ]  = $pd_where;
+		$pd_short[ $pd_type ][]  = $pd_fqn;
+	}
+}
 
-		preg_match_all( '/^(?:final\s+|abstract\s+)?(?:class|interface|trait|enum)\s+(\w+)/m', $pd_block, $pd_types );
+// Pass two: parse, resolve, and count arguments.
+$pd_tmp = tempnam( sys_get_temp_dir(), 'pd-example-' ) . '.php';
 
-		foreach ( $pd_types[1] as $pd_type ) {
-			$pd_fqn = '' === $pd_namespace ? $pd_type : $pd_namespace . '\\' . $pd_type;
+foreach ( $pd_complete as $pd_block ) {
+	$pd_where = sprintf( '%s block %d', $pd_block['file'], $pd_block['index'] );
 
-			if ( isset( $pd_declared[ $pd_fqn ] ) && ! $pd_is_replace ) {
-				$pd_errors[] = sprintf(
-					'%s block %d redeclares %s, first declared in %s',
-					$pd_name,
-					$pd_index + 1,
-					$pd_fqn,
-					$pd_declared[ $pd_fqn ]
-				);
+	file_put_contents( $pd_tmp, $pd_block['code'] );
+
+	$pd_lint = array();
+	$pd_code = 0;
+	exec( 'php -l ' . escapeshellarg( $pd_tmp ) . ' 2>&1', $pd_lint, $pd_code );
+
+	if ( 0 !== $pd_code ) {
+		$pd_errors[] = sprintf( '[syntax] %s: %s', $pd_where, (string) reset( $pd_lint ) );
+	}
+
+	preg_match_all( '/^use\s+([^;]+);/m', $pd_block['code'], $pd_uses );
+
+	$pd_imported = array();
+
+	foreach ( $pd_uses[1] as $pd_use ) {
+		$pd_use   = trim( $pd_use );
+		$pd_alias = substr( (string) strrchr( '\\' . $pd_use, '\\' ), 1 );
+
+		if ( isset( $pd_imported[ $pd_alias ] ) ) {
+			$pd_errors[] = sprintf( '[duplicate-import] %s: %s', $pd_where, $pd_use );
+		}
+
+		$pd_imported[ $pd_alias ] = $pd_use;
+
+		if ( str_starts_with( $pd_use, 'PostDomain\\' ) && ! isset( $pd_declared[ $pd_use ] ) ) {
+			$pd_errors[] = sprintf( '[unresolved-import] %s: %s', $pd_where, $pd_use );
+		}
+	}
+
+	preg_match_all( '/\\\\(PostDomain\\\\[A-Za-z0-9_\\\\]+)/', $pd_block['code'], $pd_inline );
+
+	foreach ( $pd_inline[1] as $pd_symbol ) {
+		$pd_symbol = rtrim( $pd_symbol, '\\' );
+
+		if ( ! isset( $pd_declared[ $pd_symbol ] ) ) {
+			$pd_errors[] = sprintf( '[unresolved-fq] %s: %s', $pd_where, $pd_symbol );
+		}
+	}
+
+	// Comments first: an apostrophe in prose would otherwise open a phantom
+	// string and swallow the code after it. Both the reference scan and the arity
+	// scan run on this stripped form, so a class named in a comment or a string is
+	// not mistaken for a use of it.
+	$pd_bare = (string) preg_replace( '#/\*.*?\*/#s', '', $pd_block['code'] );
+	$pd_bare = (string) preg_replace( '#//[^\n]*#', '', $pd_bare );
+	$pd_bare = (string) preg_replace( "#'(?:[^'\\\\]|\\\\.)*'#", "''", $pd_bare );
+
+	// A bare short name that the suite declares elsewhere, neither imported here
+	// nor living in this block's own namespace. This is the Reconciler defect.
+	$pd_reference = '/(?<![\\\\\w$>])(?:(?:new|instanceof|extends|implements)\s+([A-Z]\w+)|([A-Z]\w+)::|\(\s*([A-Z]\w+)\s+\$|:\s*\??([A-Z]\w+)[\s{;)]|\|\s*([A-Z]\w+)\b)/';
+
+	preg_match_all( $pd_reference, $pd_bare, $pd_refs, PREG_SET_ORDER );
+
+	foreach ( $pd_refs as $pd_match ) {
+		$pd_name = '';
+
+		foreach ( array_slice( $pd_match, 1 ) as $pd_group ) {
+			if ( '' !== $pd_group ) {
+				$pd_name = $pd_group;
+
+				break;
+			}
+		}
+
+		if ( '' === $pd_name || ! isset( $pd_short[ $pd_name ] ) ) {
+			continue;
+		}
+
+		if ( isset( $pd_imported[ $pd_name ] ) || in_array( $pd_name, $pd_block['types'], true ) ) {
+			continue;
+		}
+
+		$pd_local = '' === $pd_block['ns'] ? $pd_name : $pd_block['ns'] . '\\' . $pd_name;
+
+		if ( isset( $pd_declared[ $pd_local ] ) ) {
+			continue;
+		}
+
+		$pd_errors[] = sprintf(
+			'[missing-import] %s: %s is declared as %s and is neither imported nor local',
+			$pd_where,
+			$pd_name,
+			$pd_short[ $pd_name ][0]
+		);
+	}
+
+	foreach ( $pd_pinned as $pd_method => $pd_allowed ) {
+		preg_match_all( '/(?:->|::)' . $pd_method . '\(/', $pd_bare, $pd_calls, PREG_OFFSET_CAPTURE );
+
+		foreach ( $pd_calls[0] as $pd_call ) {
+			$pd_start = $pd_call[1] + strlen( $pd_call[0] );
+			$pd_depth = 1;
+			$pd_at    = $pd_start;
+
+			while ( $pd_at < strlen( $pd_bare ) && $pd_depth > 0 ) {
+				if ( str_contains( '([', $pd_bare[ $pd_at ] ) ) {
+					++$pd_depth;
+				} elseif ( str_contains( ')]', $pd_bare[ $pd_at ] ) ) {
+					--$pd_depth;
+				}
+
+				++$pd_at;
 			}
 
-			$pd_declared[ $pd_fqn ] = sprintf( '%s block %d', $pd_name, $pd_index + 1 );
-		}
+			$pd_count = pd_count_arguments( substr( $pd_bare, $pd_start, $pd_at - $pd_start - 1 ) );
 
-		// References, in both forms a plan uses them: an import, and a fully
-		// qualified name written inline. Only PostDomain symbols are checked;
-		// everything else belongs to WordPress or PHP itself.
-		preg_match_all( '/^use\s+(PostDomain\\\\[^;\s]+)\s*;/m', $pd_block, $pd_used );
-		preg_match_all( '/\\\\(PostDomain\\\\[A-Za-z0-9_\\\\]+)/', $pd_block, $pd_inline );
-
-		foreach ( array_merge( $pd_used[1], array_map( static fn( string $s ): string => rtrim( $s, '\\' ), $pd_inline[1] ) ) as $pd_symbol ) {
-			$pd_imports[ $pd_symbol ][] = sprintf( '%s block %d', $pd_name, $pd_index + 1 );
+			if ( ! in_array( $pd_count, $pd_allowed, true ) ) {
+				$pd_errors[] = sprintf(
+					'[arity] %s: %s() called with %d argument(s), expected %s',
+					$pd_where,
+					$pd_method,
+					$pd_count,
+					implode( ' or ', $pd_allowed )
+				);
+			}
 		}
 	}
 }
 
-@unlink( $pd_tmp ); // phpcs:ignore WordPress.PHP.NoSilencedErrors
-
-// Test namespaces are declared by the test files the plans create, which the
-// same scan above already picked up. Anything left unresolved is a real gap.
-$pd_unresolved = 0;
-
-foreach ( $pd_imports as $pd_symbol => $pd_sites ) {
-	if ( isset( $pd_declared[ $pd_symbol ] ) ) {
-		continue;
-	}
-
-	++$pd_unresolved;
-	$pd_errors[] = sprintf( 'unresolved symbol %s (imported in %s)', $pd_symbol, implode( ', ', $pd_sites ) );
+if ( file_exists( $pd_tmp ) ) {
+	unlink( $pd_tmp );
 }
 
-printf( "complete files linted: %d
-", $pd_complete );
-printf( "fragments not linted: %d
-", $pd_fragment );
-printf( "symbols resolved: %d
-", count( $pd_imports ) - $pd_unresolved );
+function pd_count_arguments( string $list ): int {
+	$depth = 0;
+	$count = 0;
+	$seen  = false;
+
+	foreach ( str_split( $list ) as $char ) {
+		if ( str_contains( '([', $char ) ) {
+			++$depth;
+		} elseif ( str_contains( ')]', $char ) ) {
+			--$depth;
+		}
+
+		if ( ! ctype_space( $char ) ) {
+			$seen = true;
+		}
+
+		if ( ',' === $char && 0 === $depth ) {
+			++$count;
+		}
+	}
+
+	return $seen ? $count + 1 : 0;
+}
+
+printf( "complete examples inspected: %d\n", count( $pd_complete ) );
+printf( "fragments NOT inspected: %d\n", count( $pd_skipped ) );
+printf( "types declared: %d\n", count( $pd_declared ) );
+
+foreach ( $pd_skipped as $pd_block ) {
+	printf( "  skipped %s block %d — %s\n", $pd_block['file'], $pd_block['index'], $pd_block['intro'] );
+}
+
+$pd_errors = array_values( array_unique( $pd_errors ) );
 
 if ( array() !== $pd_errors ) {
-	fwrite( STDERR, implode( "
-", $pd_errors ) . "
-" );
+	sort( $pd_errors );
+	fwrite( STDERR, implode( "\n", $pd_errors ) . "\n" );
 
 	exit( 1 );
 }
@@ -2052,20 +2375,27 @@ Add to `.github/workflows/ci.yml`, alongside the other lint steps:
 - [ ] **Step 4: Run the test to verify it passes**
 
 Run: `composer lint:plans && vendor/bin/phpunit --testsuite unit --filter PlanExamplesTest`
-Expected: PASS — 4 tests
+Expected: PASS — 11 tests (including the six defect fixtures)
 
-If `lint:plans` reports an unresolved symbol, that is a **plan** defect, not an
-implementation one: fix the plan document before writing the code it describes.
+If `lint:plans` reports anything, that is a **plan** defect, not an implementation
+one: fix the plan document before writing the code it describes. And read the
+skipped-fragment list before trusting a clean run — those examples were not
+inspected at all.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add bin/check-plan-examples.php composer.json .github/workflows/ci.yml tests/unit/PlanExamplesTest.php
-git commit -m "Check that the plans' own PHP parses and resolves
+git add bin/check-plan-examples.php composer.json .github/workflows/ci.yml tests/unit/PlanExamplesTest.php tests/fixtures/plan-examples/
+git commit -m "Check that the plans' own PHP parses, resolves, and agrees with itself
 
-A missing import or a signature that drifted between two plans is otherwise
-found one task at a time, by a human, at implementation time. The check reports
-how much it skipped so a thin run cannot masquerade as a clean one."
+Seven defect classes, each with a fixture that must fail: syntax, unresolved
+import, unresolved fully qualified name, a bare short name with no import, a
+duplicated import, a type declared twice outside an explicit replacement, and a
+pinned API called with the wrong arity. The missing-import fixture reproduces the
+Reconciler defect that reached review.
+
+Skipped fragments are listed, not merely counted, so a clean run cannot be
+mistaken for coverage it does not have."
 ```
 
 ---

@@ -29,6 +29,11 @@ Inherit Plans 01–07, and add:
   further, delete nothing, retry nothing (spec §12.6) — and **return a fenced
   result, not the provider's status**. A provider call that succeeded is not the
   same fact as a mutation that took effect.
+- **Only `CAS_LOST` is fencing.** A transaction that could not start, an event
+  that could not be written, and a `COMMIT` that was not confirmed are database
+  failures, not another worker. They are reported as their own outcome, they never
+  re-issue a provider call, and where the local state is genuinely unknown the row
+  is **re-read** rather than assumed.
 - **Every service returns `MutationResult`** (Plan 07 Task 4), which carries an
   `SslStatus` only for `COMMITTED`. `FENCED` and `CONFIRMED_NOT_PERSISTED` are
   told apart by re-reading the row: a replaced token or a `RECOVERING` phase
@@ -882,14 +887,7 @@ final class CreateService {
 		$mapping_id = $authorized['mapping']->id;
 
 		$applied = AtomicTransition::commit(
-			fn (): bool => $this->lease->finalize(
-				$mapping_id,
-				$gated->in_flight_revision,
-				$gated->lease_token,
-				MutationKind::CREATE,
-				MutationPhase::IN_FLIGHT,
-				$outcome
-			),
+			fn (): bool => $this->lease->finalize( $gated->owner, $outcome ),
 			fn (): bool => EventLog::record(
 				$mapping_id,
 				$authorized['mapping']->host,
@@ -908,7 +906,7 @@ final class CreateService {
 		// A lost CAS is fencing; anything else is a database failure that left the
 		// provider ahead of us. The row itself distinguishes the first case.
 		return $applied->cas_lost()
-			? MutationResult::lost( $this->repo->by_id( $mapping_id ), $gated->lease_token )
+			? MutationResult::lost( $this->repo->by_id( $mapping_id ), $gated->owner->token )
 			: MutationResult::not_persisted( $applied->detail );
 	}
 }
@@ -1332,11 +1330,7 @@ final class AdoptionService {
 
 		$applied = AtomicTransition::commit(
 			fn (): bool => $this->lease->finalize(
-				$mapping_id,
-				$gated->in_flight_revision,
-				$gated->lease_token,
-				MutationKind::ADOPT,
-				MutationPhase::IN_FLIGHT,
+				$gated->owner,
 				LeaseOutcome::adopted(
 					$status->state,
 					$authorized['observed_ref'],
@@ -1363,7 +1357,7 @@ final class AdoptionService {
 		}
 
 		return $applied->cas_lost()
-			? MutationResult::lost( $this->repo->by_id( $mapping_id ), $gated->lease_token )
+			? MutationResult::lost( $this->repo->by_id( $mapping_id ), $gated->owner->token )
 			: MutationResult::not_persisted( $applied->detail );
 	}
 }
@@ -1790,14 +1784,7 @@ final class MethodChangeService {
 		$mapping_id = $authorized['mapping']->id;
 
 		$applied = AtomicTransition::commit(
-			fn (): bool => $this->lease->finalize(
-				$mapping_id,
-				$gated->in_flight_revision,
-				$gated->lease_token,
-				MutationKind::METHOD,
-				MutationPhase::IN_FLIGHT,
-				$outcome
-			),
+			fn (): bool => $this->lease->finalize( $gated->owner, $outcome ),
 			fn (): bool => EventLog::record(
 				$mapping_id,
 				$authorized['mapping']->host,
@@ -1811,7 +1798,7 @@ final class MethodChangeService {
 
 		if ( ! $applied->committed() ) {
 			return $applied->cas_lost()
-				? MutationResult::lost( $this->repo->by_id( $mapping_id ), $gated->lease_token )
+				? MutationResult::lost( $this->repo->by_id( $mapping_id ), $gated->owner->token )
 				: MutationResult::not_persisted( $applied->detail );
 		}
 
@@ -1851,7 +1838,7 @@ leaves ssl_method exactly as it was, and a fenced worker persists nothing."
 - Consumes: `DeletionAuthorizer`, `MutationGate`, `MutationLease` (Plan 07), `MappingRepository` (Plan 02).
 - Produces:
   - `DeletionService::request( Mapping $m ): bool` — a CAS write on the expected revision that stops serving and, when a provider resource exists, moves to `pending_removal`; when none exists it takes a `RESERVED` lease and deletes under it.
-  - `DeletionService::process( Mapping $m ): string` — `removed`, `pending`, `transient`, `failed`, `refused`, `fenced`, or `deferred` (the database refused the write; the lease still stands and the next pass retries).
+  - `DeletionService::process( Mapping $m ): string` — `removed`, `pending`, `transient`, `failed`, `refused`, `fenced`, or `deferred`. `deferred` means the local write could not be established: the provider is not called again, the row is re-read, and the next pass decides. After an unconfirmed `COMMIT` the re-read is what distinguishes a row that is already gone from one that is not.
   - `ForceLocalDelete::run( Mapping $m ): bool`.
 
 Every deletion path is fenced by the exact lease. A failed finalize means the
@@ -2019,6 +2006,42 @@ final class DeletionServiceTest extends WP_UnitTestCase {
 			)
 		);
 		$this->assertNotNull( $this->repo->by_id( $m->id ) );
+	}
+
+	public function test_an_unconfirmed_commit_reports_the_state_it_re_reads_not_a_guess(): void {
+		$m       = $this->owned();
+		$service = DeletionService::for_tests( RecordingDriver::removing( RemovalOutcome::REMOVED ), $this->proof( DnsOutcome::MATCH ) );
+
+		$service->request( $m );
+
+		// The delete lands, but the client never sees the COMMIT succeed.
+		add_filter( 'query', $fail = static fn( string $q ): string => 'COMMIT' === $q ? 'SELECT bad_syntax FROM' : $q );
+
+		$outcome = $service->process( $this->repo->by_id( $m->id ) );
+
+		remove_filter( 'query', $fail );
+
+		// Whichever way the server went, the answer is a re-read, never a claim.
+		$this->assertContains( $outcome, array( 'removed', 'deferred' ) );
+		$this->assertSame(
+			null === $this->repo->by_id( $m->id ) ? 'removed' : 'deferred',
+			$outcome,
+			'the report must match what the row actually says now'
+		);
+	}
+
+	public function test_an_unconfirmed_commit_never_re_issues_the_provider_deletion(): void {
+		$m       = $this->owned();
+		$driver  = RecordingDriver::removing( RemovalOutcome::REMOVED );
+		$service = DeletionService::for_tests( $driver, $this->proof( DnsOutcome::MATCH ) );
+
+		$service->request( $m );
+
+		add_filter( 'query', $fail = static fn( string $q ): string => 'COMMIT' === $q ? 'SELECT bad_syntax FROM' : $q );
+		$service->process( $this->repo->by_id( $m->id ) );
+		remove_filter( 'query', $fail );
+
+		$this->assertSame( 1, $driver->remove_calls, 'the provider already confirmed; asking again proves nothing' );
 	}
 
 	public function test_a_fenced_worker_does_not_hard_delete(): void {
@@ -2223,13 +2246,7 @@ final class ForceLocalDelete {
 		$actor = 'admin:' . get_current_user_id();
 
 		$deleted = AtomicTransition::commit(
-			static fn (): bool => $lease->delete_row(
-				$id,
-				$held['revision'],
-				$held['token'],
-				MutationKind::REMOVE,
-				MutationPhase::RESERVED
-			),
+			static fn (): bool => $lease->delete_row( $held ),
 			static fn (): bool => EventLog::record(
 				$id,
 				$host,
@@ -2242,7 +2259,9 @@ final class ForceLocalDelete {
 		);
 
 		if ( ! $deleted->committed() ) {
-			$lease->release_reserved( $mapping->id, $held['revision'], $held['token'], MutationKind::REMOVE );
+			// Either cause means the row is still here. The release is itself
+			// owner-pinned, so it is a no-op if the lease is no longer ours.
+			$lease->release_reserved( $held );
 
 			return false;
 		}
@@ -2376,13 +2395,7 @@ final class DeletionService {
 			$lease = $this->lease;
 
 			$deleted = AtomicTransition::commit(
-				static fn (): bool => $lease->delete_row(
-					$id,
-					$gated->in_flight_revision,
-					$gated->lease_token,
-					MutationKind::REMOVE,
-					MutationPhase::IN_FLIGHT
-				),
+				static fn (): bool => $lease->delete_row( $gated->owner ),
 				static fn (): bool => EventLog::record(
 					$id,
 					$host,
@@ -2398,7 +2411,15 @@ final class DeletionService {
 				return 'removed';
 			}
 
-			return $deleted->cas_lost() ? 'fenced' : 'deferred';
+			if ( $deleted->cas_lost() ) {
+				return 'fenced';
+			}
+
+			// An unconfirmed COMMIT leaves two possibilities and no way to choose
+			// between them from here: the row may be gone, or it may not. Re-read
+			// rather than assume, and never re-issue the provider deletion — the
+			// provider already confirmed the resource is gone.
+			return null === $this->repo->by_id( $mapping->id ) ? 'removed' : 'deferred';
 		}
 
 		$outcome = RemovalOutcome::FAILED === $result->outcome
@@ -2409,14 +2430,7 @@ final class DeletionService {
 			: LeaseOutcome::checked();
 
 		$applied = AtomicTransition::commit(
-			fn (): bool => $this->lease->finalize(
-				$mapping->id,
-				$gated->in_flight_revision,
-				$gated->lease_token,
-				MutationKind::REMOVE,
-				MutationPhase::IN_FLIGHT,
-				$outcome
-			),
+			fn (): bool => $this->lease->finalize( $gated->owner, $outcome ),
 			fn (): bool => EventLog::record(
 				$mapping->id,
 				$mapping->host,
@@ -2452,13 +2466,7 @@ final class DeletionService {
 		$lease = $this->lease;
 
 		$deleted = AtomicTransition::commit(
-			static fn (): bool => $lease->delete_row(
-				$id,
-				$held['revision'],
-				$held['token'],
-				MutationKind::REMOVE,
-				MutationPhase::RESERVED
-			),
+			static fn (): bool => $lease->delete_row( $held ),
 			static fn (): bool => EventLog::record(
 				$id,
 				$host,
@@ -2471,7 +2479,9 @@ final class DeletionService {
 		);
 
 		if ( ! $deleted->committed() ) {
-			$this->lease->release_reserved( $mapping->id, $held['revision'], $held['token'], MutationKind::REMOVE );
+			// Either cause means the row is still here. The release is itself
+			// owner-pinned, so it is a no-op if the lease is no longer ours.
+			$this->lease->release_reserved( $held );
 		}
 
 		return $deleted->committed();
@@ -2513,7 +2523,7 @@ final class DeletionService {
 - [ ] **Step 4: Run the test to verify it passes**
 
 Run: `composer test:integration -- --filter DeletionServiceTest`
-Expected: PASS — 26 tests (including the two six-case lease-state providers)
+Expected: PASS — 28 tests (including the two six-case lease-state providers)
 
 - [ ] **Step 5: Commit**
 
@@ -3371,6 +3381,8 @@ final class Reconciler {
 				)
 			);
 
+			// Both non-commit causes mean the same thing here: this batch read did
+			// not change the row, so it is not counted and nothing is logged.
 			if ( $applied->committed() ) {
 				++$updated;
 			} else {

@@ -59,16 +59,19 @@ driver and provider environment it began against (Plan 02's two lease columns,
 Plan 07's acquisition and recovery rules), so a configuration change mid-flight
 can never make recovery question the wrong account.
 
-`composer lint:plans` (Plan 01, Task 10) checks these documents' own PHP: every
-complete example parses, every `PostDomain\` symbol resolves, and no type is
-declared twice outside an explicit "Replace" step.
+`composer lint:plans` (Plan 01, Task 10) checks these documents' own PHP against
+seven defect classes: syntax, unresolved imports, unresolved fully qualified
+names, a bare short name with no import, duplicated imports, a type declared twice
+outside an explicit "Replace" step, and a pinned API called with the wrong arity.
+It inspects only complete examples and **lists** the fragments it skips, so a
+clean run cannot be mistaken for coverage it does not have.
 
 ## Specification coverage by plan
 
 | Plan | Spec sections |
 |---|---|
 | 01 | §1, §1.1, §1.2, §2, §2.1, §2.2, §3.1, §3.2, §3.3, §3.4, §3.5, §14.16 (host-level wildcard rejection), §18 (toolchain, including the plan-example check) |
-| 02 | §3.7, §12.1, §12.2 (columns, including the two mutation-binding columns), §12.3 (including the InnoDB transition-and-event transaction and its typed result), §12.4, §12.5, §12.6 (columns + invariants only), §12.7, §18 (uninstall) |
+| 02 | §3.7, §12.1, §12.2 (columns, including the two mutation-binding columns), §12.3 (including the InnoDB transition-and-event transaction, its typed result, and the ambient-transaction rule), §12.4, §12.5, §12.6 (columns + invariants only), §12.7, §18 (uninstall) |
 | 03 | §3.6, §4, §4.1, §4.2, §4.3, §4.4, §5.1, §5.2, §5.3, §5.4, §9 (redirect + REST registration), §11.1, §11.4, §11.8 (host and request rows), and the Phase C invocations of §11.2 and §11.3 |
 | 04 | §6, §6.1, §6.2, §6.3, §10, §11.2, §11.3 (the subtree filters themselves), §11.8 (subtree and scope rows), §20 |
 | 05 | §7, §7.1, §7.2, §7.3, §7.4, §7.5, §8, §8.1, §9 (CORS and ajax), §11.5, §11.8 (URL rows) |
@@ -91,14 +94,14 @@ its predecessor's gate is green.
 
 | After | Gate |
 |---|---|
-| 01 | `composer test`, `composer lint`, `composer analyse`, `composer lint:plans` all pass; plugin activates on wp-env single-site and refuses multisite activation |
-| 02 | Schema installs and upgrades idempotently; every row invariant rejected at the repository, including all six lease columns moving together; a transition and its event commit or roll back together on InnoDB and never precede the CAS on any engine, with a typed result that never reports an unstarted transaction or an uncertain commit as committed; `uninstall.php` leaves a seeded post untouched |
+| 01 | `composer test`, `composer lint`, `composer analyse`, `composer lint:plans` all pass — the last one against all seven defect classes, with every skipped fragment listed; plugin activates on wp-env single-site and refuses multisite activation |
+| 02 | Schema installs and upgrades idempotently; every row invariant rejected at the repository, including all six lease columns moving together; a transition and its event commit or roll back together on InnoDB and never precede the CAS on any engine, with a typed result that never reports an unstarted transaction or an unconfirmed commit as committed; a transaction opened elsewhere on the connection is detected and neither committed nor rolled back, and the transition does not run; `uninstall.php` leaves a seeded post untouched |
 | 03 | The disposition matrix integration test passes for all five outcomes across every host kind |
 | 04 | The round-trip property test passes over a generated fixture tree; no unbounded scope executes |
 | 05 | The rendered-output compatibility matrix passes for every row in spec §7.2 |
 | 06 | A seeded mapping goes `unverified → pending → verified` against a stubbed resolver, and a transient result never deactivates it |
-| 07 | No provider mutation is reachable without a consumed permit; the lease race tests pass; a recovery claim pinned to the wrong kind or phase affects zero rows; the driver and provider environment are bound before any provider call and pinned by the consumption CAS; recovery against a deregistered driver or a changed environment reads nothing and stays fenced; lease TTL and recovery grace strictly exceed the provider timeout plus the margin; a mapping with no provider never resolves to `NullDriver` by default |
-| 08 | Every ambiguous outcome test resolves by a provider read, through the driver the lease was bound to and never one chosen from current configuration; a conclusive recovery leaves no recovery schedule behind; every precondition failure proves zero mutating provider calls; a failed finalization writes nothing, deletes nothing, logs nothing, and returns `FENCED`; reconciliation counts no zero-row update; force-local-delete cannot overwrite a lease |
+| 07 | No provider mutation is reachable without a consumed permit; the lease race tests pass; **every** lease-owning CAS pins every value its caller possesses, so a wrong revision, token, kind, phase, driver, or environment affects zero rows; the driver and provider environment are bound before any provider call and pinned by the consumption CAS; recovery against a deregistered driver or a changed environment reads nothing and stays fenced; malformed or duplicate driver identifiers are refused before a lease exists; lease TTL and recovery grace strictly exceed the provider timeout plus the margin; a mapping with no provider never resolves to `NullDriver` by default |
+| 08 | Every ambiguous outcome test resolves by a provider read, through the driver the lease was bound to and never one chosen from current configuration; a conclusive recovery leaves no recovery schedule behind; only a lost CAS is reported as fencing, and an unconfirmed commit re-reads rather than guessing; every precondition failure proves zero mutating provider calls; a failed finalization writes nothing, deletes nothing, logs nothing, and returns `FENCED`; reconciliation counts no zero-row update; force-local-delete cannot overwrite a lease |
 | 09 | The status map generates offline from the digested snapshot, all 16 hostname and 21 SSL values are classified, CI fails on an unclassified value or a digest mismatch, and a configured Cloudflare driver is reachable from a mapping whose stored provider is null |
 | 10 | Management routes are absent from `/wp-json/` discovery on a mapped host, every registered route is answered by a real handler introduced in the same task, and no fenced mutation is reported with a success status |
 | 11 | Full suite green; README covers every item in spec §19 |

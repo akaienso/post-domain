@@ -658,7 +658,15 @@ MAX_TTL so a scheduled re-read stays inside its own fencing window."
 - Produces:
   - `PostDomain\Ssl\LeaseBinding` — readonly `int $mapping_id`, `int $revision`, `string $token`, `MutationKind $kind`, `string $host`, `?string $provider_id`, `?string $provider_ref`, `string $challenge`, `?string $requested_method`, `?OwnershipOrigin $ownership_origin`, `?string $owner_installation_id`.
   - `PostDomain\Ssl\LeaseOutcome` — typed, column-allowlisted; `::state()`, `::bound()`, `::adopted()`, `::method_confirmed()`, `::failure()`, `::checked()`, `::provider_state()`, `::attempted()`, `::raw()`, `::merge()`, `::columns()`.
-  - `PostDomain\Ssl\MutationLease::__construct( Clock $clock )` with `::acquire( int $mapping_id, int $revision, MutationKind $kind, SslDriver $driver ): ?array{token,revision,driver,environment}`, `::consume()`, `::release_reserved()`, `::finalize()`, `::delete_row()`, `::clear_expired_reserved()`, `::claim_recovery( int $mapping_id, string $old_token, MutationKind $kind, MutationPhase $from ): ?array`, `::extend_recovery( int $mapping_id, int $revision, string $token, MutationKind $kind, int $attempt ): bool`.
+  - `PostDomain\Ssl\LeaseOwner` — readonly `int $mapping_id`, `int $revision`, `string $token`, `MutationKind $kind`, `MutationPhase $phase`, `string $driver`, `string $environment`; with `::at( int $revision, MutationPhase $phase ): self` and `::predicate_values(): array`.
+  - `PostDomain\Ssl\MutationLease::__construct( Clock $clock )` with `::acquire( int $mapping_id, int $revision, MutationKind $kind, SslDriver $driver ): ?LeaseOwner`, `::consume( LeaseBinding $b ): ?LeaseOwner`, `::release_reserved( LeaseOwner $o ): bool`, `::finalize( LeaseOwner $o, LeaseOutcome $outcome ): bool`, `::delete_row( LeaseOwner $o ): bool`, `::clear_expired_reserved( LeaseOwner $o ): bool`, `::claim_recovery( LeaseOwner $expected ): ?LeaseOwner`, `::extend_recovery( LeaseOwner $o, int $attempt ): bool`.
+
+**Every lease-owning CAS pins every value the caller possesses.** That is not a
+discipline each method remembers separately: the values live on `LeaseOwner` and
+the `WHERE` fragment is a single shared constant, so omitting one is not something
+a future edit can do by accident. `clear_expired_reserved()` is the one deliberate
+exception — it omits the revision, because it races the owner's own begin-mutation
+transition, which bumps it — and it pins everything else plus the expiry.
 
 The consumption CAS re-checks **every** value in `LeaseBinding`, including the two
 ownership columns, with null-safe comparisons (spec §12.6).
@@ -681,6 +689,7 @@ use PostDomain\Mapping\SslState;
 use PostDomain\Mapping\VerificationState;
 use PostDomain\Ssl\LeaseBinding;
 use PostDomain\Ssl\LeaseOutcome;
+use PostDomain\Ssl\LeaseOwner;
 use PostDomain\Ssl\MutationKind;
 use PostDomain\Ssl\MutationLease;
 use PostDomain\Ssl\MutationPhase;
@@ -727,7 +736,7 @@ final class MutationLeaseTest extends WP_UnitTestCase {
 		);
 	}
 
-	private function force_lease( int $id, MutationPhase $phase, int $offset ): string {
+	private function force_lease( int $id, MutationPhase $phase, int $offset ): LeaseOwner {
 		global $wpdb;
 
 		$token = bin2hex( random_bytes( 16 ) );
@@ -745,7 +754,28 @@ final class MutationLeaseTest extends WP_UnitTestCase {
 			array( 'id' => $id )
 		);
 
-		return $token;
+		return new LeaseOwner(
+			$id,
+			(int) $this->repo->by_id( $id )?->revision,
+			$token,
+			MutationKind::REMOVE,
+			$phase,
+			$this->driver->id(),
+			$this->driver->environment_id()
+		);
+	}
+
+	/** The same owner with exactly one value wrong. */
+	private function owner_with( LeaseOwner $owner, string $field, $value ): LeaseOwner {
+		return new LeaseOwner(
+			$owner->mapping_id,
+			'revision' === $field ? $value : $owner->revision,
+			'token' === $field ? $value : $owner->token,
+			'kind' === $field ? $value : $owner->kind,
+			'phase' === $field ? $value : $owner->phase,
+			'driver' === $field ? $value : $owner->driver,
+			'environment' === $field ? $value : $owner->environment
+		);
 	}
 
 	public function test_acquiring_on_a_free_row_reserves_it(): void {
@@ -761,8 +791,8 @@ final class MutationLeaseTest extends WP_UnitTestCase {
 		$lease = $this->lease->acquire( $m->id, $m->revision, MutationKind::CREATE, $this->driver );
 		$after = $this->repo->by_id( $m->id );
 
-		$this->assertSame( $this->driver->id(), $lease['driver'] );
-		$this->assertSame( $this->driver->environment_id(), $lease['environment'] );
+		$this->assertSame( $this->driver->id(), $lease->driver );
+		$this->assertSame( $this->driver->environment_id(), $lease->environment );
 		$this->assertSame( $this->driver->id(), $after?->ssl_mutation_driver );
 		$this->assertSame( $this->driver->environment_id(), $after?->ssl_mutation_environment );
 		$this->assertNull( $after?->ssl_provider, 'a first create is bound before it has a provider' );
@@ -773,7 +803,7 @@ final class MutationLeaseTest extends WP_UnitTestCase {
 		$lease = $this->lease->acquire( $m->id, $m->revision, MutationKind::CREATE, $this->driver );
 
 		$binding = new LeaseBinding(
-			$m->id, $lease['revision'], $lease['token'], MutationKind::CREATE, $m->host,
+			$m->id, $lease->revision, $lease->token, MutationKind::CREATE, $m->host,
 			$m->ssl_provider, $m->ssl_ref, $m->challenge, $m->ssl_method,
 			$m->ssl_ownership_origin, $m->ssl_owner_installation_id,
 			$this->driver->id(), 'zone:somewhere-else'
@@ -787,7 +817,7 @@ final class MutationLeaseTest extends WP_UnitTestCase {
 		$lease = $this->lease->acquire( $m->id, $m->revision, MutationKind::CREATE, $this->driver );
 
 		$binding = new LeaseBinding(
-			$m->id, $lease['revision'], $lease['token'], MutationKind::CREATE, $m->host,
+			$m->id, $lease->revision, $lease->token, MutationKind::CREATE, $m->host,
 			$m->ssl_provider, $m->ssl_ref, $m->challenge, $m->ssl_method,
 			$m->ssl_ownership_origin, $m->ssl_owner_installation_id,
 			'some-other-driver', $this->driver->environment_id()
@@ -801,7 +831,7 @@ final class MutationLeaseTest extends WP_UnitTestCase {
 
 		$m     = $this->seed();
 		$lease = $this->lease->acquire( $m->id, $m->revision, MutationKind::CREATE, $this->driver );
-		$in    = (int) $this->lease->consume( $this->binding( $this->repo->by_id( $m->id ), $lease['token'], $lease['revision'] ) );
+		$in    = $this->lease->consume( $this->binding( $this->repo->by_id( $m->id ), $lease->token, $lease->revision ) );
 
 		// Pretend a recovery had already scheduled re-reads on this row.
 		$wpdb->update( // phpcs:ignore WordPress.DB
@@ -810,10 +840,7 @@ final class MutationLeaseTest extends WP_UnitTestCase {
 			array( 'id' => $m->id )
 		);
 
-		$this->lease->finalize(
-			$m->id, $in, $lease['token'], MutationKind::CREATE, MutationPhase::IN_FLIGHT,
-			LeaseOutcome::state( SslState::ACTIVE )
-		);
+		$this->lease->finalize( $in, LeaseOutcome::state( SslState::ACTIVE ) );
 
 		$after = $this->repo->by_id( $m->id );
 
@@ -826,14 +853,11 @@ final class MutationLeaseTest extends WP_UnitTestCase {
 	public function test_finalizing_respects_an_outcome_that_sets_a_schedule_itself(): void {
 		$m     = $this->seed();
 		$lease = $this->lease->acquire( $m->id, $m->revision, MutationKind::REMOVE, $this->driver );
-		$in    = (int) $this->lease->consume(
-			$this->binding( $this->repo->by_id( $m->id ), $lease['token'], $lease['revision'], MutationKind::REMOVE )
+		$in    = $this->lease->consume(
+			$this->binding( $this->repo->by_id( $m->id ), $lease->token, $lease->revision, MutationKind::REMOVE )
 		);
 
-		$this->lease->finalize(
-			$m->id, $in, $lease['token'], MutationKind::REMOVE, MutationPhase::IN_FLIGHT,
-			LeaseOutcome::attempted( 2, 600 )
-		);
+		$this->lease->finalize( $in, LeaseOutcome::attempted( 2, 600 ) );
 
 		$this->assertNull( $this->repo->by_id( $m->id )?->ssl_next_attempt_at );
 	}
@@ -875,17 +899,17 @@ final class MutationLeaseTest extends WP_UnitTestCase {
 		$lease = $this->lease->acquire( $m->id, $m->revision, MutationKind::CREATE, $this->driver );
 
 		$in_flight = $this->lease->consume(
-			$this->binding( $this->repo->by_id( $m->id ), $lease['token'], $lease['revision'] )
+			$this->binding( $this->repo->by_id( $m->id ), $lease->token, $lease->revision )
 		);
 
-		$this->assertSame( $lease['revision'] + 1, $in_flight );
+		$this->assertSame( $lease->revision + 1, $in_flight );
 		$this->assertSame( MutationPhase::IN_FLIGHT, $this->repo->by_id( $m->id )?->ssl_mutation_phase );
 	}
 
 	public function test_consuming_twice_fails_the_second_time(): void {
 		$m       = $this->seed();
 		$lease   = $this->lease->acquire( $m->id, $m->revision, MutationKind::CREATE, $this->driver );
-		$binding = $this->binding( $this->repo->by_id( $m->id ), $lease['token'], $lease['revision'] );
+		$binding = $this->binding( $this->repo->by_id( $m->id ), $lease->token, $lease->revision );
 
 		$this->assertNotNull( $this->lease->consume( $binding ) );
 		$this->assertNull( $this->lease->consume( $binding ), 'one execution per authorization' );
@@ -900,7 +924,7 @@ final class MutationLeaseTest extends WP_UnitTestCase {
 
 		$m       = $this->seed( true );
 		$lease   = $this->lease->acquire( $m->id, $m->revision, MutationKind::CREATE, $this->driver );
-		$binding = $this->binding( $this->repo->by_id( $m->id ), $lease['token'], $lease['revision'] );
+		$binding = $this->binding( $this->repo->by_id( $m->id ), $lease->token, $lease->revision );
 
 		$wpdb->update( Schema::domains_table(), $change, array( 'id' => $m->id ) ); // phpcs:ignore WordPress.DB
 
@@ -927,7 +951,7 @@ final class MutationLeaseTest extends WP_UnitTestCase {
 
 		$m       = $this->seed();
 		$lease   = $this->lease->acquire( $m->id, $m->revision, MutationKind::CREATE, $this->driver );
-		$binding = $this->binding( $this->repo->by_id( $m->id ), $lease['token'], $lease['revision'] );
+		$binding = $this->binding( $this->repo->by_id( $m->id ), $lease->token, $lease->revision );
 
 		$wpdb->update( // phpcs:ignore WordPress.DB
 			Schema::domains_table(),
@@ -938,13 +962,11 @@ final class MutationLeaseTest extends WP_UnitTestCase {
 		$this->assertNull( $this->lease->consume( $binding ) );
 	}
 
-	public function test_releasing_a_reserved_lease_clears_all_four_columns(): void {
+	public function test_releasing_a_reserved_lease_clears_every_lease_column(): void {
 		$m     = $this->seed();
 		$lease = $this->lease->acquire( $m->id, $m->revision, MutationKind::CREATE, $this->driver );
 
-		$this->assertTrue(
-			$this->lease->release_reserved( $m->id, $lease['revision'], $lease['token'], MutationKind::CREATE )
-		);
+		$this->assertTrue( $this->lease->release_reserved( $lease ) );
 
 		$after = $this->repo->by_id( $m->id );
 
@@ -952,26 +974,41 @@ final class MutationLeaseTest extends WP_UnitTestCase {
 		$this->assertNull( $after?->ssl_mutation_kind );
 		$this->assertNull( $after?->ssl_mutation_phase );
 		$this->assertNull( $after?->ssl_mutation_expires_at );
+		$this->assertNull( $after?->ssl_mutation_driver );
+		$this->assertNull( $after?->ssl_mutation_environment );
 	}
 
-	public function test_release_refuses_a_wrong_token_kind_or_revision(): void {
+	/**
+	 * @dataProvider wrong_owner_values
+	 */
+	public function test_release_refuses_any_wrong_owner_value( string $field, $value ): void {
 		$m     = $this->seed();
 		$lease = $this->lease->acquire( $m->id, $m->revision, MutationKind::CREATE, $this->driver );
 
-		$this->assertFalse( $this->lease->release_reserved( $m->id, $lease['revision'], str_repeat( '0', 32 ), MutationKind::CREATE ) );
-		$this->assertFalse( $this->lease->release_reserved( $m->id, $lease['revision'], $lease['token'], MutationKind::REMOVE ) );
-		$this->assertFalse( $this->lease->release_reserved( $m->id, $lease['revision'] + 9, $lease['token'], MutationKind::CREATE ) );
+		$this->assertFalse( $this->lease->release_reserved( $this->owner_with( $lease, $field, $value ) ) );
+	}
+
+	/** @return array<string, array{0: string, 1: mixed}> */
+	public static function wrong_owner_values(): array {
+		return array(
+			'revision'    => array( 'revision', 999 ),
+			'token'       => array( 'token', '00000000000000000000000000000000' ),
+			'kind'        => array( 'kind', MutationKind::REMOVE ),
+			'phase'       => array( 'phase', MutationPhase::IN_FLIGHT ),
+			'driver'      => array( 'driver', 'some-other-driver' ),
+			'environment' => array( 'environment', 'zone:somewhere-else' ),
+		);
 	}
 
 	public function test_release_never_clears_an_in_flight_lease(): void {
 		$m     = $this->seed();
 		$lease = $this->lease->acquire( $m->id, $m->revision, MutationKind::CREATE, $this->driver );
-		$in    = (int) $this->lease->consume(
-			$this->binding( $this->repo->by_id( $m->id ), $lease['token'], $lease['revision'] )
+		$in    = $this->lease->consume(
+			$this->binding( $this->repo->by_id( $m->id ), $lease->token, $lease->revision )
 		);
 
 		$this->assertFalse(
-			$this->lease->release_reserved( $m->id, $in, $lease['token'], MutationKind::CREATE ),
+			$this->lease->release_reserved( $in->at( $in->revision, MutationPhase::RESERVED ) ),
 			'an in-flight lease may have reached the provider'
 		);
 	}
@@ -979,13 +1016,13 @@ final class MutationLeaseTest extends WP_UnitTestCase {
 	public function test_finalize_applies_an_allowlisted_outcome_and_clears_the_lease(): void {
 		$m     = $this->seed();
 		$lease = $this->lease->acquire( $m->id, $m->revision, MutationKind::CREATE, $this->driver );
-		$in    = (int) $this->lease->consume(
-			$this->binding( $this->repo->by_id( $m->id ), $lease['token'], $lease['revision'] )
+		$in    = $this->lease->consume(
+			$this->binding( $this->repo->by_id( $m->id ), $lease->token, $lease->revision )
 		);
 
 		$this->assertTrue(
 			$this->lease->finalize(
-				$m->id, $in, $lease['token'], MutationKind::CREATE, MutationPhase::IN_FLIGHT,
+				$in,
 				LeaseOutcome::bound( SslState::REQUESTED, 'ref-1', 'test-driver', OwnershipOrigin::CREATED, 'install-a' )
 			)
 		);
@@ -1000,17 +1037,14 @@ final class MutationLeaseTest extends WP_UnitTestCase {
 	public function test_finalize_fails_under_a_replaced_token(): void {
 		$m     = $this->seed();
 		$lease = $this->lease->acquire( $m->id, $m->revision, MutationKind::CREATE, $this->driver );
-		$in    = (int) $this->lease->consume(
-			$this->binding( $this->repo->by_id( $m->id ), $lease['token'], $lease['revision'] )
+		$in    = $this->lease->consume(
+			$this->binding( $this->repo->by_id( $m->id ), $lease->token, $lease->revision )
 		);
 
 		$this->force_lease( $m->id, MutationPhase::RECOVERING, 600 );
 
 		$this->assertFalse(
-			$this->lease->finalize(
-				$m->id, $in, $lease['token'], MutationKind::CREATE, MutationPhase::IN_FLIGHT,
-				LeaseOutcome::state( SslState::ACTIVE )
-			),
+			$this->lease->finalize( $in, LeaseOutcome::state( SslState::ACTIVE ) ),
 			'a fenced worker cannot apply its result'
 		);
 	}
@@ -1022,9 +1056,9 @@ final class MutationLeaseTest extends WP_UnitTestCase {
 
 	public function test_an_expired_reserved_lease_clears_without_a_read(): void {
 		$m     = $this->seed();
-		$token = $this->force_lease( $m->id, MutationPhase::RESERVED, -600 );
+		$owner = $this->force_lease( $m->id, MutationPhase::RESERVED, -600 );
 
-		$this->assertTrue( $this->lease->clear_expired_reserved( $m->id, $token ) );
+		$this->assertTrue( $this->lease->clear_expired_reserved( $owner ) );
 		$this->assertNull( $this->repo->by_id( $m->id )?->ssl_mutation_token );
 	}
 
@@ -1032,59 +1066,70 @@ final class MutationLeaseTest extends WP_UnitTestCase {
 		$m = $this->seed();
 
 		$live = $this->force_lease( $m->id, MutationPhase::RESERVED, 600 );
-		$this->assertFalse( $this->lease->clear_expired_reserved( $m->id, $live ) );
+		$this->assertFalse( $this->lease->clear_expired_reserved( $live ) );
 
 		$flight = $this->force_lease( $m->id, MutationPhase::IN_FLIGHT, -600 );
-		$this->assertFalse( $this->lease->clear_expired_reserved( $m->id, $flight ) );
+		$this->assertFalse( $this->lease->clear_expired_reserved( $flight ) );
 	}
 
-	public function test_claiming_recovery_replaces_the_token_and_preserves_the_kind(): void {
+	public function test_clearing_refuses_a_changed_provider_binding(): void {
+		$m     = $this->seed();
+		$owner = $this->force_lease( $m->id, MutationPhase::RESERVED, -600 );
+
+		$this->assertFalse(
+			$this->lease->clear_expired_reserved( $this->owner_with( $owner, 'environment', 'zone:elsewhere' ) )
+		);
+		$this->assertNotNull( $this->repo->by_id( $m->id )?->ssl_mutation_token );
+	}
+
+	public function test_claiming_recovery_replaces_the_token_and_preserves_the_binding(): void {
 		$m   = $this->seed();
 		$old = $this->force_lease( $m->id, MutationPhase::IN_FLIGHT, -600 );
 
-		$claim = $this->lease->claim_recovery( $m->id, $old, MutationKind::REMOVE, MutationPhase::IN_FLIGHT );
+		$claim = $this->lease->claim_recovery( $old );
 
 		$this->assertNotNull( $claim );
-		$this->assertNotSame( $old, $claim['token'] );
+		$this->assertNotSame( $old->token, $claim->token );
 
 		$after = $this->repo->by_id( $m->id );
 
 		$this->assertSame( MutationPhase::RECOVERING, $after?->ssl_mutation_phase );
 		$this->assertSame( MutationKind::REMOVE, $after?->ssl_mutation_kind );
-		$this->assertSame( $after?->revision, $claim['revision'] );
+		$this->assertSame( $after?->revision, $claim->revision );
+		$this->assertSame( $old->driver, $after?->ssl_mutation_driver, 'inherited, never rebound' );
+		$this->assertSame( $old->environment, $after?->ssl_mutation_environment );
+		$this->assertSame( $old->environment, $claim->environment );
 	}
 
 	public function test_claiming_recovery_refuses_an_unexpired_lease(): void {
-		$m     = $this->seed();
-		$token = $this->force_lease( $m->id, MutationPhase::IN_FLIGHT, 600 );
+		$m = $this->seed();
 
-		$this->assertNull(
-			$this->lease->claim_recovery( $m->id, $token, MutationKind::REMOVE, MutationPhase::IN_FLIGHT )
-		);
+		$this->assertNull( $this->lease->claim_recovery( $this->force_lease( $m->id, MutationPhase::IN_FLIGHT, 600 ) ) );
 	}
 
-	public function test_claiming_recovery_refuses_a_kind_that_changed_under_the_selector(): void {
+	/**
+	 * @dataProvider stale_claim_snapshots
+	 */
+	public function test_claiming_recovery_refuses_a_snapshot_that_moved( string $field, $value ): void {
 		$m   = $this->seed();
 		$old = $this->force_lease( $m->id, MutationPhase::IN_FLIGHT, -600 );
 
-		$this->assertNull(
-			$this->lease->claim_recovery( $m->id, $old, MutationKind::CREATE, MutationPhase::IN_FLIGHT ),
-			'the selector snapshot said create; the row says remove'
+		$this->assertNull( $this->lease->claim_recovery( $this->owner_with( $old, $field, $value ) ) );
+		$this->assertSame(
+			$old->token,
+			$this->repo->by_id( $m->id )?->ssl_mutation_token,
+			'a stale snapshot changes nothing at all'
 		);
-		$this->assertSame( $old, $this->repo->by_id( $m->id )?->ssl_mutation_token );
 	}
 
-	public function test_claiming_recovery_refuses_a_phase_that_changed_under_the_selector(): void {
-		$m   = $this->seed();
-		$old = $this->force_lease( $m->id, MutationPhase::RECOVERING, -600 );
-
-		$this->assertNull(
-			$this->lease->claim_recovery( $m->id, $old, MutationKind::REMOVE, MutationPhase::IN_FLIGHT ),
-			'an exact source phase, never a phase set'
-		);
-		$this->assertSame(
-			MutationPhase::RECOVERING,
-			$this->repo->by_id( $m->id )?->ssl_mutation_phase
+	/** @return array<string, array{0: string, 1: mixed}> */
+	public static function stale_claim_snapshots(): array {
+		return array(
+			'kind moved'        => array( 'kind', MutationKind::CREATE ),
+			'phase moved'       => array( 'phase', MutationPhase::RECOVERING ),
+			'token moved'       => array( 'token', '00000000000000000000000000000000' ),
+			'driver moved'      => array( 'driver', 'some-other-driver' ),
+			'environment moved' => array( 'environment', 'zone:somewhere-else' ),
 		);
 	}
 
@@ -1092,46 +1137,47 @@ final class MutationLeaseTest extends WP_UnitTestCase {
 		$m   = $this->seed();
 		$old = $this->force_lease( $m->id, MutationPhase::RECOVERING, -600 );
 
-		$claim = $this->lease->claim_recovery( $m->id, $old, MutationKind::REMOVE, MutationPhase::RECOVERING );
+		$claim = $this->lease->claim_recovery( $old );
 
 		$this->assertNotNull( $claim );
-		$this->assertNotSame( $old, $claim['token'] );
+		$this->assertNotSame( $old->token, $claim->token );
 	}
 
 	public function test_claiming_recovery_from_reserved_is_a_programming_error(): void {
-		$m   = $this->seed();
-		$old = $this->force_lease( $m->id, MutationPhase::RESERVED, -600 );
+		$m = $this->seed();
 
 		$this->expectException( \LogicException::class );
 
-		$this->lease->claim_recovery( $m->id, $old, MutationKind::REMOVE, MutationPhase::RESERVED );
+		$this->lease->claim_recovery( $this->force_lease( $m->id, MutationPhase::RESERVED, -600 ) );
 	}
 
-	public function test_extending_recovery_requires_the_owning_token_and_kind(): void {
+	/**
+	 * @dataProvider wrong_owner_values
+	 */
+	public function test_extending_recovery_refuses_any_wrong_owner_value( string $field, $value ): void {
 		$m     = $this->seed();
-		$old   = $this->force_lease( $m->id, MutationPhase::IN_FLIGHT, -600 );
-		$claim = $this->lease->claim_recovery( $m->id, $old, MutationKind::REMOVE, MutationPhase::IN_FLIGHT );
+		$claim = $this->lease->claim_recovery( $this->force_lease( $m->id, MutationPhase::IN_FLIGHT, -600 ) );
 
-		$this->assertFalse(
-			$this->lease->extend_recovery( $m->id, $claim['revision'], $old, MutationKind::REMOVE, 0 )
-		);
-		$this->assertFalse(
-			$this->lease->extend_recovery( $m->id, $claim['revision'], $claim['token'], MutationKind::CREATE, 0 )
-		);
-		$this->assertTrue(
-			$this->lease->extend_recovery( $m->id, $claim['revision'], $claim['token'], MutationKind::REMOVE, 0 )
-		);
+		// 'phase' is RECOVERING for a claim, so the shared provider's IN_FLIGHT
+		// value is still a wrong value here, as are the other five.
+		$this->assertFalse( $this->lease->extend_recovery( $this->owner_with( $claim, $field, $value ), 0 ) );
+	}
+
+	public function test_extending_recovery_succeeds_for_the_exact_owner(): void {
+		$m     = $this->seed();
+		$claim = $this->lease->claim_recovery( $this->force_lease( $m->id, MutationPhase::IN_FLIGHT, -600 ) );
+
+		$this->assertTrue( $this->lease->extend_recovery( $claim, 0 ) );
 	}
 
 	public function test_extending_recovery_persists_a_growing_backoff_inside_its_window(): void {
 		$m     = $this->seed();
-		$old   = $this->force_lease( $m->id, MutationPhase::IN_FLIGHT, -600 );
-		$claim = $this->lease->claim_recovery( $m->id, $old, MutationKind::REMOVE, MutationPhase::IN_FLIGHT );
+		$claim = $this->lease->claim_recovery( $this->force_lease( $m->id, MutationPhase::IN_FLIGHT, -600 ) );
 
-		$this->lease->extend_recovery( $m->id, $claim['revision'], $claim['token'], MutationKind::REMOVE, 0 );
+		$this->lease->extend_recovery( $claim, 0 );
 		$first = $this->repo->by_id( $m->id );
 
-		$this->lease->extend_recovery( $m->id, $first->revision, $claim['token'], MutationKind::REMOVE, 3 );
+		$this->lease->extend_recovery( $claim->at( $first->revision, MutationPhase::RECOVERING ), 3 );
 		$second = $this->repo->by_id( $m->id );
 
 		$this->assertSame( 0, $first?->ssl_transient_count );
@@ -1153,13 +1199,12 @@ final class MutationLeaseTest extends WP_UnitTestCase {
 
 	public function test_extending_recovery_on_a_stale_revision_affects_nothing(): void {
 		$m     = $this->seed();
-		$old   = $this->force_lease( $m->id, MutationPhase::IN_FLIGHT, -600 );
-		$claim = $this->lease->claim_recovery( $m->id, $old, MutationKind::REMOVE, MutationPhase::IN_FLIGHT );
+		$claim = $this->lease->claim_recovery( $this->force_lease( $m->id, MutationPhase::IN_FLIGHT, -600 ) );
 
-		$this->lease->extend_recovery( $m->id, $claim['revision'], $claim['token'], MutationKind::REMOVE, 0 );
+		$this->lease->extend_recovery( $claim, 0 );
 
 		$this->assertFalse(
-			$this->lease->extend_recovery( $m->id, $claim['revision'], $claim['token'], MutationKind::REMOVE, 1 ),
+			$this->lease->extend_recovery( $claim, 1 ),
 			'the revision moved; this worker no longer speaks for the row'
 		);
 	}
@@ -1167,17 +1212,17 @@ final class MutationLeaseTest extends WP_UnitTestCase {
 	public function test_delete_row_requires_the_exact_owner(): void {
 		$m     = $this->seed();
 		$lease = $this->lease->acquire( $m->id, $m->revision, MutationKind::REMOVE, $this->driver );
-		$in    = (int) $this->lease->consume(
-			$this->binding( $this->repo->by_id( $m->id ), $lease['token'], $lease['revision'], MutationKind::REMOVE )
+		$in    = $this->lease->consume(
+			$this->binding( $this->repo->by_id( $m->id ), $lease->token, $lease->revision, MutationKind::REMOVE )
 		);
 
 		$this->assertFalse(
-			$this->lease->delete_row( $m->id, $in, str_repeat( '0', 32 ), MutationKind::REMOVE, MutationPhase::IN_FLIGHT )
+			$this->lease->delete_row( $this->owner_with( $in, 'token', str_repeat( '0', 32 ) ) )
 		);
 		$this->assertNotNull( $this->repo->by_id( $m->id ) );
 
 		$this->assertTrue(
-			$this->lease->delete_row( $m->id, $in, $lease['token'], MutationKind::REMOVE, MutationPhase::IN_FLIGHT )
+			$this->lease->delete_row( $in )
 		);
 		$this->assertNull( $this->repo->by_id( $m->id ) );
 	}
@@ -1219,6 +1264,19 @@ final class LeaseBinding {
 		public readonly string $mutation_driver,
 		public readonly string $mutation_environment
 	) {}
+
+	/** The RESERVED owner this binding was granted against. */
+	public function owner(): LeaseOwner {
+		return new LeaseOwner(
+			$this->mapping_id,
+			$this->revision,
+			$this->token,
+			$this->kind,
+			MutationPhase::RESERVED,
+			$this->mutation_driver,
+			$this->mutation_environment
+		);
+	}
 }
 ```
 
@@ -1381,33 +1439,46 @@ use PostDomain\Support\Schema;
 
 final class MutationLease {
 
+	/**
+	 * Every value a lease owner possesses, pinned in one place so no CAS can
+	 * quietly omit one. Used with LeaseOwner::predicate_values().
+	 */
+	private const OWNER_PREDICATE = 'AND revision = %d
+				    AND ssl_mutation_token = %s AND ssl_mutation_kind = %s
+				    AND ssl_mutation_phase = %s
+				    AND ssl_mutation_driver = %s AND ssl_mutation_environment = %s';
+
 	public function __construct( private readonly Clock $clock ) {}
 
 	/**
 	 * Permitted only when the row carries NO lease. Expiry never frees a row for
 	 * ordinary work; it transfers the row to LeaseRecovery.
 	 *
-	 * @return array{token: string, revision: int}|null
-	 */
-	/**
-	 * @return array{token: string, revision: int, driver: string, environment: string}|null
+	 * The durable binding to this driver and provider environment is written
+	 * here, before anything can be sent, because a first create still has
+	 * ssl_provider = NULL and recovery must not have to guess which environment
+	 * received the request (spec §12.6).
 	 */
 	public function acquire(
 		int $mapping_id,
 		int $revision,
 		MutationKind $kind,
 		SslDriver $driver
-	): ?array {
+	): ?LeaseOwner {
 		global $wpdb;
 
-		$table       = Schema::domains_table();
-		$token       = bin2hex( random_bytes( 16 ) );
-		$expires     = gmdate( 'Y-m-d H:i:s', $this->clock->now()->getTimestamp() + TimingPolicy::lease_ttl() );
-		$environment = $driver->environment_id();
+		$identity = DriverIdentity::of( $driver );
 
-		// The binding is written here, before anything can be sent, because a
-		// first create still has ssl_provider = NULL and recovery must not have
-		// to guess which environment received the request (spec §12.6).
+		if ( $identity instanceof DriverUnavailable ) {
+			// A driver whose identifiers will not fit the columns or will not
+			// render safely must never reach SQL, an event, or a screen.
+			return null;
+		}
+
+		$table   = Schema::domains_table();
+		$token   = bin2hex( random_bytes( 16 ) );
+		$expires = gmdate( 'Y-m-d H:i:s', $this->clock->now()->getTimestamp() + TimingPolicy::lease_ttl() );
+
 		$affected = $wpdb->query( // phpcs:ignore WordPress.DB
 			$wpdb->prepare(
 				"UPDATE {$table}
@@ -1420,8 +1491,8 @@ final class MutationLease {
 				$kind->value,
 				MutationPhase::RESERVED->value,
 				$expires,
-				$driver->id(),
-				$environment,
+				$identity->driver_id,
+				$identity->environment_id,
 				$this->clock->mysql(),
 				$mapping_id,
 				$revision
@@ -1429,11 +1500,14 @@ final class MutationLease {
 		);
 
 		return 1 === $affected
-			? array(
-				'token'       => $token,
-				'revision'    => $revision + 1,
-				'driver'      => $driver->id(),
-				'environment' => $environment,
+			? new LeaseOwner(
+				$mapping_id,
+				$revision + 1,
+				$token,
+				$kind,
+				MutationPhase::RESERVED,
+				$identity->driver_id,
+				$identity->environment_id
 			)
 			: null;
 	}
@@ -1442,9 +1516,9 @@ final class MutationLease {
 	 * The consumption point: RESERVED -> IN_FLIGHT, before any provider call.
 	 * Every bound value is re-checked, with null-safe comparisons.
 	 *
-	 * @return int|null The in-flight revision, or null when the provider must not be called.
+	 * @return LeaseOwner|null The IN_FLIGHT owner, or null when the provider must not be called.
 	 */
-	public function consume( LeaseBinding $b ): ?int {
+	public function consume( LeaseBinding $b ): ?LeaseOwner {
 		global $wpdb;
 
 		$table = Schema::domains_table();
@@ -1485,11 +1559,21 @@ final class MutationLease {
 			)
 		);
 
-		return 1 === $affected ? $b->revision + 1 : null;
+		return 1 === $affected
+			? new LeaseOwner(
+				$b->mapping_id,
+				$b->revision + 1,
+				$b->token,
+				$b->kind,
+				MutationPhase::IN_FLIGHT,
+				$b->mutation_driver,
+				$b->mutation_environment
+			)
+			: null;
 	}
 
 	/** Releases a RESERVED lease after a refusal, before any provider call. */
-	public function release_reserved( int $mapping_id, int $revision, string $token, MutationKind $kind ): bool {
+	public function release_reserved( LeaseOwner $owner ): bool {
 		global $wpdb;
 
 		$table = Schema::domains_table();
@@ -1500,28 +1584,16 @@ final class MutationLease {
 				    SET ssl_mutation_token = NULL, ssl_mutation_kind = NULL,
 				        ssl_mutation_phase = NULL, ssl_mutation_expires_at = NULL,
 				        ssl_mutation_driver = NULL, ssl_mutation_environment = NULL,
+				        ssl_next_attempt_at = NULL, ssl_transient_count = 0,
 				        revision = revision + 1, updated_at = %s
-				  WHERE id = %d AND revision = %d AND ssl_mutation_token = %s
-				    AND ssl_mutation_kind = %s AND ssl_mutation_phase = %s",
-				$this->clock->mysql(),
-				$mapping_id,
-				$revision,
-				$token,
-				$kind->value,
-				MutationPhase::RESERVED->value
+				  WHERE id = %d " . self::OWNER_PREDICATE,
+				array_merge( array( $this->clock->mysql() ), $owner->predicate_values() )
 			)
 		);
 	}
 
 	/** Applies the result and clears the lease in one transition. */
-	public function finalize(
-		int $mapping_id,
-		int $revision,
-		string $token,
-		MutationKind $kind,
-		MutationPhase $phase,
-		LeaseOutcome $outcome
-	): bool {
+	public function finalize( LeaseOwner $owner, LeaseOutcome $outcome ): bool {
 		global $wpdb;
 
 		$table  = Schema::domains_table();
@@ -1558,47 +1630,37 @@ final class MutationLease {
 		$sets[] = 'updated_at = %s';
 
 		$values[] = $this->clock->mysql();
-		$values[] = $mapping_id;
-		$values[] = $revision;
-		$values[] = $token;
-		$values[] = $kind->value;
-		$values[] = $phase->value;
+		$values[] = $owner->mapping_id;
+		$values   = array_merge( $values, $owner->predicate_values() );
 
 		$sql = "UPDATE {$table} SET " . implode( ', ', $sets )
-			. ' WHERE id = %d AND revision = %d AND ssl_mutation_token = %s'
-			. ' AND ssl_mutation_kind = %s AND ssl_mutation_phase = %s';
+			. ' WHERE id = %d ' . self::OWNER_PREDICATE;
 
 		return 1 === $wpdb->query( $wpdb->prepare( $sql, $values ) ); // phpcs:ignore WordPress.DB
 	}
 
 	/** Deletes the row, owned by the exact lease. */
-	public function delete_row(
-		int $mapping_id,
-		int $revision,
-		string $token,
-		MutationKind $kind,
-		MutationPhase $phase
-	): bool {
+	public function delete_row( LeaseOwner $owner ): bool {
 		global $wpdb;
 
 		$table = Schema::domains_table();
 
 		return 1 === $wpdb->query( // phpcs:ignore WordPress.DB
 			$wpdb->prepare(
-				"DELETE FROM {$table}
-				  WHERE id = %d AND revision = %d AND ssl_mutation_token = %s
-				    AND ssl_mutation_kind = %s AND ssl_mutation_phase = %s",
-				$mapping_id,
-				$revision,
-				$token,
-				$kind->value,
-				$phase->value
+				"DELETE FROM {$table} WHERE id = %d " . self::OWNER_PREDICATE,
+				array_merge( array( $owner->mapping_id ), $owner->predicate_values() )
 			)
 		);
 	}
 
-	/** An expired RESERVED lease proves nothing was sent. */
-	public function clear_expired_reserved( int $mapping_id, string $token ): bool {
+	/**
+	 * An expired RESERVED lease proves nothing was sent.
+	 *
+	 * The revision is deliberately absent: this CAS races the owner's own
+	 * begin-mutation transition, which bumps it. Every other owned value is
+	 * pinned, plus the expiry that makes the row recoverable at all.
+	 */
+	public function clear_expired_reserved( LeaseOwner $owner ): bool {
 		global $wpdb;
 
 		$table = Schema::domains_table();
@@ -1611,12 +1673,18 @@ final class MutationLease {
 				        ssl_mutation_driver = NULL, ssl_mutation_environment = NULL,
 				        ssl_next_attempt_at = NULL, ssl_transient_count = 0,
 				        revision = revision + 1, updated_at = %s
-				  WHERE id = %d AND ssl_mutation_token = %s
-				    AND ssl_mutation_phase = %s AND ssl_mutation_expires_at <= %s",
+				  WHERE id = %d
+				    AND ssl_mutation_token = %s AND ssl_mutation_kind = %s
+				    AND ssl_mutation_phase = %s
+				    AND ssl_mutation_driver = %s AND ssl_mutation_environment = %s
+				    AND ssl_mutation_expires_at <= %s",
 				$this->clock->mysql(),
-				$mapping_id,
-				$token,
+				$owner->mapping_id,
+				$owner->token,
+				$owner->kind->value,
 				MutationPhase::RESERVED->value,
+				$owner->driver,
+				$owner->environment,
 				$this->clock->mysql()
 			)
 		);
@@ -1625,23 +1693,19 @@ final class MutationLease {
 	/**
 	 * Fences the original worker before any provider read.
 	 *
-	 * The CAS pins the preserved mutation kind and the EXACT source phase the
-	 * caller selected on. A selector result is a snapshot: by the time the claim
-	 * runs the row's kind or phase may already have moved, and a claim that
-	 * matched anyway would fence a mutation of a kind the caller cannot resolve
-	 * (spec §12.6).
+	 * The CAS pins the preserved mutation kind, the EXACT source phase, and the
+	 * durable driver and environment binding the caller's snapshot carried. A
+	 * selector result is a snapshot: by the time the claim runs, any of those may
+	 * have moved, and a claim that matched anyway would fence a mutation the
+	 * caller cannot resolve (spec §12.6).
 	 *
-	 * @return array{token: string, revision: int}|null
+	 * The binding columns are absent from the SET clause, so the recovery owner
+	 * inherits the original binding rather than rebinding to current configuration.
 	 */
-	public function claim_recovery(
-		int $mapping_id,
-		string $old_token,
-		MutationKind $kind,
-		MutationPhase $from
-	): ?array {
+	public function claim_recovery( LeaseOwner $expected ): ?LeaseOwner {
 		global $wpdb;
 
-		if ( MutationPhase::IN_FLIGHT !== $from && MutationPhase::RECOVERING !== $from ) {
+		if ( MutationPhase::IN_FLIGHT !== $expected->phase && MutationPhase::RECOVERING !== $expected->phase ) {
 			throw new \LogicException( 'Recovery is claimed only from IN_FLIGHT or RECOVERING.' );
 		}
 
@@ -1653,18 +1717,23 @@ final class MutationLease {
 			$wpdb->prepare(
 				"UPDATE {$table}
 				    SET ssl_mutation_token = %s, ssl_mutation_phase = %s,
-				        ssl_mutation_expires_at = %s, revision = revision + 1, updated_at = %s
-				  WHERE id = %d AND ssl_mutation_token = %s
-				    AND ssl_mutation_kind = %s
-				    AND ssl_mutation_phase = %s AND ssl_mutation_expires_at <= %s",
+				        ssl_mutation_expires_at = %s,
+				        revision = revision + 1, updated_at = %s
+				  WHERE id = %d
+				    AND ssl_mutation_token = %s AND ssl_mutation_kind = %s
+				    AND ssl_mutation_phase = %s
+				    AND ssl_mutation_driver = %s AND ssl_mutation_environment = %s
+				    AND ssl_mutation_expires_at <= %s",
 				$new,
 				MutationPhase::RECOVERING->value,
 				$expires,
 				$this->clock->mysql(),
-				$mapping_id,
-				$old_token,
-				$kind->value,
-				$from->value,
+				$expected->mapping_id,
+				$expected->token,
+				$expected->kind->value,
+				$expected->phase->value,
+				$expected->driver,
+				$expected->environment,
 				$this->clock->mysql()
 			)
 		);
@@ -1674,10 +1743,18 @@ final class MutationLease {
 		}
 
 		$revision = (int) $wpdb->get_var( // phpcs:ignore WordPress.DB
-			$wpdb->prepare( "SELECT revision FROM {$table} WHERE id = %d", $mapping_id ) // phpcs:ignore WordPress.DB
+			$wpdb->prepare( "SELECT revision FROM {$table} WHERE id = %d", $expected->mapping_id ) // phpcs:ignore WordPress.DB
 		);
 
-		return array( 'token' => $new, 'revision' => $revision );
+		return new LeaseOwner(
+			$expected->mapping_id,
+			$revision,
+			$new,
+			$expected->kind,
+			MutationPhase::RECOVERING,
+			$expected->driver,
+			$expected->environment
+		);
 	}
 
 	/**
@@ -1688,20 +1765,14 @@ final class MutationLease {
 	 * scheduled it is still the owner when it comes due; a re-read falling
 	 * outside the window would hand the row to a takeover instead.
 	 */
-	public function extend_recovery(
-		int $mapping_id,
-		int $revision,
-		string $token,
-		MutationKind $kind,
-		int $attempt
-	): bool {
+	public function extend_recovery( LeaseOwner $owner, int $attempt ): bool {
 		global $wpdb;
 
-		$table    = Schema::domains_table();
-		$backoff  = TimingPolicy::recovery_backoff( $attempt );
-		$now      = $this->clock->now()->getTimestamp();
-		$next     = gmdate( 'Y-m-d H:i:s', $now + $backoff );
-		$expires  = gmdate( 'Y-m-d H:i:s', $now + TimingPolicy::recovery_grace() + $backoff );
+		$table   = Schema::domains_table();
+		$backoff = TimingPolicy::recovery_backoff( $attempt );
+		$now     = $this->clock->now()->getTimestamp();
+		$next    = gmdate( 'Y-m-d H:i:s', $now + $backoff );
+		$expires = gmdate( 'Y-m-d H:i:s', $now + TimingPolicy::recovery_grace() + $backoff );
 
 		return 1 === $wpdb->query( // phpcs:ignore WordPress.DB
 			$wpdb->prepare(
@@ -1709,19 +1780,72 @@ final class MutationLease {
 				    SET ssl_mutation_expires_at = %s, ssl_next_attempt_at = %s,
 				        ssl_transient_count = %d, ssl_checked_at = %s,
 				        revision = revision + 1, updated_at = %s
-				  WHERE id = %d AND revision = %d AND ssl_mutation_token = %s
-				    AND ssl_mutation_kind = %s AND ssl_mutation_phase = %s",
-				$expires,
-				$next,
-				$attempt,
-				$this->clock->mysql(),
-				$this->clock->mysql(),
-				$mapping_id,
-				$revision,
-				$token,
-				$kind->value,
-				MutationPhase::RECOVERING->value
+				  WHERE id = %d " . self::OWNER_PREDICATE,
+				array_merge(
+					array( $expires, $next, $attempt, $this->clock->mysql(), $this->clock->mysql() ),
+					array( $owner->mapping_id ),
+					$owner->predicate_values()
+				)
 			)
+		);
+	}
+}
+```
+
+Create `src/Ssl/LeaseOwner.php`:
+
+```php
+<?php
+declare( strict_types = 1 );
+
+namespace PostDomain\Ssl;
+
+/**
+ * Everything a caller must prove to write through a lease it holds: the row, the
+ * revision it saw, the token, the kind, the phase, and the durable binding to the
+ * driver and provider environment the mutation began against.
+ *
+ * It exists so "pin every value the caller possesses" is structural rather than a
+ * discipline each CAS has to remember separately.
+ */
+final class LeaseOwner {
+
+	public function __construct(
+		public readonly int $mapping_id,
+		public readonly int $revision,
+		public readonly string $token,
+		public readonly MutationKind $kind,
+		public readonly MutationPhase $phase,
+		public readonly string $driver,
+		public readonly string $environment
+	) {}
+
+	/** The same owner, one phase along, at the revision that transition produced. */
+	public function at( int $revision, MutationPhase $phase ): self {
+		return new self(
+			$this->mapping_id,
+			$revision,
+			$this->token,
+			$this->kind,
+			$phase,
+			$this->driver,
+			$this->environment
+		);
+	}
+
+	/**
+	 * Values for MutationLease::OWNER_PREDICATE, in its placeholder order.
+	 *
+	 * @return array<int, int|string>
+	 */
+	public function predicate_values(): array {
+		return array(
+			$this->revision,
+			$this->token,
+			$this->kind->value,
+			$this->phase->value,
+			$this->driver,
+			$this->environment,
 		);
 	}
 }
@@ -1730,8 +1854,9 @@ final class MutationLease {
 - [ ] **Step 4: Run the test to verify it passes**
 
 Run: `composer test:integration -- --filter MutationLeaseTest`
-Expected: PASS — 43 tests (including the six phase-and-expiry cases and the nine
-changed-column cases)
+Expected: PASS — 55 tests (including the six phase-and-expiry cases, the nine
+changed-column cases, the six wrong-owner cases used twice, and the five stale
+claim snapshots)
 
 - [ ] **Step 5: Commit**
 
@@ -2037,7 +2162,12 @@ enum MutationDisposition: string {
 	/** Recovery replaced our token mid-flight: our result was discarded. */
 	case FENCED = 'fenced';
 
-	/** The provider confirmed, but the local write did not land. */
+	/**
+	 * The provider confirmed, but the local write did not land — or, after an
+	 * unconfirmed COMMIT, may or may not have landed. Either way this process
+	 * cannot claim success and must not repeat the provider call. The row is
+	 * re-read, and recovery or reconciliation settles what remains.
+	 */
 	case CONFIRMED_NOT_PERSISTED = 'confirmed_not_persisted';
 }
 ```
@@ -2085,7 +2215,7 @@ final class MutationResult {
 		return new self( MutationDisposition::FENCED, null, null, $note );
 	}
 
-	public static function not_persisted( string $note = 'the provider confirmed but the local write did not land' ): self {
+	public static function not_persisted( string $note = 'the provider confirmed; the local result could not be established here' ): self {
 		return new self( MutationDisposition::CONFIRMED_NOT_PERSISTED, null, null, $note );
 	}
 
@@ -2576,7 +2706,7 @@ execution, so the driver boundary re-checks what the gate already enforced."
 **Interfaces:**
 - Consumes: `MutationLease` (Task 3), `MutationAuthorization`, `ExecutionPermit`, `MutationOperation` (Task 4), `SslDriver` (Task 5).
 - Produces:
-  - `PostDomain\Ssl\GateResult` — readonly `object $result` (an `SslStatus` or `RemovalResult`), `int $in_flight_revision`, `string $lease_token`, `MutationOperation $operation`.
+  - `PostDomain\Ssl\GateResult` — readonly `object $result` (an `SslStatus` or `RemovalResult`), `LeaseOwner $owner` (the IN_FLIGHT owner the consumption CAS produced, carrying the revision, token, kind, phase, and durable binding), `MutationOperation $operation`.
   - `PostDomain\Ssl\MutationGate::__construct( MutationLease $lease, Clock $clock )` with `::execute( SslDriver $driver, SslResourceContext $context, MutationAuthorization $auth, ?string $argument = null ): GateResult|MutationRefusal` and `::release( MutationAuthorization $auth ): void`.
   - `PostDomain\Tests\Integration\Ssl\Fixtures\RecordingDriver` — the shared driver double used here and in Plans 08 and 09.
 
@@ -2817,6 +2947,7 @@ use PostDomain\Ssl\MutationAuthorization;
 use PostDomain\Ssl\MutationGate;
 use PostDomain\Ssl\MutationLease;
 use PostDomain\Ssl\MutationOperation;
+use PostDomain\Ssl\MutationPhase;
 use PostDomain\Ssl\MutationRefusal;
 use PostDomain\Ssl\SslResourceContext;
 use PostDomain\Support\Schema;
@@ -2860,10 +2991,10 @@ final class MutationGateTest extends WP_UnitTestCase {
 		$leased = $this->repo->by_id( $m->id );
 
 		$binding = new LeaseBinding(
-			$leased->id, $lease['revision'], $lease['token'], $op->kind(), $leased->host,
+			$leased->id, $lease->revision, $lease->token, $op->kind(), $leased->host,
 			$leased->ssl_provider, $leased->ssl_ref, $leased->challenge, $leased->ssl_method,
 			$leased->ssl_ownership_origin, $leased->ssl_owner_installation_id,
-			$lease['driver'], $lease['environment']
+			$lease->driver, $lease->environment
 		);
 
 		return array(
@@ -2878,10 +3009,10 @@ final class MutationGateTest extends WP_UnitTestCase {
 				'install-a',
 				'_x.mapped.test',
 				$this->driver->id(),
-				$lease['token']
+				$lease->token
 			),
-			'token'    => $lease['token'],
-			'revision' => $lease['revision'],
+			'token'    => $lease->token,
+			'revision' => $lease->revision,
 		);
 	}
 
@@ -2904,7 +3035,9 @@ final class MutationGateTest extends WP_UnitTestCase {
 		$setup  = $this->reserved( $this->seed(), MutationOperation::CREATE );
 		$result = $this->gate->execute( RecordingDriver::succeeding( 'ref-1' ), $setup['context'], $setup['auth'] );
 
-		$this->assertSame( $setup['revision'] + 1, $result->in_flight_revision );
+		$this->assertSame( $setup['revision'] + 1, $result->owner->revision );
+		$this->assertSame( MutationPhase::IN_FLIGHT, $result->owner->phase );
+		$this->assertSame( $setup['auth']->binding->mutation_environment, $result->owner->environment );
 	}
 
 	public function test_a_provider_environment_change_stops_the_call_before_it_is_sent(): void {
@@ -3081,8 +3214,7 @@ final class GateResult {
 	/** @param SslStatus|RemovalResult $result */
 	public function __construct(
 		public readonly object $result,
-		public readonly int $in_flight_revision,
-		public readonly string $lease_token,
+		public readonly LeaseOwner $owner,
 		public readonly MutationOperation $operation
 	) {}
 }
@@ -3152,9 +3284,9 @@ final class MutationGate {
 
 		$permit = ExecutionPermit::issue(
 			$auth->operation,
-			$auth->binding->mapping_id,
-			$in_flight,
-			$auth->binding->token,
+			$in_flight->mapping_id,
+			$in_flight->revision,
+			$in_flight->token,
 			$auth->expires_at
 		);
 
@@ -3165,17 +3297,12 @@ final class MutationGate {
 			MutationOperation::REMOVE        => $driver->remove( $context, $permit ),
 		};
 
-		return new GateResult( $result, $in_flight, $auth->binding->token, $auth->operation );
+		return new GateResult( $result, $in_flight, $auth->operation );
 	}
 
 	/** Releases the reservation held by an authorization that will never be consumed. */
 	public function release( MutationAuthorization $auth ): void {
-		$this->lease->release_reserved(
-			$auth->binding->mapping_id,
-			$auth->binding->revision,
-			$auth->binding->token,
-			$auth->binding->kind
-		);
+		$this->lease->release_reserved( $auth->binding->owner() );
 	}
 }
 ```
@@ -3250,6 +3377,7 @@ use PostDomain\Mapping\VerificationState;
 use PostDomain\Contracts\SslDriver;
 use PostDomain\Ssl\DriverFactory;
 use PostDomain\Ssl\LeaseOutcome;
+use PostDomain\Ssl\LeaseOwner;
 use PostDomain\Ssl\LeaseRecovery;
 use PostDomain\Ssl\MutationKind;
 use PostDomain\Ssl\MutationLease;
@@ -3446,16 +3574,12 @@ final class LeaseRecoveryTest extends WP_UnitTestCase {
 	}
 
 	public function test_the_fenced_original_worker_cannot_finalize(): void {
-		$m   = $this->seed( 'inflight.test', MutationPhase::IN_FLIGHT, -600 );
-		$old = (string) $m->ssl_mutation_token;
+		$m = $this->seed( 'inflight.test', MutationPhase::IN_FLIGHT, -600 );
 
 		$this->recovery->recover( $m, $this->resolver( RecoveryOutcome::inconclusive( 'x' ) ) );
 
 		$this->assertFalse(
-			$this->lease->finalize(
-				$m->id, $m->revision, $old, MutationKind::CREATE, MutationPhase::IN_FLIGHT,
-				LeaseOutcome::state( SslState::ACTIVE )
-			)
+			$this->lease->finalize( $this->owner_of( $m, MutationPhase::IN_FLIGHT ), LeaseOutcome::state( SslState::ACTIVE ) )
 		);
 	}
 
@@ -3679,16 +3803,12 @@ final class LeaseRecoveryTest extends WP_UnitTestCase {
 	}
 
 	public function test_a_superseded_recovery_worker_cannot_apply_a_result(): void {
-		$m   = $this->seed( 'recovering.test', MutationPhase::RECOVERING, -600 );
-		$old = (string) $m->ssl_mutation_token;
+		$m = $this->seed( 'recovering.test', MutationPhase::RECOVERING, -600 );
 
 		$this->recovery->recover( $m, $this->resolver( RecoveryOutcome::inconclusive( 'x' ) ) );
 
 		$this->assertFalse(
-			$this->lease->finalize(
-				$m->id, $m->revision, $old, MutationKind::CREATE, MutationPhase::RECOVERING,
-				LeaseOutcome::state( SslState::ACTIVE )
-			)
+			$this->lease->finalize( $this->owner_of( $m, MutationPhase::RECOVERING ), LeaseOutcome::state( SslState::ACTIVE ) )
 		);
 	}
 
@@ -3870,6 +3990,19 @@ final class LeaseRecoveryTest extends WP_UnitTestCase {
 		foreach ( array( 'MutationGate', 'MutationAuthorization', 'ExecutionPermit' ) as $needle ) {
 			$this->assertStringNotContainsString( $needle, $source );
 		}
+	}
+
+	/** The lease this row carried when the test seeded it. */
+	private function owner_of( Mapping $m, MutationPhase $phase ): LeaseOwner {
+		return new LeaseOwner(
+			$m->id,
+			$m->revision,
+			(string) $m->ssl_mutation_token,
+			$m->ssl_mutation_kind ?? MutationKind::CREATE,
+			$phase,
+			(string) $m->ssl_mutation_driver,
+			(string) $m->ssl_mutation_environment
+		);
 	}
 
 	/** Simulates another recovery worker claiming the row mid-read. */
@@ -4055,15 +4188,23 @@ final class LeaseRecovery {
 
 		$expired = $this->is_expired( $mapping );
 
+		$snapshot = $this->owner_from( $mapping );
+
+		if ( null === $snapshot ) {
+			// A lease without its binding is not a lease the repository would have
+			// accepted; leave it for an operator rather than guessing.
+			return 'skipped';
+		}
+
 		if ( MutationPhase::RESERVED === $phase ) {
 			if ( ! $expired ) {
 				return 'skipped';
 			}
 
 			// Nothing was sent: clear without contacting the provider, and record
-			// the clearance only if the phase-pinned CAS actually won.
+			// the clearance only if the owner-pinned CAS actually won.
 			$cleared = AtomicTransition::commit(
-				fn (): bool => $this->lease->clear_expired_reserved( $mapping->id, $token ),
+				fn (): bool => $this->lease->clear_expired_reserved( $snapshot ),
 				fn (): bool => EventLog::record(
 					$mapping->id,
 					$mapping->host,
@@ -4080,22 +4221,22 @@ final class LeaseRecovery {
 			}
 
 			// A lost CAS means someone else cleared it; anything else means the
-			// write did not land and the row is still leased for the next pass.
+			// write is not known to have landed. The next pass re-reads rather
+			// than assuming either way.
 			return $cleared->cas_lost() ? 'skipped' : 'deferred';
 		}
 
 		if ( $expired ) {
 			// Takeover: fence the previous owner before any provider read, pinning
-			// the kind and the exact phase this row was selected in.
-			$claim = $this->lease->claim_recovery( $mapping->id, $token, $kind, $phase );
+			// the kind, the exact phase, and the durable binding this row was
+			// selected with. A snapshot that has moved matches nothing.
+			$owner = $this->lease->claim_recovery( $snapshot );
 
-			if ( null === $claim ) {
+			if ( null === $owner ) {
 				return 'skipped';
 			}
 
-			$owner_token    = $claim['token'];
-			$owner_revision = $claim['revision'];
-			$attempt        = MutationPhase::RECOVERING === $phase ? $mapping->ssl_transient_count : 0;
+			$attempt = MutationPhase::RECOVERING === $phase ? $mapping->ssl_transient_count : 0;
 		} else {
 			// Continuation: this worker still owns the recovery lease and its
 			// scheduled re-read has come due. No token replacement, no fencing.
@@ -4103,9 +4244,8 @@ final class LeaseRecovery {
 				return 'skipped';
 			}
 
-			$owner_token    = $token;
-			$owner_revision = $mapping->revision;
-			$attempt        = $mapping->ssl_transient_count;
+			$owner   = $snapshot;
+			$attempt = $mapping->ssl_transient_count;
 		}
 
 		$current = $this->repo->by_id( $mapping->id );
@@ -4121,23 +4261,17 @@ final class LeaseRecovery {
 		$bound = $this->bound_driver( $current );
 
 		if ( is_string( $bound ) ) {
-			return $this->stay_fenced( $current, $kind, $phase, $owner_token, $owner_revision, $attempt, $bound );
+			return $this->stay_fenced( $current, $phase, $owner, $attempt, $bound );
 		}
 
 		// Read only. The resolver never issues a provider mutation.
-		$outcome = $resolver->resolve( $current, $kind, $owner_token, $bound );
+		$outcome = $resolver->resolve( $current, $kind, $owner->token, $bound );
 
 		if ( ! $outcome->conclusive ) {
 			$next = $attempt + 1;
 
 			$extended = AtomicTransition::commit(
-				fn (): bool => $this->lease->extend_recovery(
-					$mapping->id,
-					$owner_revision,
-					$owner_token,
-					$kind,
-					$next
-				),
+				fn (): bool => $this->lease->extend_recovery( $owner, $next ),
 				fn (): bool => EventLog::record(
 					$mapping->id,
 					$mapping->host,
@@ -4166,13 +4300,7 @@ final class LeaseRecovery {
 
 		if ( $outcome->delete_row ) {
 			$deleted = AtomicTransition::commit(
-				fn (): bool => $this->lease->delete_row(
-					$mapping->id,
-					$owner_revision,
-					$owner_token,
-					$kind,
-					MutationPhase::RECOVERING
-				),
+				fn (): bool => $this->lease->delete_row( $owner ),
 				fn (): bool => EventLog::record(
 					$mapping->id,
 					$mapping->host,
@@ -4194,14 +4322,7 @@ final class LeaseRecovery {
 		// Finalization also clears ssl_next_attempt_at and ssl_transient_count,
 		// so a resolved row carries no leftover recovery schedule (spec §12.6).
 		$applied = AtomicTransition::commit(
-			fn (): bool => $this->lease->finalize(
-				$mapping->id,
-				$owner_revision,
-				$owner_token,
-				$kind,
-				MutationPhase::RECOVERING,
-				$outcome->apply ?? LeaseOutcome::checked()
-			),
+			fn (): bool => $this->lease->finalize( $owner, $outcome->apply ?? LeaseOutcome::checked() ),
 			fn (): bool => EventLog::record(
 				$mapping->id,
 				$mapping->host,
@@ -4218,6 +4339,27 @@ final class LeaseRecovery {
 		}
 
 		return $applied->cas_lost() ? 'fenced' : 'deferred';
+	}
+
+	/** The lease exactly as the selector saw it, or null if it is incomplete. */
+	private function owner_from( Mapping $mapping ): ?LeaseOwner {
+		if ( null === $mapping->ssl_mutation_token
+			|| null === $mapping->ssl_mutation_kind
+			|| null === $mapping->ssl_mutation_phase
+			|| null === $mapping->ssl_mutation_driver
+			|| null === $mapping->ssl_mutation_environment ) {
+			return null;
+		}
+
+		return new LeaseOwner(
+			$mapping->id,
+			$mapping->revision,
+			$mapping->ssl_mutation_token,
+			$mapping->ssl_mutation_kind,
+			$mapping->ssl_mutation_phase,
+			$mapping->ssl_mutation_driver,
+			$mapping->ssl_mutation_environment
+		);
 	}
 
 	/**
@@ -4255,23 +4397,15 @@ final class LeaseRecovery {
 	 */
 	private function stay_fenced(
 		Mapping $mapping,
-		MutationKind $kind,
 		MutationPhase $phase,
-		string $owner_token,
-		int $owner_revision,
+		LeaseOwner $owner,
 		int $attempt,
 		string $reason
 	): string {
 		$next = $attempt + 1;
 
 		$extended = AtomicTransition::commit(
-			fn (): bool => $this->lease->extend_recovery(
-				$mapping->id,
-				$owner_revision,
-				$owner_token,
-				$kind,
-				$next
-			),
+			fn (): bool => $this->lease->extend_recovery( $owner, $next ),
 			fn (): bool => EventLog::record(
 				$mapping->id,
 				$mapping->host,
@@ -4280,7 +4414,7 @@ final class LeaseRecovery {
 				'recovery_blocked',
 				'cron',
 				array(
-					'kind'        => $kind->value,
+					'kind'        => $owner->kind->value,
 					'reason'      => $reason,
 					'driver'      => $mapping->ssl_mutation_driver,
 					'environment' => $mapping->ssl_mutation_environment,
@@ -4289,7 +4423,14 @@ final class LeaseRecovery {
 			)
 		);
 
-		return $extended->committed() ? 'blocked' : 'fenced';
+		// The same three-way reading as every other branch. Only a lost CAS proves
+		// another worker owns this row; a transaction, event, or commit failure is
+		// this database being unable to write, which is not fencing.
+		if ( $extended->committed() ) {
+			return 'blocked';
+		}
+
+		return $extended->cas_lost() ? 'fenced' : 'deferred';
 	}
 
 	private function is_expired( Mapping $mapping ): bool {
@@ -4592,17 +4733,18 @@ needing a rule of its own."
 ### Task 9: Registry, driver factory, cooldowns, shared preconditions, and the deletion authorizer
 
 **Files:**
-- Create: `src/Ssl/SslDriverRegistry.php`, `src/Ssl/DriverFactory.php`, `src/Ssl/DriverUnavailable.php`, `src/Ssl/Cooldown.php`, `src/Ssl/AuthorizerSupport.php`, `src/Ssl/DeletionAuthorizer.php`
-- Test: `tests/integration/Ssl/DriverFactoryTest.php`, `tests/integration/Ssl/DeletionAuthorizerTest.php`
+- Create: `src/Ssl/SslDriverRegistry.php`, `src/Ssl/DriverIdentity.php`, `src/Ssl/DriverFactory.php`, `src/Ssl/DriverUnavailable.php`, `src/Ssl/Cooldown.php`, `src/Ssl/AuthorizerSupport.php`, `src/Ssl/DeletionAuthorizer.php`
+- Test: `tests/unit/Ssl/DriverIdentityTest.php`, `tests/integration/Ssl/DriverFactoryTest.php`, `tests/integration/Ssl/DeletionAuthorizerTest.php`
 
 **Interfaces:**
 - Consumes: everything above, `FreshProof` (Plan 06).
 - Produces:
-  - `SslDriverRegistry::register()`, `::get()`, `::default()`, `::ids(): string[]`.
+  - `SslDriverRegistry::register( SslDriver $d ): true|DriverUnavailable`, `::get()`, `::default()`, `::ids(): string[]`, `::rejected(): DriverUnavailable[]`, `::reject( DriverUnavailable $r ): void`.
+  - `PostDomain\Ssl\DriverIdentity::of( SslDriver $d ): self|DriverUnavailable` with readonly `string $driver_id`, `string $environment_id`, and the public constants `MAX_DRIVER_ID` (60), `MAX_ENVIRONMENT_ID` (190), `DRIVER_ID_SYNTAX`, `ENVIRONMENT_SYNTAX`.
   - `PostDomain\Ssl\DriverUnavailable` — readonly `string $reason`, `string $driver_id`.
   - `PostDomain\Ssl\DriverFactory::registry(): SslDriverRegistry`, `::selected_driver_id(): string`, `::for_mapping( Mapping $m ): SslDriver|DriverUnavailable`, `::for_new_mapping(): SslDriver|DriverUnavailable`, `::reset(): void`.
   - `Cooldown::active_for()`, `::set()`.
-  - `PostDomain\Ssl\AuthorizerSupport::open_window( MappingRepository $repo, MutationLease $lease, Mapping $m, MutationOperation $op ): array{driver: SslDriver, context: SslResourceContext, lease: array{token: string, revision: int}, mapping: Mapping}|MutationRefusal` — resolves its driver through `DriverFactory`, so no caller can supply a different registry, `::check_identity( SslDriver $d, SslResourceContext $c, bool $require_bound_match ): ?MutationRefusal`, and `::refuse( MutationLease $l, Mapping $m, ?array $held, MutationKind $k, string $precondition, bool $transient ): MutationRefusal` — which **releases the reservation**.
+  - `PostDomain\Ssl\AuthorizerSupport::open_window( MappingRepository $repo, MutationLease $lease, Mapping $m, MutationOperation $op ): array{driver: SslDriver, context: SslResourceContext, lease: LeaseOwner, mapping: Mapping}|MutationRefusal` — resolves its driver through `DriverFactory`, so no caller can supply a different registry, `::check_identity( SslDriver $d, SslResourceContext $c, bool $require_bound_match ): ?MutationRefusal`, and `::refuse( MutationLease $l, Mapping $m, ?LeaseOwner $held, MutationKind $k, string $precondition, bool $transient ): MutationRefusal` — which **releases the reservation**.
   - `DeletionAuthorizer::__construct( MappingRepository $repo, FreshProof $proof, MutationLease $lease, Clock $clock )` with `::authorize( Mapping $m ): array{auth: MutationAuthorization, context: SslResourceContext, driver: SslDriver, lease: array{token: string, revision: int}, mapping: Mapping}|MutationRefusal`. No authorizer takes a registry: they all resolve through `DriverFactory`.
 
 Plan 08's create, adopt, and method-change authorizers reuse `AuthorizerSupport`
@@ -4969,8 +5111,43 @@ final class SslDriverRegistry {
 		$this->drivers[ $fallback->id() ] = $fallback;
 	}
 
-	public function register( SslDriver $driver ): void {
-		$this->drivers[ $driver->id() ] = $driver;
+	/**
+	 * Refusals collected while building this registry, so a misconfigured driver
+	 * is reportable in Diagnostics rather than merely absent.
+	 *
+	 * @var DriverUnavailable[]
+	 */
+	private array $rejected = array();
+
+	/** @return DriverUnavailable[] */
+	public function rejected(): array {
+		return $this->rejected;
+	}
+
+	public function reject( DriverUnavailable $refusal ): void {
+		$this->rejected[] = $refusal;
+	}
+
+	/**
+	 * @return true|DriverUnavailable A refusal naming why, never a silent drop.
+	 */
+	public function register( SslDriver $driver ) {
+		$identity = DriverIdentity::of( $driver );
+
+		if ( $identity instanceof DriverUnavailable ) {
+			return $identity;
+		}
+
+		// A duplicate id must not replace a registered driver: whichever one then
+		// answered would depend on filter order, and a bound row would resolve to
+		// a driver that is not the one it was bound to.
+		if ( isset( $this->drivers[ $identity->driver_id ] ) ) {
+			return new DriverUnavailable( 'driver_id_duplicate', $identity->driver_id );
+		}
+
+		$this->drivers[ $identity->driver_id ] = $driver;
+
+		return true;
 	}
 
 	public function get( string $id ): ?SslDriver {
@@ -5006,6 +5183,87 @@ final class DriverUnavailable {
 		public readonly string $reason,
 		public readonly string $driver_id
 	) {}
+}
+```
+
+Create `src/Ssl/DriverIdentity.php`:
+
+```php
+<?php
+declare( strict_types = 1 );
+
+namespace PostDomain\Ssl;
+
+use PostDomain\Contracts\SslDriver;
+
+/**
+ * The one boundary at which a driver's own identifiers are checked.
+ *
+ * `id()` and `environment_id()` are supplied by executable code an integrator
+ * registered, so they are trusted not to be hostile — but they are not trusted to
+ * be well-formed. These values are written into fixed-width columns, shown to
+ * operators, and compared for equality across process boundaries, so an empty,
+ * oversized, unstable, or control-character-bearing value has to be refused
+ * before it reaches SQL, REST, Diagnostics, an event, or a log line.
+ *
+ * The values stay readable. Nothing here hashes or obscures them.
+ */
+final class DriverIdentity {
+
+	/** Matches the ssl_mutation_driver column and ssl_provider. */
+	public const MAX_DRIVER_ID = 60;
+
+	/** Matches the ssl_mutation_environment column. */
+	public const MAX_ENVIRONMENT_ID = 190;
+
+	/** Lower-case, machine-readable, safe in an option key and a URL. */
+	public const DRIVER_ID_SYNTAX = '/^[a-z0-9][a-z0-9._-]*$/';
+
+	/** Printable ASCII only: no control characters, no line breaks, no tabs. */
+	public const ENVIRONMENT_SYNTAX = '/^[\x20-\x7E]+$/';
+
+	private function __construct(
+		public readonly string $driver_id,
+		public readonly string $environment_id
+	) {}
+
+	/** @return self|DriverUnavailable */
+	public static function of( SslDriver $driver ) {
+		$id = $driver->id();
+
+		if ( '' === $id || strlen( $id ) > self::MAX_DRIVER_ID ) {
+			return new DriverUnavailable( 'driver_id_length', self::describe( $id ) );
+		}
+
+		if ( 1 !== preg_match( self::DRIVER_ID_SYNTAX, $id ) ) {
+			return new DriverUnavailable( 'driver_id_syntax', self::describe( $id ) );
+		}
+
+		$environment = $driver->environment_id();
+
+		if ( '' === $environment || strlen( $environment ) > self::MAX_ENVIRONMENT_ID ) {
+			return new DriverUnavailable( 'environment_id_length', $id );
+		}
+
+		if ( 1 !== preg_match( self::ENVIRONMENT_SYNTAX, $environment ) ) {
+			return new DriverUnavailable( 'environment_id_syntax', $id );
+		}
+
+		// Determinism is the property the whole binding rests on: a value that
+		// differs between two calls cannot be compared across a process boundary.
+		if ( $driver->environment_id() !== $environment ) {
+			return new DriverUnavailable( 'environment_id_unstable', $id );
+		}
+
+		return new self( $id, $environment );
+	}
+
+	/** A safe rendering of a rejected id, for a refusal an operator will read. */
+	private static function describe( string $id ): string {
+		$safe = preg_replace( '/[^\x20-\x7E]/', '?', substr( $id, 0, 40 ) );
+
+		return '' === (string) $safe ? '(empty)' : (string) $safe;
+	}
 }
 ```
 
@@ -5048,8 +5306,14 @@ final class DriverFactory {
 		$drivers = (array) apply_filters( 'pd_ssl_drivers', array_merge( array( $null ), self::built_in_drivers() ) );
 
 		foreach ( $drivers as $driver ) {
-			if ( $driver instanceof SslDriver ) {
-				$registry->register( $driver );
+			if ( ! $driver instanceof SslDriver ) {
+				continue;
+			}
+
+			$registered = $registry->register( $driver );
+
+			if ( $registered instanceof DriverUnavailable ) {
+				$registry->reject( $registered );
 			}
 		}
 
@@ -5172,7 +5436,7 @@ use PostDomain\Verification\Challenge;
 final class AuthorizerSupport {
 
 	/**
-	 * @return array{driver: SslDriver, context: SslResourceContext, lease: array{token: string, revision: int}, mapping: Mapping}|MutationRefusal
+	 * @return array{driver: SslDriver, context: SslResourceContext, lease: LeaseOwner, mapping: Mapping}|MutationRefusal
 	 */
 	public static function open_window(
 		MappingRepository $repo,
@@ -5223,7 +5487,7 @@ final class AuthorizerSupport {
 				Environment::installation_id(),
 				$name,
 				$driver->id(),
-				$held['token']
+				$held->token
 			),
 			'lease'   => $held,
 			'mapping' => $leased,
@@ -5233,12 +5497,11 @@ final class AuthorizerSupport {
 	/**
 	 * Records the refusal and releases the reservation.
 	 *
-	 * @param array{token: string, revision: int}|null $held
 	 */
 	public static function refuse(
 		MutationLease $lease,
 		Mapping $mapping,
-		?array $held,
+		?LeaseOwner $held,
 		MutationKind $kind,
 		string $precondition,
 		bool $transient
@@ -5266,12 +5529,7 @@ final class AuthorizerSupport {
 		// The result is deliberately unused: the refusal stands either way, and
 		// an unreleased reservation is recovery's problem, not the caller's.
 		AtomicTransition::commit(
-			static fn(): bool => $lease->release_reserved(
-				$mapping->id,
-				$held['revision'],
-				$held['token'],
-				$kind
-			),
+			static fn(): bool => $lease->release_reserved( $held ),
 			$event
 		);
 
@@ -5300,14 +5558,11 @@ final class AuthorizerSupport {
 		return null;
 	}
 
-	/**
-	 * @param array{token: string, revision: int, driver: string, environment: string} $held
-	 */
-	public static function binding_for( Mapping $leased, array $held, MutationKind $kind ): LeaseBinding {
+	public static function binding_for( Mapping $leased, LeaseOwner $held, MutationKind $kind ): LeaseBinding {
 		return new LeaseBinding(
 			$leased->id,
-			$held['revision'],
-			$held['token'],
+			$held->revision,
+			$held->token,
 			$kind,
 			$leased->host,
 			$leased->ssl_provider,
@@ -5316,8 +5571,8 @@ final class AuthorizerSupport {
 			$leased->ssl_method,
 			$leased->ssl_ownership_origin,
 			$leased->ssl_owner_installation_id,
-			$held['driver'],
-			$held['environment']
+			$held->driver,
+			$held->environment
 		);
 	}
 }
@@ -5416,7 +5671,178 @@ final class DeletionAuthorizer {
 Run: `composer test:integration -- --filter DeletionAuthorizerTest`
 Expected: PASS — 15 tests
 
-- [ ] **Step 5: Write the failing test for the driver factory**
+- [ ] **Step 5: Write the failing test for identifier validation**
+
+Create `tests/unit/Ssl/DriverIdentityTest.php`:
+
+```php
+<?php
+declare( strict_types = 1 );
+
+namespace PostDomain\Tests\Unit\Ssl;
+
+use PHPUnit\Framework\TestCase;
+use PostDomain\Ssl\DriverIdentity;
+use PostDomain\Ssl\DriverUnavailable;
+use PostDomain\Ssl\NullDriver;
+use PostDomain\Tests\Unit\Ssl\Fixtures\IdentityDriver;
+
+final class DriverIdentityTest extends TestCase {
+
+	public function test_the_null_driver_is_valid(): void {
+		$identity = DriverIdentity::of( new NullDriver() );
+
+		$this->assertInstanceOf( DriverIdentity::class, $identity );
+		$this->assertSame( 'null', $identity->driver_id );
+		$this->assertSame( 'none', $identity->environment_id );
+	}
+
+	public function test_a_cloudflare_shaped_identity_is_valid(): void {
+		$identity = DriverIdentity::of( new IdentityDriver( 'cloudflare-saas', 'cf-zone:0123456789abcdef' ) );
+
+		$this->assertInstanceOf( DriverIdentity::class, $identity );
+		$this->assertSame( 'cf-zone:0123456789abcdef', $identity->environment_id );
+	}
+
+	/**
+	 * @dataProvider rejected_identities
+	 */
+	public function test_a_malformed_identity_is_refused_by_name( string $id, string $environment, string $reason ): void {
+		$result = DriverIdentity::of( new IdentityDriver( $id, $environment ) );
+
+		$this->assertInstanceOf( DriverUnavailable::class, $result );
+		$this->assertSame( $reason, $result->reason );
+	}
+
+	/** @return array<string, array{0: string, 1: string, 2: string}> */
+	public static function rejected_identities(): array {
+		return array(
+			'empty driver id'        => array( '', 'ok', 'driver_id_length' ),
+			'overlong driver id'     => array( str_repeat( 'a', 61 ), 'ok', 'driver_id_length' ),
+			'uppercase driver id'    => array( 'CloudFlare', 'ok', 'driver_id_syntax' ),
+			'spaced driver id'       => array( 'cloud flare', 'ok', 'driver_id_syntax' ),
+			'newline in driver id'   => array( "cf\nsaas", 'ok', 'driver_id_syntax' ),
+			'leading dash driver id' => array( '-cf', 'ok', 'driver_id_syntax' ),
+			'empty environment'      => array( 'cf', '', 'environment_id_length' ),
+			'overlong environment'   => array( 'cf', str_repeat( 'z', 191 ), 'environment_id_length' ),
+			'newline environment'    => array( 'cf', "zone:1\nzone:2", 'environment_id_syntax' ),
+			'tab environment'        => array( 'cf', "zone:\t1", 'environment_id_syntax' ),
+			'null byte environment'  => array( 'cf', "zone:\0", 'environment_id_syntax' ),
+			'non ascii environment'  => array( 'cf', 'zone:münchen', 'environment_id_syntax' ),
+		);
+	}
+
+	public function test_an_unstable_environment_is_refused(): void {
+		$result = DriverIdentity::of( IdentityDriver::unstable( 'cf' ) );
+
+		$this->assertInstanceOf( DriverUnavailable::class, $result );
+		$this->assertSame( 'environment_id_unstable', $result->reason );
+	}
+
+	public function test_a_refusal_renders_safely_for_an_operator(): void {
+		$result = DriverIdentity::of( new IdentityDriver( "bad\x01id", 'ok' ) );
+
+		$this->assertInstanceOf( DriverUnavailable::class, $result );
+		$this->assertMatchesRegularExpression( '/^[\x20-\x7E]*$/', $result->driver_id );
+	}
+
+	public function test_the_column_limits_match_the_schema(): void {
+		// If these drift from Plan 02's column widths, a valid identity would be
+		// silently truncated by MySQL instead of refused here.
+		$this->assertSame( 60, DriverIdentity::MAX_DRIVER_ID );
+		$this->assertSame( 190, DriverIdentity::MAX_ENVIRONMENT_ID );
+	}
+}
+```
+
+Create `tests/unit/Ssl/Fixtures/IdentityDriver.php`, a driver that exists only to
+return the identifiers a test asks for:
+
+```php
+<?php
+declare( strict_types = 1 );
+
+namespace PostDomain\Tests\Unit\Ssl\Fixtures;
+
+use PostDomain\Contracts\SslDriver;
+use PostDomain\Ssl\DriverCapabilities;
+use PostDomain\Ssl\ExecutionPermit;
+use PostDomain\Ssl\IdentityResult;
+use PostDomain\Ssl\NullDriver;
+use PostDomain\Ssl\ReconcileReport;
+use PostDomain\Ssl\RemovalResult;
+use PostDomain\Ssl\SslResourceContext;
+use PostDomain\Ssl\SslStatus;
+use PostDomain\Ssl\ValidationPlan;
+
+final class IdentityDriver implements SslDriver {
+
+	private int $environment_calls = 0;
+
+	public function __construct(
+		private readonly string $id,
+		private readonly string $environment,
+		private readonly bool $unstable = false
+	) {}
+
+	public static function unstable( string $id ): self {
+		return new self( $id, 'zone:one', true );
+	}
+
+	public function id(): string {
+		return $this->id;
+	}
+
+	public function environment_id(): string {
+		++$this->environment_calls;
+
+		return $this->unstable ? 'zone:' . $this->environment_calls : $this->environment;
+	}
+
+	public function capabilities(): DriverCapabilities {
+		return ( new NullDriver() )->capabilities();
+	}
+
+	public function status( SslResourceContext $ctx ): SslStatus {
+		return ( new NullDriver() )->status( $ctx );
+	}
+
+	public function identify( SslResourceContext $ctx ): IdentityResult {
+		return ( new NullDriver() )->identify( $ctx );
+	}
+
+	public function create( SslResourceContext $ctx, ExecutionPermit $permit ): SslStatus {
+		return ( new NullDriver() )->create( $ctx, $permit );
+	}
+
+	public function adopt( SslResourceContext $ctx, ExecutionPermit $permit ): SslStatus {
+		return ( new NullDriver() )->adopt( $ctx, $permit );
+	}
+
+	public function change_validation_method( SslResourceContext $ctx, string $method, ExecutionPermit $permit ): SslStatus {
+		return ( new NullDriver() )->change_validation_method( $ctx, $method, $permit );
+	}
+
+	public function remove( SslResourceContext $ctx, ExecutionPermit $permit ): RemovalResult {
+		return ( new NullDriver() )->remove( $ctx, $permit );
+	}
+
+	public function reconcile( array $contexts ): ReconcileReport {
+		return ( new NullDriver() )->reconcile( $contexts );
+	}
+
+	public function validation_plan( SslResourceContext $ctx, ?object $apex ): ValidationPlan {
+		return ( new NullDriver() )->validation_plan( $ctx, $apex );
+	}
+}
+```
+
+- [ ] **Step 6: Run it and verify it passes**
+
+Run: `vendor/bin/phpunit --testsuite unit --filter DriverIdentityTest`
+Expected: PASS — 17 tests (including the twelve malformed cases)
+
+- [ ] **Step 7: Write the failing test for the driver factory**
 
 Create `tests/integration/Ssl/DriverFactoryTest.php`:
 
@@ -5436,6 +5862,7 @@ use PostDomain\Ssl\DriverUnavailable;
 use PostDomain\Ssl\NullDriver;
 use PostDomain\Support\Schema;
 use PostDomain\Tests\Integration\Ssl\Fixtures\RecordingDriver;
+use PostDomain\Tests\Unit\Ssl\Fixtures\IdentityDriver;
 use WP_UnitTestCase;
 
 final class DriverFactoryTest extends WP_UnitTestCase {
@@ -5562,6 +5989,60 @@ final class DriverFactoryTest extends WP_UnitTestCase {
 		);
 	}
 
+	public function test_a_driver_with_a_malformed_id_is_refused_not_registered(): void {
+		add_filter(
+			'pd_ssl_drivers',
+			static fn( array $drivers ): array => array_merge( $drivers, array( new IdentityDriver( 'Bad Id', 'ok' ) ) )
+		);
+		DriverFactory::reset();
+
+		$this->assertNotContains( 'Bad Id', DriverFactory::registry()->ids() );
+		$this->assertNotSame( array(), DriverFactory::registry()->rejected() );
+		$this->assertSame( 'driver_id_syntax', DriverFactory::registry()->rejected()[0]->reason );
+	}
+
+	public function test_a_driver_with_an_unrenderable_environment_is_refused(): void {
+		add_filter(
+			'pd_ssl_drivers',
+			static fn( array $drivers ): array => array_merge( $drivers, array( new IdentityDriver( 'weird', "zone\n1" ) ) )
+		);
+		DriverFactory::reset();
+
+		$this->assertNotContains( 'weird', DriverFactory::registry()->ids() );
+		$this->assertSame( 'environment_id_syntax', DriverFactory::registry()->rejected()[0]->reason );
+	}
+
+	public function test_a_duplicate_driver_id_does_not_replace_the_registered_one(): void {
+		$first = RecordingDriver::succeeding( 'ref-1' );
+
+		add_filter(
+			'pd_ssl_drivers',
+			static fn( array $drivers ): array => array_merge(
+				$drivers,
+				array( $first, new IdentityDriver( 'recording', 'impostor' ) )
+			)
+		);
+		DriverFactory::reset();
+		$this->select( 'recording' );
+
+		$this->assertSame( $first, DriverFactory::for_new_mapping(), 'first registration wins' );
+		$this->assertSame( 'driver_id_duplicate', DriverFactory::registry()->rejected()[0]->reason );
+	}
+
+	public function test_a_refused_driver_never_yields_a_lease(): void {
+		add_filter(
+			'pd_ssl_drivers',
+			static fn( array $drivers ): array => array_merge( $drivers, array( new IdentityDriver( 'Bad Id', 'ok' ) ) )
+		);
+		DriverFactory::reset();
+		$this->select( 'Bad Id' );
+
+		$result = DriverFactory::for_new_mapping();
+
+		$this->assertInstanceOf( DriverUnavailable::class, $result );
+		$this->assertSame( 'driver_not_registered', $result->reason );
+	}
+
 	public function test_a_filter_returning_junk_is_ignored_rather_than_fatal(): void {
 		add_filter( 'pd_ssl_drivers', static fn(): array => array( 'not a driver', 42 ) );
 		DriverFactory::reset();
@@ -5571,20 +6052,20 @@ final class DriverFactoryTest extends WP_UnitTestCase {
 }
 ```
 
-- [ ] **Step 6: Run it and verify it passes**
+- [ ] **Step 8: Run it and verify it passes**
 
 Run: `composer test:integration -- --filter DriverFactoryTest`
-Expected: PASS — 11 tests
+Expected: PASS — 15 tests
 
-- [ ] **Step 7: Run the full suite**
+- [ ] **Step 9: Run the full suite**
 
 Run: `composer lint && composer analyse && composer test && composer test:integration`
 Expected: PASS
 
-- [ ] **Step 8: Commit**
+- [ ] **Step 10: Commit**
 
 ```bash
-git add src/Ssl/SslDriverRegistry.php src/Ssl/DriverFactory.php src/Ssl/DriverUnavailable.php src/Ssl/Cooldown.php src/Ssl/AuthorizerSupport.php src/Ssl/DeletionAuthorizer.php tests/integration/Ssl/DriverFactoryTest.php tests/integration/Ssl/DeletionAuthorizerTest.php
+git add src/Ssl/SslDriverRegistry.php src/Ssl/DriverIdentity.php src/Ssl/DriverFactory.php src/Ssl/DriverUnavailable.php src/Ssl/Cooldown.php src/Ssl/AuthorizerSupport.php src/Ssl/DeletionAuthorizer.php src/Ssl/LeaseOwner.php tests/unit/Ssl/DriverIdentityTest.php tests/unit/Ssl/Fixtures/IdentityDriver.php tests/integration/Ssl/DriverFactoryTest.php tests/integration/Ssl/DeletionAuthorizerTest.php
 git commit -m "Resolve every SSL driver through one factory, and refuse by name
 
 An existing mapping resolves through its stored provider; a new one resolves

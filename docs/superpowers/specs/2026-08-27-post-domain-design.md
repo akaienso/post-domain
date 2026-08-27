@@ -1080,6 +1080,31 @@ written in one transaction. On any other engine the transaction is skipped and t
 event log is **best-effort** — it can lag or miss rows, which is tolerable precisely
 because nothing reads it.
 
+**Ambient transactions.** WordPress core opens no transactions, but another plugin or an
+embedding application may have one open on the same connection, and on MySQL and MariaDB
+a `START TRANSACTION` issued inside one **implicitly commits** it. This plugin therefore
+never commits or rolls back a transaction it does not own. Before starting one it probes
+the session — `SAVEPOINT` followed by `RELEASE SAVEPOINT`, which succeeds inside a
+transaction and fails with "savepoint does not exist" outside one, needs no privilege, and
+neither commits nor rolls anything back in either state. Three outcomes:
+
+| Session | Behaviour |
+|---|---|
+| no transaction open | own the whole lifecycle: start, transition, event, commit or roll back |
+| a transaction already open | **refuse before running the transition**; report it and leave the ambient transaction untouched |
+| the probe itself fails | **refuse before running the transition** — an undetectable session is not a safe one |
+
+Refusing rather than nesting via savepoints is deliberate. A savepoint released inside
+somebody else's transaction leaves the plugin's write undurable until that owner commits,
+so reporting it as committed would be a lie; and rolling back to a savepoint on failure
+would still leave the caller's transaction in a state the plugin did not choose. A refusal
+costs one deferred attempt, which the lease and the recovery pass already handle.
+
+A refusal is not a lost CAS: nothing was attempted, the lease is untouched, and the next
+pass retries. Nothing else in the plugin opens a transaction, so this condition is
+expected to be vanishingly rare in practice; it is handled because the failure mode if it
+were ignored is another plugin's half-written transaction being committed.
+
 ### 12.4 Timestamps and storage hygiene
 
 All `DATETIME` columns are **UTC**, written with `gmdate('Y-m-d H:i:s')`.
@@ -2728,6 +2753,11 @@ Cloudflare client):**
 - an expired `RECOVERING` lease can be taken over by another worker without the previous
   recovery worker being able to clear or finalize the new one
 - a known provider result and the lease clear applied in **one** atomic transition
+- a transaction already open on the session is never committed or rolled back by this
+  plugin, and the caller's transaction and its unrelated writes survive intact
+- a failed transaction probe stops the transition before it begins
+- an uncertain `COMMIT` is never reported as success and never triggers an immediate
+  repeat of the provider mutation; local state is re-read before anything else is decided
 - transient recovery results cause another bounded read, never another provider mutation
 - the driver id and provider-environment identity are written into the lease **before**
   any provider call, pinned by the consumption CAS, inherited unchanged through recovery

@@ -1362,7 +1362,7 @@ invariants live in PHP at the only code that touches the table."
 - Consumes: `Schema` (Task 2).
 - Produces:
   - `PostDomain\Mapping\EventLog::record( int $domain_id, string $host, string $type, ?string $from, ?string $to, ?string $actor, array $detail = array() ): bool` — **true only when the row was inserted** — plus `::for_domain( int $domain_id ): array` and `::prune( int $retention_days ): int`.
-  - `PostDomain\Support\AtomicTransition::is_transactional(): bool` and `::commit( callable $transition, callable $event ): TransitionResult`, where `$transition` is the owner-pinned CAS returning `true` on exactly one affected row and `$event` is a `callable(): bool` recording the event.
+  - `PostDomain\Support\AtomicTransition::is_transactional(): bool`, `::in_ambient_transaction(): ?bool`, and `::commit( callable $transition, callable $event ): TransitionResult`, where `$transition` is the owner-pinned CAS returning `true` on exactly one affected row and `$event` is a `callable(): bool` recording the event.
   - `PostDomain\Support\TransitionOutcome` enum — `COMMITTED`, `CAS_LOST`, `EVENT_FAILED`, `TRANSACTION_UNAVAILABLE`, `COMMIT_UNCERTAIN`.
   - `PostDomain\Support\TransitionResult` — readonly `TransitionOutcome $outcome`, `string $detail`, with `::committed(): bool` and `::cas_lost(): bool`.
 
@@ -1379,14 +1379,24 @@ transition can never leave a success event behind.
 `AtomicTransition::commit()` is the single mechanism every later plan uses for
 this. Nothing in Plans 07–10 may pair a CAS with an event any other way.
 
-**It returns a result, not a boolean, because "not committed" has four causes and
+**It never touches a transaction it did not open.** WordPress core opens none, but
+another plugin may, and on MySQL and MariaDB a `START TRANSACTION` inside an
+existing transaction implicitly commits it. Before starting one, `commit()` probes
+the session with `SAVEPOINT` / `RELEASE SAVEPOINT` — privilege-free, identical on
+both engines, and side-effect-free in either state. If a transaction is already
+open, or if the probe itself cannot be trusted, the transition **never runs** and
+the result is `TRANSACTION_UNAVAILABLE`. Savepoint nesting was rejected: a
+savepoint released inside somebody else's transaction leaves the write undurable
+until that owner commits, so calling it committed would be false (spec §12.3).
+
+**It returns a result, not a boolean, because "not committed" has five causes and
 callers need different answers to them.** A CAS that lost means another owner has
-the row — discard and move on. A transaction that could not be started, an event
-that could not be inserted, or a `COMMIT` whose success is unknown all mean the
-local write did not land even though a provider call may already have happened.
-Collapsing those into `false` would let a caller report a fenced worker and a
-failed database write identically, which is exactly the confusion the fencing
-rules exist to prevent. `START TRANSACTION`, `COMMIT`, and `ROLLBACK` results are
+the row — discard and move on. A transaction that could not be started and an
+event that could not be inserted both mean the write definitely did not land. A
+`COMMIT` that was not confirmed means **nobody here knows** whether it landed, so
+the only honest next step is to re-read. Collapsing these into `false` would let a
+caller report a fenced worker, a failed database write, and an unknown outcome
+identically, which is exactly the confusion the fencing rules exist to prevent. `START TRANSACTION`, `COMMIT`, and `ROLLBACK` results are
 therefore checked rather than assumed, and a transition never begins when the
 required transaction could not be established.
 
@@ -1589,6 +1599,48 @@ final class AtomicTransition {
 	}
 
 	/**
+	 * Is a transaction already open on this connection?
+	 *
+	 * SAVEPOINT succeeds in both states. RELEASE SAVEPOINT succeeds only inside a
+	 * transaction; outside one, autocommit has already ended the statement's own
+	 * transaction and the savepoint no longer exists. The probe needs no
+	 * privilege, works the same on MySQL and MariaDB, and — this is the point —
+	 * neither commits nor rolls back anything in either state.
+	 *
+	 * `$wpdb->last_error` is the signal, so errors are suppressed and the previous
+	 * suppression state and error text are restored: a probe must not look like a
+	 * failure to whatever ran before it.
+	 *
+	 * @return bool|null True inside a transaction, false outside one, null when
+	 *                   the probe itself could not be trusted.
+	 */
+	public static function in_ambient_transaction(): ?bool {
+		global $wpdb;
+
+		$name       = 'pd_probe_' . bin2hex( random_bytes( 4 ) );
+		$suppressed = $wpdb->suppress_errors( true );
+		$prior      = $wpdb->last_error;
+
+		$set = $wpdb->query( "SAVEPOINT {$name}" ); // phpcs:ignore WordPress.DB
+
+		if ( false === $set ) {
+			$wpdb->suppress_errors( $suppressed );
+			$wpdb->last_error = $prior;
+
+			return null;
+		}
+
+		$released = $wpdb->query( "RELEASE SAVEPOINT {$name}" ); // phpcs:ignore WordPress.DB
+
+		$wpdb->suppress_errors( $suppressed );
+		$wpdb->last_error = $prior;
+
+		// Released cleanly => the savepoint outlived its statement => a
+		// transaction is open. Refused => there was none.
+		return false !== $released;
+	}
+
+	/**
 	 * @param callable(): bool $transition The owner-pinned CAS. True ⇒ exactly one row changed.
 	 * @param callable(): bool $event      Records the event. True ⇒ the row was inserted.
 	 */
@@ -1613,6 +1665,24 @@ final class AtomicTransition {
 				: new TransitionResult( TransitionOutcome::COMMITTED, 'committed; the best-effort event was not recorded' );
 		}
 
+		// START TRANSACTION inside somebody else's transaction implicitly commits
+		// it. Refuse rather than take a write we do not own with us (spec §12.3).
+		$ambient = self::in_ambient_transaction();
+
+		if ( null === $ambient ) {
+			return new TransitionResult(
+				TransitionOutcome::TRANSACTION_UNAVAILABLE,
+				'the session transaction state could not be determined'
+			);
+		}
+
+		if ( true === $ambient ) {
+			return new TransitionResult(
+				TransitionOutcome::TRANSACTION_UNAVAILABLE,
+				'a transaction opened elsewhere is already active on this connection'
+			);
+		}
+
 		if ( false === $wpdb->query( 'START TRANSACTION' ) ) { // phpcs:ignore WordPress.DB
 			// The transition is never attempted: without the transaction there is
 			// no way to keep it and its event together.
@@ -1631,14 +1701,18 @@ final class AtomicTransition {
 			}
 
 			if ( false === $wpdb->query( 'COMMIT' ) ) { // phpcs:ignore WordPress.DB
-				// Whether the server applied it is unknown. Never call this
-				// committed; reconciliation and recovery settle the row.
-				return new TransitionResult( TransitionOutcome::COMMIT_UNCERTAIN, 'COMMIT failed or returned an unknown result' );
+				// The client did not get confirmation. That is NOT the same as
+				// knowing the server discarded it — the transaction may well have
+				// committed. No rollback is attempted, because rolling back a
+				// transaction that already committed is meaningless and rolling
+				// back one that did not is what the connection will do anyway.
+				// The caller re-reads; recovery and reconciliation settle the rest.
+				return new TransitionResult( TransitionOutcome::COMMIT_UNCERTAIN, 'COMMIT was not confirmed; the outcome is unknown' );
 			}
 
 			return new TransitionResult( TransitionOutcome::COMMITTED, 'committed' );
 		} catch ( \Throwable $e ) {
-			self::undo( TransitionOutcome::COMMIT_UNCERTAIN, 'rolled back after an exception' );
+			self::undo( TransitionOutcome::CAS_LOST, 'rolled back after an exception' );
 
 			throw $e;
 		} finally {
@@ -1681,7 +1755,11 @@ enum TransitionOutcome: string {
 	/** No transaction could be started, so the transition was never attempted. */
 	case TRANSACTION_UNAVAILABLE = 'transaction_unavailable';
 
-	/** The commit or the rollback failed: the row's state is not known here. */
+	/**
+	 * The commit was not confirmed, or a rollback failed. The transition may or
+	 * may not have landed and this process cannot tell. Never success, never
+	 * fencing, and never a reason to repeat a provider call: re-read instead.
+	 */
 	case COMMIT_UNCERTAIN = 'commit_uncertain';
 }
 ```
@@ -1851,6 +1929,32 @@ final class AtomicTransitionTest extends WP_UnitTestCase {
 		$this->assertSame( TransitionOutcome::COMMIT_UNCERTAIN, $result->outcome );
 		$this->assertFalse( $result->committed() );
 		$this->assertFalse( $result->cas_lost(), 'an uncertain commit is not a lost CAS' );
+		$this->assertStringContainsString( 'unknown', $result->detail, 'the wording must not claim a rollback' );
+	}
+
+	public function test_an_uncertain_commit_attempts_no_rollback(): void {
+		$this->as_engine( 'InnoDB' );
+
+		$issued = array();
+
+		add_filter(
+			'query',
+			$spy = static function ( string $q ) use ( &$issued ): string {
+				$issued[] = $q;
+
+				return 'COMMIT' === $q ? 'SELECT bad_syntax FROM' : $q;
+			}
+		);
+
+		AtomicTransition::commit( static fn(): bool => true, $this->event( 115 ) );
+
+		remove_filter( 'query', $spy );
+
+		$this->assertNotContains(
+			'ROLLBACK',
+			$issued,
+			'rolling back a transaction that may already have committed decides nothing'
+		);
 	}
 
 	public function test_a_failed_rollback_is_reported_as_uncertain_not_as_a_lost_cas(): void {
@@ -1933,6 +2037,104 @@ final class AtomicTransitionTest extends WP_UnitTestCase {
 		);
 	}
 
+	public function test_a_top_level_transition_owns_its_own_transaction(): void {
+		$this->as_engine( 'InnoDB' );
+
+		$this->assertFalse( AtomicTransition::in_ambient_transaction(), 'the probe sees a clean session' );
+		$this->assertTrue( AtomicTransition::commit( static fn(): bool => true, $this->event( 110 ) )->committed() );
+		$this->assertFalse( AtomicTransition::in_ambient_transaction(), 'and leaves it clean' );
+	}
+
+	public function test_an_ambient_transaction_is_detected(): void {
+		global $wpdb;
+
+		$this->as_engine( 'InnoDB' );
+
+		$wpdb->query( 'START TRANSACTION' ); // phpcs:ignore WordPress.DB
+
+		$this->assertTrue( AtomicTransition::in_ambient_transaction() );
+
+		$wpdb->query( 'ROLLBACK' ); // phpcs:ignore WordPress.DB
+	}
+
+	public function test_an_ambient_transaction_refuses_before_the_transition_runs(): void {
+		global $wpdb;
+
+		$this->as_engine( 'InnoDB' );
+		$ran = false;
+
+		$wpdb->query( 'START TRANSACTION' ); // phpcs:ignore WordPress.DB
+
+		$result = AtomicTransition::commit(
+			static function () use ( &$ran ): bool {
+				$ran = true;
+
+				return true;
+			},
+			$this->event( 111 )
+		);
+
+		$still_open = AtomicTransition::in_ambient_transaction();
+
+		$wpdb->query( 'ROLLBACK' ); // phpcs:ignore WordPress.DB
+
+		$this->assertSame( TransitionOutcome::TRANSACTION_UNAVAILABLE, $result->outcome );
+		$this->assertFalse( $ran, 'nothing is written into a transaction this plugin does not own' );
+		$this->assertTrue( $still_open, 'and the ambient transaction is neither committed nor rolled back' );
+		$this->assertCount( 0, EventLog::for_domain( 111 ) );
+	}
+
+	public function test_an_ambient_transaction_keeps_its_own_unrelated_writes(): void {
+		global $wpdb;
+
+		$this->as_engine( 'InnoDB' );
+
+		$wpdb->query( 'START TRANSACTION' ); // phpcs:ignore WordPress.DB
+		EventLog::record( 112, 'callers-own.test', 'admin', null, null, 'someone-else' );
+
+		AtomicTransition::commit( static fn(): bool => true, $this->event( 113 ) );
+
+		// Still the caller's to decide, and still uncommitted.
+		$this->assertCount( 1, EventLog::for_domain( 112 ) );
+
+		$wpdb->query( 'ROLLBACK' ); // phpcs:ignore WordPress.DB
+
+		$this->assertCount( 0, EventLog::for_domain( 112 ), 'the caller rolled back its own work' );
+		$this->assertCount( 0, EventLog::for_domain( 113 ) );
+	}
+
+	public function test_a_probe_that_cannot_be_trusted_stops_the_transition(): void {
+		$this->as_engine( 'InnoDB' );
+		$ran = false;
+
+		add_filter( 'query', $fail = static fn( string $q ): string => str_starts_with( $q, 'SAVEPOINT' ) ? 'SELECT bad_syntax FROM' : $q );
+
+		$result = AtomicTransition::commit(
+			static function () use ( &$ran ): bool {
+				$ran = true;
+
+				return true;
+			},
+			$this->event( 114 )
+		);
+
+		remove_filter( 'query', $fail );
+
+		$this->assertSame( TransitionOutcome::TRANSACTION_UNAVAILABLE, $result->outcome );
+		$this->assertFalse( $ran );
+	}
+
+	public function test_the_probe_leaves_no_error_behind(): void {
+		global $wpdb;
+
+		$this->as_engine( 'InnoDB' );
+		$wpdb->last_error = '';
+
+		AtomicTransition::in_ambient_transaction();
+
+		$this->assertSame( '', $wpdb->last_error, 'a probe must not look like a failure to the next caller' );
+	}
+
 	public function test_on_a_nontransactional_engine_a_zero_row_cas_still_records_no_event(): void {
 		$this->as_engine( 'MyISAM' );
 
@@ -1956,7 +2158,7 @@ final class AtomicTransitionTest extends WP_UnitTestCase {
 - [ ] **Step 6: Run it and verify it passes**
 
 Run: `composer test:integration -- --filter AtomicTransitionTest`
-Expected: PASS — 14 tests
+Expected: PASS — 20 tests
 
 - [ ] **Step 7: Commit**
 
@@ -1970,9 +2172,10 @@ event stays best-effort, but it is attempted only after the CAS succeeds, so a
 fenced worker can never leave a success event behind.
 
 The result is typed rather than boolean: a lost CAS means someone else owns the
-row, while an unavailable transaction, a failed event, or an uncertain commit all
-mean the local write did not land after a provider call may already have gone
-out. Those need different answers, so they are not collapsed."
+row, while an unavailable transaction, a failed event, or an uncertain commit are
+each a different kind of not-knowing. Those need different answers, so they are
+not collapsed. And a transaction opened elsewhere on the connection is never
+committed or rolled back here — the transition simply does not run."
 ```
 
 ---
