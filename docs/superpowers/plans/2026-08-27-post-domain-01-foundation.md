@@ -1774,6 +1774,302 @@ hijacked by whichever plugin autoloads its copy of the same library first."
 
 ---
 
+### Task 10: Mechanically validating the plans' own PHP examples
+
+**Files:**
+- Create: `bin/check-plan-examples.php`
+- Modify: `composer.json` (add the `lint:plans` script), `.github/workflows/ci.yml`
+- Test: `tests/unit/PlanExamplesTest.php`
+
+**Interfaces:**
+- Consumes: nothing at runtime — this is a developer tool, like the schema generator.
+- Produces: `composer lint:plans`, which fails on a plan example that will not parse or that references a `PostDomain\` class no plan defines.
+
+Every task in this suite prescribes exact PHP, and a worker will paste it. A
+missing `use` statement or a signature that drifted between plans is then found
+by a human at implementation time, one task at a time. This checks it in one
+command before any of it is written.
+
+The check is deliberately modest, because over-promising here is worse than
+under-promising:
+
+- **Complete files** — fenced `php` blocks whose first line is `<?php` — are
+  written to a temporary file and passed through `php -l`.
+- **Fragments** (method bodies, `composer.json` additions, snippets introduced by
+  "Add to …") are **not** linted. They are counted and reported, so a run that
+  covers little is visibly a run that covers little rather than a silent pass.
+- **Duplicate declarations** fail the check, unless the block is introduced by
+  a "Replace `src/…` with" line — the one form in which a later plan
+  deliberately restates a type an earlier plan created.
+- **Symbol resolution** is checked across the whole suite, in both forms the
+  plans use: every `use PostDomain\…;` and every fully qualified
+  `\PostDomain\…` written inline must name a class, interface, enum, or trait
+  that some block in some plan declares. That is what catches a `Reconciler` calling
+  `AtomicTransition` it never imported, a constructor argument left over from a
+  retired design, or a class two plans spell differently.
+
+It cannot prove the code is correct. It can prove it parses and that its names
+resolve, which are exactly the failures that survived the last review.
+
+- [ ] **Step 1: Write the failing test**
+
+Create `tests/unit/PlanExamplesTest.php`:
+
+```php
+<?php
+declare( strict_types = 1 );
+
+namespace PostDomain\Tests\Unit;
+
+use PHPUnit\Framework\TestCase;
+
+final class PlanExamplesTest extends TestCase {
+
+	private function root(): string {
+		return dirname( __DIR__, 2 );
+	}
+
+	/** @return array{code: int, output: string} */
+	private function run(): array {
+		$output = (string) shell_exec(
+			'php ' . escapeshellarg( $this->root() . '/bin/check-plan-examples.php' ) . ' 2>&1; echo "EXIT:$?"'
+		);
+
+		preg_match( '/EXIT:(\d+)\s*$/', $output, $m );
+
+		return array( 'code' => (int) ( $m[1] ?? 1 ), 'output' => $output );
+	}
+
+	public function test_every_prescribed_example_parses_and_resolves(): void {
+		$result = $this->run();
+
+		$this->assertSame( 0, $result['code'], $result['output'] );
+	}
+
+	public function test_the_report_states_how_much_it_actually_checked(): void {
+		$result = $this->run();
+
+		$this->assertMatchesRegularExpression( '/complete files linted: \d+/', $result['output'] );
+		$this->assertMatchesRegularExpression( '/fragments not linted: \d+/', $result['output'] );
+		$this->assertMatchesRegularExpression( '/symbols resolved: \d+/', $result['output'] );
+	}
+
+	public function test_an_unresolvable_symbol_fails_the_check(): void {
+		$fixture = sys_get_temp_dir() . '/pd-plan-fixture-' . getmypid() . '.md';
+
+		file_put_contents(
+			$fixture,
+			"# fixture\n\n```php\n<?php\nnamespace PostDomain\\Ssl;\n\nuse PostDomain\\Ssl\\NoSuchClass;\n\nfinal class Fixture {}\n```\n"
+		);
+
+		$output = (string) shell_exec(
+			'php ' . escapeshellarg( $this->root() . '/bin/check-plan-examples.php' )
+			. ' --only=' . escapeshellarg( $fixture ) . ' 2>&1; echo "EXIT:$?"'
+		);
+
+		unlink( $fixture );
+
+		$this->assertStringContainsString( 'NoSuchClass', $output );
+		$this->assertStringContainsString( 'EXIT:1', $output );
+	}
+
+	public function test_a_syntax_error_fails_the_check(): void {
+		$fixture = sys_get_temp_dir() . '/pd-plan-syntax-' . getmypid() . '.md';
+
+		file_put_contents( $fixture, "# fixture\n\n```php\n<?php\nfinal class Broken {\n```\n" );
+
+		$output = (string) shell_exec(
+			'php ' . escapeshellarg( $this->root() . '/bin/check-plan-examples.php' )
+			. ' --only=' . escapeshellarg( $fixture ) . ' 2>&1; echo "EXIT:$?"'
+		);
+
+		unlink( $fixture );
+
+		$this->assertStringContainsString( 'EXIT:1', $output );
+	}
+}
+```
+
+- [ ] **Step 2: Run the test to verify it fails**
+
+Run: `vendor/bin/phpunit --testsuite unit --filter PlanExamplesTest`
+Expected: FAIL — `Could not open input file: …/bin/check-plan-examples.php`
+
+- [ ] **Step 3: Write minimal implementation**
+
+Create `bin/check-plan-examples.php`:
+
+```php
+<?php
+/**
+ * Parses the PHP examples in the plan documents and checks that they compile and
+ * that every PostDomain symbol they import is declared somewhere in the suite.
+ *
+ * Developer tool. Never loaded by the plugin, never reaches the network.
+ *
+ * @package PostDomain
+ */
+
+declare( strict_types = 1 );
+
+$pd_root  = dirname( __DIR__ );
+$pd_only  = null;
+
+foreach ( array_slice( $argv, 1 ) as $pd_arg ) {
+	if ( str_starts_with( $pd_arg, '--only=' ) ) {
+		$pd_only = substr( $pd_arg, strlen( '--only=' ) );
+	}
+}
+
+$pd_files = null === $pd_only
+	? glob( $pd_root . '/docs/superpowers/plans/*.md' )
+	: array( $pd_only );
+
+$pd_declared = array();
+$pd_imports  = array();
+$pd_complete = 0;
+$pd_fragment = 0;
+$pd_errors   = array();
+$pd_tmp      = tempnam( sys_get_temp_dir(), 'pd-example-' ) . '.php';
+
+foreach ( (array) $pd_files as $pd_file ) {
+	$pd_body = (string) file_get_contents( (string) $pd_file );
+	$pd_name = basename( (string) $pd_file );
+
+	preg_match_all( '/^```php\R(.*?)^```/ms', $pd_body, $pd_blocks, PREG_OFFSET_CAPTURE );
+
+	foreach ( $pd_blocks[1] as $pd_index => $pd_capture ) {
+		list( $pd_block, $pd_offset ) = $pd_capture;
+
+		// A block introduced by "Replace `src/...` with" deliberately restates a
+		// type an earlier plan created. Anything else declaring a name twice is
+		// two plans disagreeing about the same file.
+		$pd_lead      = substr( $pd_body, max( 0, $pd_offset - 200 ), 200 );
+		$pd_is_replace = str_contains( $pd_lead, 'Replace `' );
+
+		if ( ! str_starts_with( ltrim( $pd_block ), '<?php' ) ) {
+			++$pd_fragment;
+
+			continue;
+		}
+
+		++$pd_complete;
+
+		file_put_contents( $pd_tmp, $pd_block );
+
+		$pd_lint = array();
+		$pd_code = 0;
+		exec( 'php -l ' . escapeshellarg( $pd_tmp ) . ' 2>&1', $pd_lint, $pd_code );
+
+		if ( 0 !== $pd_code ) {
+			$pd_errors[] = sprintf(
+				'%s block %d: %s',
+				$pd_name,
+				$pd_index + 1,
+				implode( ' ', $pd_lint )
+			);
+		}
+
+		// Declarations: namespace + declared type names in this block.
+		preg_match( '/^namespace\s+([^;]+);/m', $pd_block, $pd_ns );
+		$pd_namespace = isset( $pd_ns[1] ) ? trim( $pd_ns[1] ) : '';
+
+		preg_match_all( '/^(?:final\s+|abstract\s+)?(?:class|interface|trait|enum)\s+(\w+)/m', $pd_block, $pd_types );
+
+		foreach ( $pd_types[1] as $pd_type ) {
+			$pd_fqn = '' === $pd_namespace ? $pd_type : $pd_namespace . '\\' . $pd_type;
+
+			if ( isset( $pd_declared[ $pd_fqn ] ) && ! $pd_is_replace ) {
+				$pd_errors[] = sprintf(
+					'%s block %d redeclares %s, first declared in %s',
+					$pd_name,
+					$pd_index + 1,
+					$pd_fqn,
+					$pd_declared[ $pd_fqn ]
+				);
+			}
+
+			$pd_declared[ $pd_fqn ] = sprintf( '%s block %d', $pd_name, $pd_index + 1 );
+		}
+
+		// References, in both forms a plan uses them: an import, and a fully
+		// qualified name written inline. Only PostDomain symbols are checked;
+		// everything else belongs to WordPress or PHP itself.
+		preg_match_all( '/^use\s+(PostDomain\\\\[^;\s]+)\s*;/m', $pd_block, $pd_used );
+		preg_match_all( '/\\\\(PostDomain\\\\[A-Za-z0-9_\\\\]+)/', $pd_block, $pd_inline );
+
+		foreach ( array_merge( $pd_used[1], array_map( static fn( string $s ): string => rtrim( $s, '\\' ), $pd_inline[1] ) ) as $pd_symbol ) {
+			$pd_imports[ $pd_symbol ][] = sprintf( '%s block %d', $pd_name, $pd_index + 1 );
+		}
+	}
+}
+
+@unlink( $pd_tmp ); // phpcs:ignore WordPress.PHP.NoSilencedErrors
+
+// Test namespaces are declared by the test files the plans create, which the
+// same scan above already picked up. Anything left unresolved is a real gap.
+$pd_unresolved = 0;
+
+foreach ( $pd_imports as $pd_symbol => $pd_sites ) {
+	if ( isset( $pd_declared[ $pd_symbol ] ) ) {
+		continue;
+	}
+
+	++$pd_unresolved;
+	$pd_errors[] = sprintf( 'unresolved symbol %s (imported in %s)', $pd_symbol, implode( ', ', $pd_sites ) );
+}
+
+printf( "complete files linted: %d
+", $pd_complete );
+printf( "fragments not linted: %d
+", $pd_fragment );
+printf( "symbols resolved: %d
+", count( $pd_imports ) - $pd_unresolved );
+
+if ( array() !== $pd_errors ) {
+	fwrite( STDERR, implode( "
+", $pd_errors ) . "
+" );
+
+	exit( 1 );
+}
+
+exit( 0 );
+```
+
+Add to `composer.json` scripts:
+
+```json
+		"lint:plans": "php bin/check-plan-examples.php"
+```
+
+Add to `.github/workflows/ci.yml`, alongside the other lint steps:
+
+```yaml
+      - run: composer lint:plans
+```
+
+- [ ] **Step 4: Run the test to verify it passes**
+
+Run: `composer lint:plans && vendor/bin/phpunit --testsuite unit --filter PlanExamplesTest`
+Expected: PASS — 4 tests
+
+If `lint:plans` reports an unresolved symbol, that is a **plan** defect, not an
+implementation one: fix the plan document before writing the code it describes.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add bin/check-plan-examples.php composer.json .github/workflows/ci.yml tests/unit/PlanExamplesTest.php
+git commit -m "Check that the plans' own PHP parses and resolves
+
+A missing import or a signature that drifted between two plans is otherwise
+found one task at a time, by a human, at implementation time. The check reports
+how much it skipped so a thin run cannot masquerade as a clean one."
+```
+
+---
+
 ## Gate for Plan 01
 
 All of the following pass before Plan 02 starts:
@@ -1785,6 +2081,8 @@ composer test
 composer test:integration
 ```
 
-Plus: activating the plugin on a wp-env single-site install succeeds, and
+Plus: activating the plugin on a wp-env single-site install succeeds,
 `Activation::refusal()` returns the multisite message when `is_multisite()` is
-true.
+true, and `composer lint:plans` passes — every complete PHP example in the suite
+parses and every `PostDomain\` symbol it imports is declared somewhere in the
+suite.

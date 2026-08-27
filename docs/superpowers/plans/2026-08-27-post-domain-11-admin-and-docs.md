@@ -944,6 +944,7 @@ final class DiagnosticsTest extends WP_UnitTestCase {
 				'environment',
 				'ssl_driver',
 				'long_recoveries',
+				'blocked_recoveries',
 			) as $key
 		) {
 			$this->assertArrayHasKey( $key, $checks, "missing diagnostic {$key}" );
@@ -970,6 +971,49 @@ final class DiagnosticsTest extends WP_UnitTestCase {
 		$this->assertStringContainsString( 'gone-away', $check['detail'] );
 
 		delete_option( 'pd_settings' );
+		\PostDomain\Ssl\DriverFactory::reset();
+	}
+
+	public function test_a_recovery_blocked_on_configuration_names_what_to_restore(): void {
+		global $wpdb;
+
+		$mapping = ( new DbRepository() )->save(
+			new Mapping(
+				0, 'orphaned.test', null, self::factory()->post->create(), 1,
+				VerificationState::VERIFIED, ActivationState::ACTIVE, SslState::REQUESTED,
+				null, str_repeat( 'c', 32 ), '_post-domain-challenge'
+			)
+		);
+
+		$wpdb->update( // phpcs:ignore WordPress.DB
+			Schema::domains_table(),
+			array(
+				'ssl_mutation_token'       => str_repeat( '5', 32 ),
+				'ssl_mutation_kind'        => MutationKind::CREATE->value,
+				'ssl_mutation_phase'       => 'recovering',
+				'ssl_mutation_expires_at'  => gmdate( 'Y-m-d H:i:s', time() + 600 ),
+				'ssl_mutation_driver'      => 'cloudflare-saas',
+				'ssl_mutation_environment' => 'cf-zone:the-old-zone',
+			),
+			array( 'id' => $mapping->id )
+		);
+
+		\PostDomain\Ssl\DriverFactory::reset();
+
+		$check = Diagnostics::checks()['blocked_recoveries'];
+
+		$this->assertSame( 'error', $check['status'] );
+		$this->assertStringContainsString( 'orphaned.test', $check['detail'] );
+		$this->assertStringContainsString( 'cf-zone:the-old-zone', $check['detail'] );
+	}
+
+	public function test_no_credential_appears_in_any_diagnostic(): void {
+		update_option( 'pd_ssl_credentials', array( 'api_token' => 'cf-token-value' ), false );
+		\PostDomain\Ssl\DriverFactory::reset();
+
+		$this->assertStringNotContainsString( 'cf-token-value', (string) wp_json_encode( Diagnostics::checks() ) );
+
+		delete_option( 'pd_ssl_credentials' );
 		\PostDomain\Ssl\DriverFactory::reset();
 	}
 
@@ -1285,7 +1329,56 @@ final class Diagnostics {
 			'environment'          => self::environment(),
 			'ssl_driver'           => self::ssl_driver(),
 			'long_recoveries'      => self::long_recoveries(),
+			'blocked_recoveries'   => self::blocked_recoveries(),
 		);
+	}
+
+	/**
+	 * A mutation cannot be resolved while the driver or provider account it began
+	 * against is unavailable. Nothing is queried in that state, so the only way an
+	 * operator learns of it is here — naming exactly what to restore.
+	 *
+	 * @return array{status: string, detail: string}
+	 */
+	private static function blocked_recoveries(): array {
+		global $wpdb;
+
+		/** @var array<int, array<string, string|null>> $rows */
+		$rows = $wpdb->get_results( // phpcs:ignore WordPress.DB
+			$wpdb->prepare(
+				'SELECT host, ssl_mutation_kind, ssl_mutation_driver, ssl_mutation_environment
+				   FROM ' . Schema::domains_table() . '
+				  WHERE ssl_mutation_phase = %s AND ssl_mutation_driver IS NOT NULL
+				  LIMIT 50',
+				'recovering'
+			),
+			ARRAY_A
+		);
+
+		$blocked  = array();
+		$registry = \PostDomain\Ssl\DriverFactory::registry();
+
+		foreach ( $rows as $row ) {
+			$driver = $registry->get( (string) $row['ssl_mutation_driver'] );
+
+			if ( null !== $driver && $driver->environment_id() === $row['ssl_mutation_environment'] ) {
+				continue;
+			}
+
+			$blocked[] = sprintf(
+				'%s (%s) needs driver "%s" configured for "%s"',
+				(string) $row['host'],
+				(string) $row['ssl_mutation_kind'],
+				(string) $row['ssl_mutation_driver'],
+				(string) $row['ssl_mutation_environment']
+			);
+		}
+
+		if ( array() === $blocked ) {
+			return array( 'status' => 'ok', 'detail' => __( 'No recovery is blocked on configuration.', 'post-domain' ) );
+		}
+
+		return array( 'status' => 'error', 'detail' => implode( '; ', $blocked ) );
 	}
 
 	/**
@@ -1531,7 +1624,7 @@ final class Diagnostics {
 - [ ] **Step 4: Run the test to verify it passes**
 
 Run: `composer test:integration -- --filter DiagnosticsTest`
-Expected: PASS — 11 tests
+Expected: PASS — 13 tests
 
 - [ ] **Step 5: Commit**
 
@@ -1599,6 +1692,7 @@ final class ReadmeTest extends TestCase {
 			'driver selection'    => array( 'Certificate provider' ),
 			'no silent no-op'     => array( 'pd_ssl_not_configured' ),
 			'event atomicity'     => array( 'pd_schema_engine' ),
+			'provider binding'    => array( 'environment' ),
 			'dcv default'         => array( 'txt' ),
 			'apex entitlement'    => array( 'BYOIP' ),
 			'dns neutrality'      => array( 'authoritative DNS' ),
@@ -1702,11 +1796,17 @@ below is required; the test above pins the phrases that must appear.
 22. **Event log fidelity** — on InnoDB (`pd_schema_engine`) a state change and its
     event row commit together; on any other engine the log is best-effort and may
     lag or miss rows. Nothing reads it to make a decision either way.
+23. **Changing provider configuration while work is outstanding** — every mutation
+    is bound to the driver and provider **environment** it began against. If that
+    configuration changes before an unresolved mutation is recovered, the plugin
+    queries nothing and says which driver and environment to restore. Restore it
+    and recovery resumes; the identity shown is a zone or account name, never a
+    credential.
 
 - [ ] **Step 4: Run the test to verify it passes**
 
 Run: `vendor/bin/phpunit --testsuite unit --filter ReadmeTest`
-Expected: PASS — 26 tests
+Expected: PASS — 27 tests
 
 - [ ] **Step 5: Commit**
 
@@ -1951,8 +2051,9 @@ composer lint && composer analyse && composer test && composer test:integration
 ```
 
 Plus: `ReadmeTest` passes for every required topic, `DiagnosticsTest` proves no
-server-side probe exists and that both an unselected and an unregistered SSL
-driver are surfaced, `AdminScreensTest` proves the driver selection offers only
+server-side probe exists, that both an unselected and an unregistered SSL driver
+are surfaced, that a recovery blocked on configuration names the driver and
+environment to restore, and that no credential appears in any check, `AdminScreensTest` proves the driver selection offers only
 registered drivers and resets the memoized registry on save, and `AcceptanceTest`
 passes end to end.
 

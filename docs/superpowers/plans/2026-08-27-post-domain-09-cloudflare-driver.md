@@ -2071,6 +2071,17 @@ final class CloudflareSaasDriver implements SslDriver {
 		return 'cloudflare-saas';
 	}
 
+	/**
+	 * Custom hostnames live in a zone, and a zone id is globally unique and not a
+	 * credential — it appears in every API path. It is therefore the right thing
+	 * to bind a mutation to: a token rotated to a different account reaches a
+	 * different zone id, and the same zone id always means the same resources.
+	 * The API token is never part of this value.
+	 */
+	public function environment_id(): string {
+		return 'cf-zone:' . $this->zone_id;
+	}
+
 	public function marker_support(): MarkerSupport {
 		return $this->marker_support;
 	}
@@ -2595,6 +2606,25 @@ final class CloudflareRegistrationTest extends WP_UnitTestCase {
 		$this->assertStringNotContainsString( 'cf-token-value', $encoded );
 	}
 
+	public function test_the_environment_identity_names_the_zone_and_holds_no_credential(): void {
+		$this->configure();
+
+		$driver = DriverFactory::registry()->get( 'cloudflare-saas' );
+
+		$this->assertSame( 'cf-zone:zone-1', $driver?->environment_id() );
+		$this->assertStringNotContainsString( 'cf-token-value', (string) $driver?->environment_id() );
+	}
+
+	public function test_a_different_zone_is_a_different_environment(): void {
+		$this->configure();
+		$first = DriverFactory::registry()->get( 'cloudflare-saas' )?->environment_id();
+
+		$this->configure( array( 'zone_id' => 'zone-2' ) );
+		$second = DriverFactory::registry()->get( 'cloudflare-saas' )?->environment_id();
+
+		$this->assertNotSame( $first, $second, 'recovery has to be able to tell these apart' );
+	}
+
 	public function test_rest_and_cron_resolve_the_same_driver_instance(): void {
 		$this->configure();
 
@@ -2657,7 +2687,7 @@ Replace `DriverFactory::built_in_drivers()` with:
 - [ ] **Step 4: Run the test to verify it passes**
 
 Run: `composer test:integration -- --filter CloudflareRegistrationTest`
-Expected: PASS — 9 tests (including the three missing-credential cases)
+Expected: PASS — 11 tests (including the three missing-credential cases)
 
 - [ ] **Step 5: Run the full suite**
 
@@ -2684,7 +2714,8 @@ composer generate:status-map && git diff --exit-code references/cloudflare-statu
 composer lint && composer analyse && composer test && composer test:integration
 ```
 
-Plus: generation fails on an unclassified value, the driver operates end to end
+Plus: generation fails on an unclassified value, `environment_id()` names the zone
+and contains no credential, the driver operates end to end
 with `marker_support = UNAVAILABLE`, no apex A record is emitted without an
 attested provenance, and a mapping whose stored provider is null resolves to the
 configured Cloudflare driver rather than to `NullDriver`.

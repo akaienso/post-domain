@@ -162,6 +162,18 @@ final class SerializerTest extends WP_UnitTestCase {
 		}
 	}
 
+	public function test_the_environment_identity_is_the_only_provider_detail_exposed(): void {
+		update_option( 'pd_ssl_credentials', array( 'api_token' => 'cf-token-value' ), false );
+
+		$encoded = (string) wp_json_encode(
+			MappingSerializer::resource( $this->mapping( VerificationState::VERIFIED, ActivationState::ACTIVE ) )
+		);
+
+		$this->assertStringNotContainsString( 'cf-token-value', $encoded );
+
+		delete_option( 'pd_ssl_credentials' );
+	}
+
 	public function test_ownership_is_reported_as_a_boolean_not_an_installation_id(): void {
 		$resource = MappingSerializer::resource( $this->mapping( VerificationState::VERIFIED, ActivationState::ACTIVE ) );
 
@@ -253,6 +265,30 @@ final class SerializerTest extends WP_UnitTestCase {
 		$this->assertSame( 'remove', $resource['ssl']['mutation_in_progress']['kind'] );
 		$this->assertSame( 'in_flight', $resource['ssl']['mutation_in_progress']['phase'] );
 		$this->assertArrayNotHasKey( 'token', $resource['ssl']['mutation_in_progress'] );
+	}
+
+	public function test_a_mutation_in_progress_names_the_environment_it_began_against(): void {
+		global $wpdb;
+
+		$mapping = $this->mapping( VerificationState::VERIFIED, ActivationState::ACTIVE );
+
+		$wpdb->update( // phpcs:ignore WordPress.DB
+			Schema::domains_table(),
+			array(
+				'ssl_mutation_token'       => str_repeat( '6', 32 ),
+				'ssl_mutation_kind'        => 'create',
+				'ssl_mutation_phase'       => 'recovering',
+				'ssl_mutation_expires_at'  => gmdate( 'Y-m-d H:i:s', time() + 60 ),
+				'ssl_mutation_driver'      => 'cloudflare-saas',
+				'ssl_mutation_environment' => 'cf-zone:zone-1',
+			),
+			array( 'id' => $mapping->id )
+		);
+
+		$resource = MappingSerializer::resource( $this->repo->by_id( $mapping->id ) );
+
+		$this->assertSame( 'cloudflare-saas', $resource['ssl']['mutation_in_progress']['driver'] );
+		$this->assertSame( 'cf-zone:zone-1', $resource['ssl']['mutation_in_progress']['environment'] );
 	}
 
 	public function test_the_etag_carries_the_revision(): void {
@@ -464,9 +500,14 @@ final class MappingSerializer {
 			'mutation_in_progress'       => null === $mapping->ssl_mutation_kind
 				? null
 				: array(
-					'kind'       => $mapping->ssl_mutation_kind->value,
-					'phase'      => $mapping->ssl_mutation_phase?->value,
-					'expires_at' => $mapping->ssl_mutation_expires_at,
+					'kind'        => $mapping->ssl_mutation_kind->value,
+					'phase'       => $mapping->ssl_mutation_phase?->value,
+					'expires_at'  => $mapping->ssl_mutation_expires_at,
+					// The environment identity is a non-secret name an operator
+					// compares against their provider console. The lease token
+					// is not here, and neither is any credential.
+					'driver'      => $mapping->ssl_mutation_driver,
+					'environment' => $mapping->ssl_mutation_environment,
 				),
 		);
 
@@ -576,7 +617,7 @@ final class MappingSerializer {
 - [ ] **Step 4: Run the test to verify it passes**
 
 Run: `composer test:integration -- --filter Rest\\SerializerTest`
-Expected: PASS — 17 tests
+Expected: PASS — 19 tests
 
 - [ ] **Step 5: Commit**
 
@@ -2110,7 +2151,8 @@ and:
 		$context = \PostDomain\Ssl\SslResourceContext::from_mapping(
 			$mapping,
 			\PostDomain\Ssl\Environment::installation_id(),
-			$name
+			$name,
+			$driver->id()
 		);
 
 		$plan = $driver->validation_plan( $context, null );

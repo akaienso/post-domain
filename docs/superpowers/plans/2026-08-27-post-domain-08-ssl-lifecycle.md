@@ -901,12 +901,15 @@ final class CreateService {
 			)
 		);
 
-		if ( $applied ) {
+		if ( $applied->committed() ) {
 			return MutationResult::committed( $status, $note );
 		}
 
-		// Fenced or simply not persisted — the row itself says which.
-		return MutationResult::lost( $this->repo->by_id( $mapping_id ), $gated->lease_token );
+		// A lost CAS is fencing; anything else is a database failure that left the
+		// provider ahead of us. The row itself distinguishes the first case.
+		return $applied->cas_lost()
+			? MutationResult::lost( $this->repo->by_id( $mapping_id ), $gated->lease_token )
+			: MutationResult::not_persisted( $applied->detail );
 	}
 }
 ```
@@ -1355,9 +1358,13 @@ final class AdoptionService {
 
 		// Claiming ownership is exactly the write that must not survive a lost
 		// CAS, and no event may say it happened.
-		return $applied
-			? MutationResult::committed( $status, 'adopted' )
-			: MutationResult::lost( $this->repo->by_id( $mapping_id ), $gated->lease_token );
+		if ( $applied->committed() ) {
+			return MutationResult::committed( $status, 'adopted' );
+		}
+
+		return $applied->cas_lost()
+			? MutationResult::lost( $this->repo->by_id( $mapping_id ), $gated->lease_token )
+			: MutationResult::not_persisted( $applied->detail );
 	}
 }
 ```
@@ -1802,8 +1809,10 @@ final class MethodChangeService {
 			)
 		);
 
-		if ( ! $applied ) {
-			return MutationResult::lost( $this->repo->by_id( $mapping_id ), $gated->lease_token );
+		if ( ! $applied->committed() ) {
+			return $applied->cas_lost()
+				? MutationResult::lost( $this->repo->by_id( $mapping_id ), $gated->lease_token )
+				: MutationResult::not_persisted( $applied->detail );
 		}
 
 		// The lease released cleanly, but the provider did not confirm the change
@@ -1842,7 +1851,7 @@ leaves ssl_method exactly as it was, and a fenced worker persists nothing."
 - Consumes: `DeletionAuthorizer`, `MutationGate`, `MutationLease` (Plan 07), `MappingRepository` (Plan 02).
 - Produces:
   - `DeletionService::request( Mapping $m ): bool` — a CAS write on the expected revision that stops serving and, when a provider resource exists, moves to `pending_removal`; when none exists it takes a `RESERVED` lease and deletes under it.
-  - `DeletionService::process( Mapping $m ): string` — `removed`, `pending`, `transient`, `failed`, `refused`, or `fenced`.
+  - `DeletionService::process( Mapping $m ): string` — `removed`, `pending`, `transient`, `failed`, `refused`, `fenced`, or `deferred` (the database refused the write; the lease still stands and the next pass retries).
   - `ForceLocalDelete::run( Mapping $m ): bool`.
 
 Every deletion path is fenced by the exact lease. A failed finalize means the
@@ -2198,7 +2207,10 @@ final class ForceLocalDelete {
 	public static function run( Mapping $mapping ): bool {
 		$clock = new SystemClock();
 		$lease = new MutationLease( $clock );
-		$held  = $lease->acquire( $mapping->id, $mapping->revision, MutationKind::REMOVE );
+
+		// No provider deletion is issued here, so the binding names the null
+		// environment: nothing external is being spoken to.
+		$held  = $lease->acquire( $mapping->id, $mapping->revision, MutationKind::REMOVE, new NullDriver() );
 
 		if ( null === $held ) {
 			return false;
@@ -2229,7 +2241,7 @@ final class ForceLocalDelete {
 			)
 		);
 
-		if ( ! $deleted ) {
+		if ( ! $deleted->committed() ) {
 			$lease->release_reserved( $mapping->id, $held['revision'], $held['token'], MutationKind::REMOVE );
 
 			return false;
@@ -2382,7 +2394,11 @@ final class DeletionService {
 				)
 			);
 
-			return $deleted ? 'removed' : 'fenced';
+			if ( $deleted->committed() ) {
+				return 'removed';
+			}
+
+			return $deleted->cas_lost() ? 'fenced' : 'deferred';
 		}
 
 		$outcome = RemovalOutcome::FAILED === $result->outcome
@@ -2412,8 +2428,8 @@ final class DeletionService {
 			)
 		);
 
-		if ( ! $applied ) {
-			return 'fenced';
+		if ( ! $applied->committed() ) {
+			return $applied->cas_lost() ? 'fenced' : 'deferred';
 		}
 
 		return $result->outcome->value;
@@ -2421,7 +2437,9 @@ final class DeletionService {
 
 	/** Deletes a mapping with no provider resource, under its own RESERVED lease. */
 	private function delete_locally( Mapping $mapping ): bool {
-		$held = $this->lease->acquire( $mapping->id, $mapping->revision, MutationKind::REMOVE );
+		// NullDriver is the honest binding here: there is nothing external, and
+		// the lease still records which environment the row believed it was in.
+		$held = $this->lease->acquire( $mapping->id, $mapping->revision, MutationKind::REMOVE, new NullDriver() );
 
 		if ( null === $held ) {
 			return false;
@@ -2452,11 +2470,11 @@ final class DeletionService {
 			)
 		);
 
-		if ( ! $deleted ) {
+		if ( ! $deleted->committed() ) {
 			$this->lease->release_reserved( $mapping->id, $held['revision'], $held['token'], MutationKind::REMOVE );
 		}
 
-		return $deleted;
+		return $deleted->committed();
 	}
 
 	private function attempts( Mapping $mapping ): int {
@@ -2542,7 +2560,6 @@ use PostDomain\Mapping\SslState;
 use PostDomain\Mapping\VerificationState;
 use PostDomain\Ssl\DriverRecoveryResolver;
 use PostDomain\Ssl\Environment;
-use PostDomain\Ssl\DriverFactory;
 use PostDomain\Ssl\MutationKind;
 use PostDomain\Support\Schema;
 use PostDomain\Tests\Integration\Ssl\Fixtures\RecordingDriver;
@@ -2559,18 +2576,9 @@ final class DriverRecoveryResolverTest extends WP_UnitTestCase {
 		$this->repo = new DbRepository();
 	}
 
-	private function resolver( RecordingDriver $driver ): DriverRecoveryResolver {
-		add_filter(
-			'pd_ssl_drivers',
-			static function ( array $drivers ) use ( $driver ): array {
-				$drivers[] = $driver;
-
-				return $drivers;
-			}
-		);
-		update_option( 'pd_settings', array( 'ssl_driver' => $driver->id() ), false );
-		DriverFactory::reset();
-
+	private function resolver(): DriverRecoveryResolver {
+		// The resolver takes its driver as an argument now: it never chooses one,
+		// so there is nothing to configure here.
 		return new DriverRecoveryResolver();
 	}
 
@@ -2589,8 +2597,12 @@ final class DriverRecoveryResolverTest extends WP_UnitTestCase {
 	}
 
 	public function test_create_recovery_binds_a_marker_matched_resource(): void {
-		$outcome = $this->resolver( RecordingDriver::ambiguous_then_marked( 'ref-9' ) )
-			->resolve( $this->mapping( null ), MutationKind::CREATE, str_repeat( '1', 32 ) );
+		$outcome = $this->resolver()->resolve(
+			$this->mapping( null ),
+			MutationKind::CREATE,
+			str_repeat( '1', 32 ),
+			RecordingDriver::ambiguous_then_marked( 'ref-9' )
+		);
 
 		$this->assertTrue( $outcome->conclusive );
 		$this->assertFalse( $outcome->delete_row );
@@ -2598,16 +2610,24 @@ final class DriverRecoveryResolverTest extends WP_UnitTestCase {
 	}
 
 	public function test_create_recovery_with_conclusive_absence_is_conclusive_and_clears(): void {
-		$outcome = $this->resolver( RecordingDriver::ambiguous_then_absent() )
-			->resolve( $this->mapping( null ), MutationKind::CREATE, str_repeat( '1', 32 ) );
+		$outcome = $this->resolver()->resolve(
+			$this->mapping( null ),
+			MutationKind::CREATE,
+			str_repeat( '1', 32 ),
+			RecordingDriver::ambiguous_then_absent()
+		);
 
 		$this->assertTrue( $outcome->conclusive );
 		$this->assertFalse( $outcome->delete_row );
 	}
 
 	public function test_create_recovery_without_markers_requires_adoption(): void {
-		$outcome = $this->resolver( RecordingDriver::ambiguous_then_unmarked( 'ref-9' ) )
-			->resolve( $this->mapping( null ), MutationKind::CREATE, str_repeat( '1', 32 ) );
+		$outcome = $this->resolver()->resolve(
+			$this->mapping( null ),
+			MutationKind::CREATE,
+			str_repeat( '1', 32 ),
+			RecordingDriver::ambiguous_then_unmarked( 'ref-9' )
+		);
 
 		$this->assertTrue( $outcome->conclusive );
 		$this->assertStringContainsString( 'adopt', $outcome->note );
@@ -2615,49 +2635,103 @@ final class DriverRecoveryResolverTest extends WP_UnitTestCase {
 
 	public function test_an_incomplete_read_is_inconclusive_for_every_kind(): void {
 		foreach ( MutationKind::cases() as $kind ) {
-			$outcome = $this->resolver( RecordingDriver::with_incomplete_identity() )
-				->resolve( $this->mapping(), $kind, str_repeat( '1', 32 ) );
+			$outcome = $this->resolver()->resolve(
+				$this->mapping(),
+				$kind,
+				str_repeat( '1', 32 ),
+				RecordingDriver::with_incomplete_identity()
+			);
 
 			$this->assertFalse( $outcome->conclusive, "kind {$kind->value} must wait on an incomplete read" );
 		}
 	}
 
 	public function test_adopt_recovery_confirms_from_identity(): void {
-		$outcome = $this->resolver( RecordingDriver::succeeding( 'ref-1' ) )
-			->resolve( $this->mapping(), MutationKind::ADOPT, str_repeat( '1', 32 ) );
+		$outcome = $this->resolver()->resolve(
+			$this->mapping(),
+			MutationKind::ADOPT,
+			str_repeat( '1', 32 ),
+			RecordingDriver::succeeding( 'ref-1' )
+		);
 
 		$this->assertTrue( $outcome->conclusive );
 		$this->assertNotNull( $outcome->apply );
 	}
 
 	public function test_method_recovery_reads_the_confirmed_method(): void {
-		$outcome = $this->resolver( RecordingDriver::confirming_method( 'http' ) )
-			->resolve( $this->mapping(), MutationKind::METHOD, str_repeat( '1', 32 ) );
+		$outcome = $this->resolver()->resolve(
+			$this->mapping(),
+			MutationKind::METHOD,
+			str_repeat( '1', 32 ),
+			RecordingDriver::confirming_method( 'http' )
+		);
 
 		$this->assertTrue( $outcome->conclusive );
 		$this->assertArrayHasKey( 'ssl_method', $outcome->apply->columns() );
 	}
 
 	public function test_remove_recovery_deletes_when_the_resource_is_gone(): void {
-		$outcome = $this->resolver( RecordingDriver::ambiguous_then_absent() )
-			->resolve( $this->mapping(), MutationKind::REMOVE, str_repeat( '1', 32 ) );
+		$outcome = $this->resolver()->resolve(
+			$this->mapping(),
+			MutationKind::REMOVE,
+			str_repeat( '1', 32 ),
+			RecordingDriver::ambiguous_then_absent()
+		);
 
 		$this->assertTrue( $outcome->conclusive );
 		$this->assertTrue( $outcome->delete_row );
 	}
 
 	public function test_remove_recovery_keeps_the_row_when_the_resource_still_exists(): void {
-		$outcome = $this->resolver( RecordingDriver::succeeding( 'ref-1' ) )
-			->resolve( $this->mapping(), MutationKind::REMOVE, str_repeat( '1', 32 ) );
+		$outcome = $this->resolver()->resolve(
+			$this->mapping(),
+			MutationKind::REMOVE,
+			str_repeat( '1', 32 ),
+			RecordingDriver::succeeding( 'ref-1' )
+		);
 
 		$this->assertFalse( $outcome->delete_row );
+	}
+
+	public function test_a_recovered_create_records_the_real_driver_not_a_placeholder(): void {
+		// The mapping's stored provider is still NULL here, which is exactly the
+		// case that used to write the literal string 'null' into ssl_provider.
+		$outcome = $this->resolver()->resolve(
+			$this->mapping( null ),
+			MutationKind::CREATE,
+			str_repeat( '1', 32 ),
+			RecordingDriver::ambiguous_then_marked( 'ref-9' )
+		);
+
+		$this->assertSame( 'recording', $outcome->apply?->columns()['ssl_provider'] );
+	}
+
+	public function test_a_recovered_adoption_records_the_real_driver(): void {
+		$outcome = $this->resolver()->resolve(
+			$this->mapping( null ),
+			MutationKind::ADOPT,
+			str_repeat( '1', 32 ),
+			RecordingDriver::succeeding( 'ref-1' )
+		);
+
+		$this->assertSame( 'recording', $outcome->apply?->columns()['ssl_provider'] );
+	}
+
+	public function test_the_resolver_never_chooses_its_own_driver(): void {
+		$source = (string) file_get_contents( dirname( __DIR__, 3 ) . '/src/Ssl/DriverRecoveryResolver.php' );
+
+		$this->assertStringNotContainsString(
+			'DriverFactory',
+			$source,
+			'the bound driver arrives as an argument; resolving one here would defeat the binding'
+		);
 	}
 
 	public function test_the_resolver_issues_no_provider_mutation(): void {
 		$driver = RecordingDriver::succeeding( 'ref-1' );
 
 		foreach ( MutationKind::cases() as $kind ) {
-			$this->resolver( $driver )->resolve( $this->mapping(), $kind, str_repeat( '1', 32 ) );
+			$this->resolver()->resolve( $this->mapping(), $kind, str_repeat( '1', 32 ), $driver );
 		}
 
 		$this->assertSame( 0, $driver->create_calls );
@@ -2996,6 +3070,7 @@ declare( strict_types = 1 );
 
 namespace PostDomain\Ssl;
 
+use PostDomain\Contracts\SslDriver;
 use PostDomain\Mapping\Mapping;
 use PostDomain\Mapping\OwnershipOrigin;
 use PostDomain\Mapping\SslState;
@@ -3010,15 +3085,17 @@ final class DriverRecoveryResolver implements RecoveryResolver {
 	// No constructor: there is one production source of drivers and this is not
 	// a place that may disagree with it.
 
-	public function resolve( Mapping $mapping, MutationKind $kind, string $recovery_token ): RecoveryOutcome {
-		$driver = DriverFactory::for_mapping( $mapping );
-
-		if ( $driver instanceof DriverUnavailable ) {
-			// Inconclusive, never conclusive: without the owning driver there is
-			// no way to learn what happened, and guessing would be worse.
-			return RecoveryOutcome::inconclusive( 'driver unavailable: ' . $driver->reason );
-		}
-
+	/**
+	 * The driver is supplied by LeaseRecovery from the lease's durable binding
+	 * and is already verified to be pointing at the same provider environment the
+	 * mutation began against. This class never resolves one for itself.
+	 */
+	public function resolve(
+		Mapping $mapping,
+		MutationKind $kind,
+		string $recovery_token,
+		SslDriver $driver
+	): RecoveryOutcome {
 		$name = Challenge::record_name( $mapping->challenge_label, $mapping->host );
 
 		if ( null === $name ) {
@@ -3029,6 +3106,7 @@ final class DriverRecoveryResolver implements RecoveryResolver {
 			$mapping,
 			Environment::installation_id(),
 			$name,
+			$driver->id(),
 			$recovery_token
 		);
 		$identity = $driver->identify( $context );
@@ -3038,14 +3116,18 @@ final class DriverRecoveryResolver implements RecoveryResolver {
 		}
 
 		return match ( $kind ) {
-			MutationKind::CREATE => $this->resolve_create( $identity, $context ),
-			MutationKind::ADOPT  => $this->resolve_adopt( $identity, $context ),
+			MutationKind::CREATE => $this->resolve_create( $identity, $context, $driver ),
+			MutationKind::ADOPT  => $this->resolve_adopt( $identity, $context, $driver ),
 			MutationKind::METHOD => $this->resolve_method( $driver, $context ),
 			MutationKind::REMOVE => $this->resolve_remove( $identity ),
 		};
 	}
 
-	private function resolve_create( IdentityResult $identity, SslResourceContext $ctx ): RecoveryOutcome {
+	private function resolve_create(
+		IdentityResult $identity,
+		SslResourceContext $ctx,
+		SslDriver $driver
+	): RecoveryOutcome {
 		$decision = CreateRecovery::decide( $identity, $ctx );
 
 		return match ( $decision ) {
@@ -3053,7 +3135,7 @@ final class DriverRecoveryResolver implements RecoveryResolver {
 				LeaseOutcome::bound(
 					SslState::REQUESTED,
 					(string) $identity->observed_ref,
-					$ctx->provider_id,
+					$driver->id(),
 					OwnershipOrigin::CREATED,
 					$ctx->installation_id
 				),
@@ -3083,7 +3165,11 @@ final class DriverRecoveryResolver implements RecoveryResolver {
 		};
 	}
 
-	private function resolve_adopt( IdentityResult $identity, SslResourceContext $ctx ): RecoveryOutcome {
+	private function resolve_adopt(
+		IdentityResult $identity,
+		SslResourceContext $ctx,
+		SslDriver $driver
+	): RecoveryOutcome {
 		if ( null === $identity->observed_ref || $identity->observed_hostname !== $ctx->host ) {
 			return RecoveryOutcome::apply( LeaseOutcome::checked(), 'adoption did not take effect' );
 		}
@@ -3099,7 +3185,7 @@ final class DriverRecoveryResolver implements RecoveryResolver {
 			LeaseOutcome::adopted(
 				SslState::REQUESTED,
 				$identity->observed_ref,
-				$ctx->provider_id,
+				$driver->id(),
 				$ctx->installation_id,
 				0
 			),
@@ -3107,7 +3193,7 @@ final class DriverRecoveryResolver implements RecoveryResolver {
 		);
 	}
 
-	private function resolve_method( \PostDomain\Contracts\SslDriver $driver, SslResourceContext $ctx ): RecoveryOutcome {
+	private function resolve_method( SslDriver $driver, SslResourceContext $ctx ): RecoveryOutcome {
 		$status = $driver->status( $ctx );
 
 		if ( $status->transient || null === $status->confirmed_method ) {
@@ -3144,6 +3230,7 @@ namespace PostDomain\Ssl;
 use PostDomain\Contracts\SslDriver;
 use PostDomain\Mapping\EventLog;
 use PostDomain\Mapping\Mapping;
+use PostDomain\Support\AtomicTransition;
 use PostDomain\Support\Schema;
 use PostDomain\Verification\Challenge;
 
@@ -3215,7 +3302,8 @@ final class Reconciler {
 			$contexts[]                = SslResourceContext::from_mapping(
 				$mapping,
 				Environment::installation_id(),
-				$name
+				$name,
+				$driver->id()
 			);
 			$by_host[ $mapping->host ] = $mapping;
 		}
@@ -3283,7 +3371,7 @@ final class Reconciler {
 				)
 			);
 
-			if ( $applied ) {
+			if ( $applied->committed() ) {
 				++$updated;
 			} else {
 				++$skipped;
@@ -3328,7 +3416,7 @@ and the method:
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `composer test:integration -- --filter DriverRecoveryResolverTest && composer test:integration -- --filter ReconcilerTest`
-Expected: PASS — 9 and 11 tests
+Expected: PASS — 12 and 11 tests
 
 - [ ] **Step 5: Run the full suite**
 

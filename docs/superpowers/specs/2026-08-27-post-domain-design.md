@@ -954,6 +954,8 @@ ssl_mutation_token       CHAR(32)          NULL          -- provider-mutation le
 ssl_mutation_kind        VARCHAR(20)       NULL          -- create|adopt|method|remove
 ssl_mutation_phase       VARCHAR(20)       NULL          -- reserved|in_flight|recovering
 ssl_mutation_expires_at  DATETIME          NULL
+ssl_mutation_driver      VARCHAR(60)       NULL          -- driver id this mutation began against
+ssl_mutation_environment VARCHAR(190)      NULL          -- non-secret provider environment identity
 
 deletion_requested_at    DATETIME          NULL
 deletion_attempts        SMALLINT UNSIGNED NOT NULL DEFAULT 0
@@ -1130,8 +1132,57 @@ final class MutationLease {
 ```
 
 Every lease column moves together. When `ssl_mutation_token` is `NULL`, `kind`, `phase`,
-and `expires_at` are all `NULL`; when it is set, all three are present, and only declared
-`MutationKind` and `MutationPhase` values are accepted by the repository.
+`expires_at`, `driver`, and `environment` are all `NULL`; when it is set, all five are
+present, and only declared `MutationKind` and `MutationPhase` values are accepted by the
+repository.
+
+#### The provider environment a mutation began against
+
+`ssl_provider` records which driver owns a *finished* resource. It cannot answer the
+question recovery actually has to ask, because during a first create or an adoption it is
+still `NULL` while the request is already in flight. Between the request and the
+recovery pass an operator may change the selected driver, or rotate an API token to one
+that reaches a different account, or point the plugin at a different zone. Resolving the
+driver again from current configuration would then let recovery interrogate a *different*
+provider environment and treat its answer as truth about the original mutation — and a
+conclusive "absent" from the wrong environment is exactly the answer that clears the lease
+and permits a duplicate mutation while the original resource still exists.
+
+The lease therefore carries its own durable answer:
+
+- **`ssl_mutation_driver`** — the exact driver id the mutation began against.
+- **`ssl_mutation_environment`** — a **non-secret, stable** identity for the provider
+  environment that driver was configured for, supplied by `SslDriver::environment_id()`.
+
+Both are written during `RESERVED` acquisition, **before** any provider call, are pinned
+in the `RESERVED → IN_FLIGHT` consumption CAS alongside every other bound value, survive
+`IN_FLIGHT → RECOVERING` and every recovery takeover unchanged, and are cleared only by
+the same transitions that clear the rest of the lease: successful reservation cleanup,
+finalization, or row deletion.
+
+`environment_id()` must distinguish configurations that hold different resources —
+different Cloudflare accounts or zones, different API endpoints — and must **never**
+encode a credential. It is an identifier an operator can read in Diagnostics and compare
+against their provider console, so it is exposed there and in the management REST
+resource; API tokens, keys, and secrets are not, anywhere, ever (§12.4).
+
+**Configuration drift during recovery.** A recovery worker resolves `ssl_mutation_driver`
+and compares that driver's current `environment_id()` with `ssl_mutation_environment`. If
+the driver is not registered, or the environment does not match, recovery:
+
+- performs **no provider read and no provider mutation** — not even against the driver
+  that is currently configured;
+- leaves the row in `RECOVERING` under its own token with the bounded re-read schedule;
+- reports, by driver id and environment identity, exactly which configuration must be
+  restored before the outcome can be learned.
+
+The row stays fenced until the original environment returns. That is the correct
+behaviour: an unresolved mutation against an unreachable account is a configuration
+problem an operator must fix, and guessing is strictly worse than waiting.
+
+This applies to all four kinds — create, adopt, method change, and remove — including
+mappings that already carry an `ssl_provider`, because a stored provider id still says
+nothing about *which account or zone* that driver was pointed at when the request left.
 
 #### RESERVED — the window is owned, nothing has been sent
 
@@ -1147,6 +1198,7 @@ carries no lease at all**:
 UPDATE {prefix}pd_domains
    SET ssl_mutation_token = :tok, ssl_mutation_kind = :kind,
        ssl_mutation_phase = 'reserved', ssl_mutation_expires_at = :exp,
+       ssl_mutation_driver = :driver_id, ssl_mutation_environment = :environment_id,
        revision = revision + 1, updated_at = :now
  WHERE id = :id AND revision = :rev
    AND ssl_mutation_token IS NULL      -- and therefore kind, phase, expiry are NULL too
@@ -1178,7 +1230,9 @@ UPDATE {prefix}pd_domains
  WHERE id = :id AND revision = :rev
    AND ssl_mutation_token = :tok AND ssl_mutation_kind = :kind
    AND ssl_mutation_phase = 'reserved' AND ssl_mutation_expires_at > :now
-   AND host = :host AND ssl_provider = :provider
+   AND ssl_mutation_driver = :driver_id
+   AND ssl_mutation_environment = :environment_id
+   AND host = :host AND ( ssl_provider <=> :provider )
    AND ( ssl_ref <=> :ref ) AND challenge = :challenge
    AND ( ssl_method <=> :method )
    AND ( ssl_ownership_origin <=> :origin )
@@ -1230,6 +1284,7 @@ UPDATE {prefix}pd_domains
         removal outcome, ssl_provider_state, ssl_checked_at …>,
        ssl_mutation_token = NULL, ssl_mutation_kind = NULL,
        ssl_mutation_phase = NULL, ssl_mutation_expires_at = NULL,
+       ssl_mutation_driver = NULL, ssl_mutation_environment = NULL,
        revision = revision + 1, updated_at = :now
  WHERE id = :id AND revision = :in_flight_rev
    AND ssl_mutation_token = :tok AND ssl_mutation_kind = :kind
@@ -1305,6 +1360,7 @@ phase:
 UPDATE {prefix}pd_domains
    SET ssl_mutation_token = NULL, ssl_mutation_kind = NULL,
        ssl_mutation_phase = NULL, ssl_mutation_expires_at = NULL,
+       ssl_mutation_driver = NULL, ssl_mutation_environment = NULL,
        revision = revision + 1, updated_at = :now
  WHERE id = :id AND ssl_mutation_token = :tok
    AND ssl_mutation_phase = 'reserved' AND ssl_mutation_expires_at <= :now
@@ -1333,6 +1389,11 @@ UPDATE {prefix}pd_domains
    AND ssl_mutation_kind = :kind          -- preserved unchanged
    AND ssl_mutation_phase = 'in_flight' AND ssl_mutation_expires_at <= :now
 ```
+
+`ssl_mutation_driver` and `ssl_mutation_environment` are deliberately absent from the
+`SET` clause: the recovery owner inherits the original binding rather than rebinding to
+whatever is configured now. That inheritance is what makes the drift rule above
+enforceable.
 
 After the claim succeeds: the original worker's finalize CAS (which names the old token
 and `in_flight`) fails; it discards its local result; it does not retry the provider
@@ -1689,6 +1750,15 @@ final class DriverCapabilities {
 
 interface SslDriver {
     public function id(): string;
+
+    /**
+     * A non-secret, stable identity for the provider environment this driver instance
+     * is configured against — the account, zone, or endpoint that actually holds the
+     * resources. It is written into the lease before any mutation and compared on
+     * recovery (§12.6), is shown to operators, and must never encode a credential.
+     */
+    public function environment_id(): string;
+
     public function capabilities(): DriverCapabilities;
 
     public function status(   SslResourceContext $ctx ): SslStatus;
@@ -2549,8 +2619,10 @@ round-trip failures; path collisions; absolute primary-host URLs found in a rend
 mapped page; the browser-side CORS probe; SSL resources that are unowned, missing,
 divergent in method, or ambiguous after a create; marker support; mutation leases by
 phase, including expired `RESERVED` leases awaiting a no-read clear and rows stuck in
-`RECOVERING` because provider state is still incomplete or transient; apex configuration
-status; the environment-mismatch banner.
+`RECOVERING` because provider state is still incomplete or transient; **rows fenced in
+`RECOVERING` because the driver or provider environment they began against is no longer
+configured, naming the `ssl_mutation_driver` and `ssl_mutation_environment` an operator
+must restore**; apex configuration status; the environment-mismatch banner.
 
 ### 16.2 Operator flows
 
@@ -2565,6 +2637,11 @@ verified) without anyone reading a log file.
 *Ambiguous provisioning*: when a create times out on an account without markers, the
 detail screen says a resource may exist, shows what was observed, and offers the explicit
 adoption workflow. Nothing is bound automatically.
+
+*Provider reconfigured mid-flight*: if the selected driver or its account changes while a
+mutation is unresolved, the detail screen names the driver and environment identity the
+mutation began against and says plainly that the outcome cannot be learned until that
+configuration is restored. The plugin queries nothing in the meantime.
 
 *Move / restore / clone*: the blocking banner forces the choice before any provider
 mutation runs.
@@ -2652,6 +2729,15 @@ Cloudflare client):**
   recovery worker being able to clear or finalize the new one
 - a known provider result and the lease clear applied in **one** atomic transition
 - transient recovery results cause another bounded read, never another provider mutation
+- the driver id and provider-environment identity are written into the lease **before**
+  any provider call, pinned by the consumption CAS, inherited unchanged through recovery
+  takeovers, and cleared only with the rest of the lease
+- a create or adoption begun with `ssl_provider = NULL`, followed by a change of selected
+  driver or of the provider account/zone, recovers against **neither** environment: zero
+  reads and zero mutations reach the newly configured driver, the row stays fenced in
+  `RECOVERING`, and the report names the driver and environment to restore
+- the same mutation resolves normally once the original configuration is restored
+- an already-bound mapping is likewise unaffected by a change to the configured default
 - the lease TTL and recovery grace exceed the driver's provider HTTP timeout by the
   documented margin
 - an expired worker unable to clear a newer worker's lease

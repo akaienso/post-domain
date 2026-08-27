@@ -411,7 +411,7 @@ final class SchemaTest extends WP_UnitTestCase {
 				'ssl_marker_support', 'ssl_checked_at', 'ssl_next_attempt_at',
 				'ssl_transient_count', 'ssl_provider_state', 'ssl_error',
 				'ssl_mutation_token', 'ssl_mutation_kind', 'ssl_mutation_phase',
-				'ssl_mutation_expires_at',
+				'ssl_mutation_expires_at', 'ssl_mutation_driver', 'ssl_mutation_environment',
 				'deletion_requested_at', 'deletion_attempts', 'deletion_next_attempt_at',
 				'title', 'favicon_attachment_id', 'created_at', 'updated_at', 'created_by',
 			) as $column
@@ -554,6 +554,8 @@ final class Schema {
 				ssl_mutation_kind varchar(20) NULL,
 				ssl_mutation_phase varchar(20) NULL,
 				ssl_mutation_expires_at datetime NULL,
+				ssl_mutation_driver varchar(60) NULL,
+				ssl_mutation_environment varchar(190) NULL,
 				deletion_requested_at datetime NULL,
 				deletion_attempts smallint(5) unsigned NOT NULL DEFAULT 0,
 				deletion_next_attempt_at datetime NULL,
@@ -648,7 +650,7 @@ default label costs 23. The limit is structural rather than a runtime check."
 **Interfaces:**
 - Consumes: `Schema` (Task 2), the enums (Task 1).
 - Produces:
-  - `PostDomain\Mapping\Mapping` — readonly, with `int $id`, `string $host`, `?int $alias_of`, `?int $post_id`, `int $revision`, `VerificationState $verification_state`, `ActivationState $activation_state`, `SslState $ssl_state`, `?string $integrity_error`, `string $challenge`, `string $challenge_label`, `?OwnershipOrigin $ssl_ownership_origin`, `?string $ssl_owner_installation_id`, `?string $ssl_provider`, `?string $ssl_ref`, `?string $ssl_method`, `?string $ssl_mutation_token`, `?MutationKind $ssl_mutation_kind`, `?MutationPhase $ssl_mutation_phase`, `?string $ssl_mutation_expires_at`, `?string $ssl_next_attempt_at`, `int $ssl_transient_count`.
+  - `PostDomain\Mapping\Mapping` — readonly, with `int $id`, `string $host`, `?int $alias_of`, `?int $post_id`, `int $revision`, `VerificationState $verification_state`, `ActivationState $activation_state`, `SslState $ssl_state`, `?string $integrity_error`, `string $challenge`, `string $challenge_label`, `?OwnershipOrigin $ssl_ownership_origin`, `?string $ssl_owner_installation_id`, `?string $ssl_provider`, `?string $ssl_ref`, `?string $ssl_method`, `?string $ssl_mutation_token`, `?MutationKind $ssl_mutation_kind`, `?MutationPhase $ssl_mutation_phase`, `?string $ssl_mutation_expires_at`, `?string $ssl_mutation_driver`, `?string $ssl_mutation_environment`, `?string $ssl_next_attempt_at`, `int $ssl_transient_count`.
 
   `ssl_next_attempt_at` and `ssl_transient_count` are **readable but not
   writable through `save()`** — they are scheduling state owned by the
@@ -781,6 +783,8 @@ final class Mapping {
 		public readonly ?MutationKind $ssl_mutation_kind = null,
 		public readonly ?MutationPhase $ssl_mutation_phase = null,
 		public readonly ?string $ssl_mutation_expires_at = null,
+		public readonly ?string $ssl_mutation_driver = null,
+		public readonly ?string $ssl_mutation_environment = null,
 		public readonly ?string $ssl_next_attempt_at = null,
 		public readonly int $ssl_transient_count = 0
 	) {}
@@ -810,6 +814,8 @@ final class Mapping {
 			null === $row['ssl_mutation_kind'] ? null : MutationKind::from( (string) $row['ssl_mutation_kind'] ),
 			null === $row['ssl_mutation_phase'] ? null : MutationPhase::from( (string) $row['ssl_mutation_phase'] ),
 			$row['ssl_mutation_expires_at'],
+			$row['ssl_mutation_driver'],
+			$row['ssl_mutation_environment'],
 			$row['ssl_next_attempt_at'],
 			(int) ( $row['ssl_transient_count'] ?? 0 )
 		);
@@ -1080,6 +1086,22 @@ final class RepositoryWriteTest extends WP_UnitTestCase {
 		);
 	}
 
+	public function test_a_lease_without_its_provider_binding_is_rejected(): void {
+		// The binding is what recovery reads to decide which environment it may
+		// question at all, so a lease without it is not a lease.
+		$this->expectException( InvalidMapping::class );
+		$this->repo->save(
+			new Mapping(
+				0, 'example.test', null, 42, 1,
+				VerificationState::UNVERIFIED, ActivationState::INACTIVE, SslState::NONE,
+				null, str_repeat( 'i', 32 ), '_post-domain-challenge',
+				null, null, null, null, null,
+				str_repeat( '9', 32 ), MutationKind::CREATE, MutationPhase::RESERVED,
+				gmdate( 'Y-m-d H:i:s', time() + 120 ), null, null
+			)
+		);
+	}
+
 	public function test_a_complete_lease_is_accepted(): void {
 		$saved = $this->repo->save(
 			new Mapping(
@@ -1088,11 +1110,15 @@ final class RepositoryWriteTest extends WP_UnitTestCase {
 				null, str_repeat( 'g', 32 ), '_post-domain-challenge',
 				null, null, null, null, null,
 				str_repeat( '9', 32 ), MutationKind::CREATE, MutationPhase::RESERVED,
-				gmdate( 'Y-m-d H:i:s', time() + 120 )
+				gmdate( 'Y-m-d H:i:s', time() + 120 ), 'cloudflare-saas', 'zone:abc123'
 			)
 		);
 
-		$this->assertSame( MutationPhase::RESERVED, $this->repo->by_id( $saved->id )?->ssl_mutation_phase );
+		$after = $this->repo->by_id( $saved->id );
+
+		$this->assertSame( MutationPhase::RESERVED, $after?->ssl_mutation_phase );
+		$this->assertSame( 'cloudflare-saas', $after?->ssl_mutation_driver );
+		$this->assertSame( 'zone:abc123', $after?->ssl_mutation_environment );
 	}
 
 	public function test_partial_ownership_provenance_is_rejected(): void {
@@ -1181,6 +1207,8 @@ Replace `DbRepository::save()` with:
 			'ssl_mutation_kind'         => $m->ssl_mutation_kind?->value,
 			'ssl_mutation_phase'        => $m->ssl_mutation_phase?->value,
 			'ssl_mutation_expires_at'   => $m->ssl_mutation_expires_at,
+			'ssl_mutation_driver'       => $m->ssl_mutation_driver,
+			'ssl_mutation_environment'  => $m->ssl_mutation_environment,
 			'updated_at'                => $now,
 		);
 
@@ -1262,15 +1290,19 @@ Replace `DbRepository::save()` with:
 			}
 		}
 
+		// Every lease column moves together, including the durable binding to the
+		// driver and provider environment the mutation began against (spec §12.6).
 		$lease = array(
 			null !== $m->ssl_mutation_token,
 			null !== $m->ssl_mutation_kind,
 			null !== $m->ssl_mutation_phase,
 			null !== $m->ssl_mutation_expires_at,
+			null !== $m->ssl_mutation_driver,
+			null !== $m->ssl_mutation_environment,
 		);
 
 		if ( count( array_unique( $lease ) ) > 1 ) {
-			throw new InvalidMapping( 'The four lease columns move together.' );
+			throw new InvalidMapping( 'The six lease columns move together.' );
 		}
 
 		$owned = array(
@@ -1306,7 +1338,7 @@ Replace `DbRepository::save()` with:
 - [ ] **Step 4: Run the test to verify it passes**
 
 Run: `composer test:integration -- --filter RepositoryWriteTest`
-Expected: PASS — 10 tests
+Expected: PASS — 11 tests
 
 - [ ] **Step 5: Commit**
 
@@ -1323,14 +1355,16 @@ invariants live in PHP at the only code that touches the table."
 ### Task 5: The audit event log and atomic state transitions
 
 **Files:**
-- Create: `src/Mapping/EventLog.php`, `src/Support/AtomicTransition.php`
+- Create: `src/Mapping/EventLog.php`, `src/Support/AtomicTransition.php`, `src/Support/TransitionOutcome.php`, `src/Support/TransitionResult.php`
 - Test: `tests/integration/Mapping/EventLogTest.php`, `tests/integration/Support/AtomicTransitionTest.php`
 
 **Interfaces:**
 - Consumes: `Schema` (Task 2).
 - Produces:
   - `PostDomain\Mapping\EventLog::record( int $domain_id, string $host, string $type, ?string $from, ?string $to, ?string $actor, array $detail = array() ): bool` — **true only when the row was inserted** — plus `::for_domain( int $domain_id ): array` and `::prune( int $retention_days ): int`.
-  - `PostDomain\Support\AtomicTransition::is_transactional(): bool` and `::commit( callable $transition, callable $event ): bool`, where `$transition` is the owner-pinned CAS returning `true` on exactly one affected row and `$event` is a `callable(): bool` recording the event.
+  - `PostDomain\Support\AtomicTransition::is_transactional(): bool` and `::commit( callable $transition, callable $event ): TransitionResult`, where `$transition` is the owner-pinned CAS returning `true` on exactly one affected row and `$event` is a `callable(): bool` recording the event.
+  - `PostDomain\Support\TransitionOutcome` enum — `COMMITTED`, `CAS_LOST`, `EVENT_FAILED`, `TRANSACTION_UNAVAILABLE`, `COMMIT_UNCERTAIN`.
+  - `PostDomain\Support\TransitionResult` — readonly `TransitionOutcome $outcome`, `string $detail`, with `::committed(): bool` and `::cas_lost(): bool`.
 
 Events are a support artifact. Nothing in authorization, routing, or state
 transition reads this table, which is what makes pruning always safe (spec §12.3).
@@ -1344,6 +1378,17 @@ transition can never leave a success event behind.
 
 `AtomicTransition::commit()` is the single mechanism every later plan uses for
 this. Nothing in Plans 07–10 may pair a CAS with an event any other way.
+
+**It returns a result, not a boolean, because "not committed" has four causes and
+callers need different answers to them.** A CAS that lost means another owner has
+the row — discard and move on. A transaction that could not be started, an event
+that could not be inserted, or a `COMMIT` whose success is unknown all mean the
+local write did not land even though a provider call may already have happened.
+Collapsing those into `false` would let a caller report a fenced worker and a
+failed database write identically, which is exactly the confusion the fencing
+rules exist to prevent. `START TRANSACTION`, `COMMIT`, and `ROLLBACK` results are
+therefore checked rather than assumed, and a transition never begins when the
+required transaction could not be established.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1537,6 +1582,8 @@ namespace PostDomain\Support;
  */
 final class AtomicTransition {
 
+	private static bool $in_progress = false;
+
 	public static function is_transactional(): bool {
 		return 0 === strcasecmp( Schema::engine(), 'InnoDB' );
 	}
@@ -1544,45 +1591,123 @@ final class AtomicTransition {
 	/**
 	 * @param callable(): bool $transition The owner-pinned CAS. True ⇒ exactly one row changed.
 	 * @param callable(): bool $event      Records the event. True ⇒ the row was inserted.
-	 * @return bool True only when the transition was applied and (on InnoDB) its event committed with it.
 	 */
-	public static function commit( callable $transition, callable $event ): bool {
+	public static function commit( callable $transition, callable $event ): TransitionResult {
 		global $wpdb;
+
+		// Nesting would make the inner COMMIT close the outer transaction, so the
+		// outer caller would be told its work committed when it had not.
+		if ( self::$in_progress ) {
+			throw new \LogicException( 'AtomicTransition::commit() may not be nested.' );
+		}
 
 		if ( ! self::is_transactional() ) {
 			if ( ! $transition() ) {
-				return false;
+				return new TransitionResult( TransitionOutcome::CAS_LOST, 'the CAS affected no rows' );
 			}
 
-			// Best-effort, and only ever after the fact.
-			$event();
-
-			return true;
+			// Best-effort, and only ever after the fact. A missing event on a
+			// nontransactional engine is tolerable: nothing reads the log.
+			return $event()
+				? new TransitionResult( TransitionOutcome::COMMITTED, 'committed without a transaction' )
+				: new TransitionResult( TransitionOutcome::COMMITTED, 'committed; the best-effort event was not recorded' );
 		}
 
-		$wpdb->query( 'START TRANSACTION' ); // phpcs:ignore WordPress.DB
+		if ( false === $wpdb->query( 'START TRANSACTION' ) ) { // phpcs:ignore WordPress.DB
+			// The transition is never attempted: without the transaction there is
+			// no way to keep it and its event together.
+			return new TransitionResult( TransitionOutcome::TRANSACTION_UNAVAILABLE, 'START TRANSACTION failed' );
+		}
+
+		self::$in_progress = true;
 
 		try {
 			if ( ! $transition() ) {
-				$wpdb->query( 'ROLLBACK' ); // phpcs:ignore WordPress.DB
-
-				return false;
+				return self::undo( TransitionOutcome::CAS_LOST, 'the CAS affected no rows' );
 			}
 
 			if ( ! $event() ) {
-				$wpdb->query( 'ROLLBACK' ); // phpcs:ignore WordPress.DB
-
-				return false;
+				return self::undo( TransitionOutcome::EVENT_FAILED, 'the event row could not be inserted' );
 			}
+
+			if ( false === $wpdb->query( 'COMMIT' ) ) { // phpcs:ignore WordPress.DB
+				// Whether the server applied it is unknown. Never call this
+				// committed; reconciliation and recovery settle the row.
+				return new TransitionResult( TransitionOutcome::COMMIT_UNCERTAIN, 'COMMIT failed or returned an unknown result' );
+			}
+
+			return new TransitionResult( TransitionOutcome::COMMITTED, 'committed' );
 		} catch ( \Throwable $e ) {
-			$wpdb->query( 'ROLLBACK' ); // phpcs:ignore WordPress.DB
+			self::undo( TransitionOutcome::COMMIT_UNCERTAIN, 'rolled back after an exception' );
 
 			throw $e;
+		} finally {
+			self::$in_progress = false;
+		}
+	}
+
+	private static function undo( TransitionOutcome $outcome, string $detail ): TransitionResult {
+		global $wpdb;
+
+		if ( false === $wpdb->query( 'ROLLBACK' ) ) { // phpcs:ignore WordPress.DB
+			// The transition may or may not still stand. That is not a CAS loss.
+			return new TransitionResult( TransitionOutcome::COMMIT_UNCERTAIN, $detail . '; ROLLBACK also failed' );
 		}
 
-		$wpdb->query( 'COMMIT' ); // phpcs:ignore WordPress.DB
+		return new TransitionResult( $outcome, $detail );
+	}
+}
+```
 
-		return true;
+Create `src/Support/TransitionOutcome.php`:
+
+```php
+<?php
+declare( strict_types = 1 );
+
+namespace PostDomain\Support;
+
+enum TransitionOutcome: string {
+
+	/** The transition is applied and, on InnoDB, its event committed with it. */
+	case COMMITTED = 'committed';
+
+	/** The CAS matched nothing: someone else owns the row. Nothing was written. */
+	case CAS_LOST = 'cas_lost';
+
+	/** The event could not be inserted, so the transition was rolled back. */
+	case EVENT_FAILED = 'event_failed';
+
+	/** No transaction could be started, so the transition was never attempted. */
+	case TRANSACTION_UNAVAILABLE = 'transaction_unavailable';
+
+	/** The commit or the rollback failed: the row's state is not known here. */
+	case COMMIT_UNCERTAIN = 'commit_uncertain';
+}
+```
+
+Create `src/Support/TransitionResult.php`:
+
+```php
+<?php
+declare( strict_types = 1 );
+
+namespace PostDomain\Support;
+
+final class TransitionResult {
+
+	public function __construct(
+		public readonly TransitionOutcome $outcome,
+		public readonly string $detail
+	) {}
+
+	public function committed(): bool {
+		return TransitionOutcome::COMMITTED === $this->outcome;
+	}
+
+	/** True only for the one cause that means another owner holds the row. */
+	public function cas_lost(): bool {
+		return TransitionOutcome::CAS_LOST === $this->outcome;
 	}
 }
 ```
@@ -1605,6 +1730,7 @@ namespace PostDomain\Tests\Integration\Support;
 use PostDomain\Mapping\EventLog;
 use PostDomain\Support\AtomicTransition;
 use PostDomain\Support\Schema;
+use PostDomain\Support\TransitionOutcome;
 use WP_UnitTestCase;
 
 final class AtomicTransitionTest extends WP_UnitTestCase {
@@ -1615,7 +1741,9 @@ final class AtomicTransitionTest extends WP_UnitTestCase {
 	}
 
 	public function tear_down(): void {
-		// Re-probe and restore the real engine after the overrides below.
+		// Re-probe and restore the real engine after the overrides below, and
+		// drop any query filter a failed assertion left installed.
+		remove_all_filters( 'query' );
 		delete_option( 'pd_schema_engine' );
 		Schema::install();
 		parent::tear_down();
@@ -1644,14 +1772,20 @@ final class AtomicTransitionTest extends WP_UnitTestCase {
 	public function test_on_innodb_a_zero_row_cas_records_no_event(): void {
 		$this->as_engine( 'InnoDB' );
 
-		$this->assertFalse( AtomicTransition::commit( static fn(): bool => false, $this->event( 101 ) ) );
+		$result = AtomicTransition::commit( static fn(): bool => false, $this->event( 101 ) );
+
+		$this->assertSame( TransitionOutcome::CAS_LOST, $result->outcome );
+		$this->assertTrue( $result->cas_lost() );
+		$this->assertFalse( $result->committed() );
 		$this->assertCount( 0, EventLog::for_domain( 101 ) );
 	}
 
 	public function test_on_innodb_a_successful_pair_commits_together(): void {
 		$this->as_engine( 'InnoDB' );
 
-		$this->assertTrue( AtomicTransition::commit( static fn(): bool => true, $this->event( 102 ) ) );
+		$result = AtomicTransition::commit( static fn(): bool => true, $this->event( 102 ) );
+
+		$this->assertTrue( $result->committed() );
 		$this->assertCount( 1, EventLog::for_domain( 102 ) );
 	}
 
@@ -1660,7 +1794,7 @@ final class AtomicTransitionTest extends WP_UnitTestCase {
 
 		$this->as_engine( 'InnoDB' );
 
-		$applied = AtomicTransition::commit(
+		$result = AtomicTransition::commit(
 			static function () use ( $wpdb ): bool {
 				$wpdb->insert( // phpcs:ignore WordPress.DB
 					Schema::events_table(),
@@ -1677,8 +1811,59 @@ final class AtomicTransitionTest extends WP_UnitTestCase {
 			static fn(): bool => false
 		);
 
-		$this->assertFalse( $applied );
+		$this->assertSame( TransitionOutcome::EVENT_FAILED, $result->outcome );
+		$this->assertFalse( $result->cas_lost(), 'the CAS succeeded; the event did not' );
 		$this->assertCount( 0, EventLog::for_domain( 103 ), 'the transition rolled back with its event' );
+	}
+
+	public function test_a_transaction_that_cannot_start_never_runs_the_transition(): void {
+		$this->as_engine( 'InnoDB' );
+
+		$ran = false;
+
+		add_filter( 'query', $fail = static fn( string $q ): string => 'START TRANSACTION' === $q ? 'SELECT bad_syntax FROM' : $q );
+
+		$result = AtomicTransition::commit(
+			static function () use ( &$ran ): bool {
+				$ran = true;
+
+				return true;
+			},
+			$this->event( 106 )
+		);
+
+		remove_filter( 'query', $fail );
+
+		$this->assertSame( TransitionOutcome::TRANSACTION_UNAVAILABLE, $result->outcome );
+		$this->assertFalse( $ran, 'nothing may be written without the transaction that keeps it whole' );
+		$this->assertCount( 0, EventLog::for_domain( 106 ) );
+	}
+
+	public function test_a_failed_commit_is_never_reported_as_committed(): void {
+		$this->as_engine( 'InnoDB' );
+
+		add_filter( 'query', $fail = static fn( string $q ): string => 'COMMIT' === $q ? 'SELECT bad_syntax FROM' : $q );
+
+		$result = AtomicTransition::commit( static fn(): bool => true, $this->event( 107 ) );
+
+		remove_filter( 'query', $fail );
+
+		$this->assertSame( TransitionOutcome::COMMIT_UNCERTAIN, $result->outcome );
+		$this->assertFalse( $result->committed() );
+		$this->assertFalse( $result->cas_lost(), 'an uncertain commit is not a lost CAS' );
+	}
+
+	public function test_a_failed_rollback_is_reported_as_uncertain_not_as_a_lost_cas(): void {
+		$this->as_engine( 'InnoDB' );
+
+		add_filter( 'query', $fail = static fn( string $q ): string => 'ROLLBACK' === $q ? 'SELECT bad_syntax FROM' : $q );
+
+		$result = AtomicTransition::commit( static fn(): bool => false, $this->event( 108 ) );
+
+		remove_filter( 'query', $fail );
+
+		$this->assertSame( TransitionOutcome::COMMIT_UNCERTAIN, $result->outcome );
+		$this->assertStringContainsString( 'ROLLBACK', $result->detail );
 	}
 
 	public function test_on_innodb_a_throwing_transition_rolls_back_and_rethrows(): void {
@@ -1698,20 +1883,72 @@ final class AtomicTransitionTest extends WP_UnitTestCase {
 		}
 	}
 
+	public function test_a_throwing_event_also_rolls_back_and_rethrows(): void {
+		$this->as_engine( 'InnoDB' );
+
+		$this->expectException( \RuntimeException::class );
+
+		AtomicTransition::commit(
+			static fn(): bool => true,
+			static function (): bool {
+				throw new \RuntimeException( 'boom' );
+			}
+		);
+	}
+
+	public function test_nesting_is_refused_rather_than_silently_flattened(): void {
+		$this->as_engine( 'InnoDB' );
+
+		$this->expectException( \LogicException::class );
+
+		AtomicTransition::commit(
+			static function (): bool {
+				AtomicTransition::commit( static fn(): bool => true, static fn(): bool => true );
+
+				return true;
+			},
+			static fn(): bool => true
+		);
+	}
+
+	public function test_a_refused_nesting_leaves_the_outer_transaction_usable(): void {
+		$this->as_engine( 'InnoDB' );
+
+		try {
+			AtomicTransition::commit(
+				static function (): bool {
+					AtomicTransition::commit( static fn(): bool => true, static fn(): bool => true );
+
+					return true;
+				},
+				static fn(): bool => true
+			);
+		} catch ( \LogicException $e ) {
+			unset( $e );
+		}
+
+		$this->assertTrue(
+			AtomicTransition::commit( static fn(): bool => true, $this->event( 109 ) )->committed(),
+			'the guard must reset itself'
+		);
+	}
+
 	public function test_on_a_nontransactional_engine_a_zero_row_cas_still_records_no_event(): void {
 		$this->as_engine( 'MyISAM' );
 
-		$this->assertFalse( AtomicTransition::commit( static fn(): bool => false, $this->event( 105 ) ) );
+		$result = AtomicTransition::commit( static fn(): bool => false, $this->event( 105 ) );
+
+		$this->assertSame( TransitionOutcome::CAS_LOST, $result->outcome );
 		$this->assertCount( 0, EventLog::for_domain( 105 ), 'the event is best-effort, never speculative' );
 	}
 
 	public function test_on_a_nontransactional_engine_a_failed_event_does_not_undo_the_transition(): void {
 		$this->as_engine( 'MyISAM' );
 
-		$this->assertTrue(
-			AtomicTransition::commit( static fn(): bool => true, static fn(): bool => false ),
-			'the log may lag or miss rows; the state change still stands'
-		);
+		$result = AtomicTransition::commit( static fn(): bool => true, static fn(): bool => false );
+
+		$this->assertTrue( $result->committed(), 'the log may lag or miss rows; the state change still stands' );
+		$this->assertStringContainsString( 'not recorded', $result->detail );
 	}
 }
 ```
@@ -1719,18 +1956,23 @@ final class AtomicTransitionTest extends WP_UnitTestCase {
 - [ ] **Step 6: Run it and verify it passes**
 
 Run: `composer test:integration -- --filter AtomicTransitionTest`
-Expected: PASS — 8 tests
+Expected: PASS — 14 tests
 
 - [ ] **Step 7: Commit**
 
 ```bash
-git add src/Mapping/EventLog.php src/Support/AtomicTransition.php tests/integration/Mapping/EventLogTest.php tests/integration/Support/AtomicTransitionTest.php
+git add src/Mapping/EventLog.php src/Support/AtomicTransition.php src/Support/TransitionOutcome.php src/Support/TransitionResult.php tests/integration/Mapping/EventLogTest.php tests/integration/Support/AtomicTransitionTest.php
 git commit -m "Write a state change and its event as one transaction on InnoDB
 
 The host snapshot exists because rows are eventually hard-deleted and the
 history has to stay readable afterwards. On engines without transactions the
 event stays best-effort, but it is attempted only after the CAS succeeds, so a
-fenced worker can never leave a success event behind."
+fenced worker can never leave a success event behind.
+
+The result is typed rather than boolean: a lost CAS means someone else owns the
+row, while an unavailable transaction, a failed event, or an uncertain commit all
+mean the local write did not land after a provider call may already have gone
+out. Those need different answers, so they are not collapsed."
 ```
 
 ---
