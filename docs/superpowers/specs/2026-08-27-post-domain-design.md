@@ -22,6 +22,9 @@ everything else derives from it.
 Requests arriving on the site's own primary domain are untouched. Normal permalinks
 continue to work exactly as they did.
 
+Mapped hosts are **exact hosts**. Wildcard host mappings are invalid, and wildcard
+certificate provisioning is out of scope for this design (§14.16).
+
 ### 1.1 Single site only
 
 The plugin must not require a multisite network and must not be installed in one.
@@ -74,7 +77,7 @@ post-domain/
       HostNormalizer.php  TrustedProxy.php  Schema.php  PublicSuffix.php
     Mapping/
       Mapping.php  VerificationState.php  ActivationState.php  SslState.php
-      DbRepository.php  AliasResolver.php
+      OwnershipOrigin.php  DbRepository.php  AliasResolver.php
     Routing/
       EndpointClass.php  Representation.php  Classifier.php
       PathNormalizer.php  PathDecomposer.php  PathDecomposition.php
@@ -99,8 +102,11 @@ post-domain/
       SslDriverRegistry.php  DriverCapabilities.php  SslResourceContext.php
       SslStatus.php  IdentityResult.php  IdentityVerdict.php  ProviderMarker.php
       MarkerSupport.php  RemovalResult.php  RemovalOutcome.php  ReconcileReport.php
-      DeletionAuthorizer.php  DeletionAuthorization.php  DeletionRefusal.php
-      AdoptionAuthorizer.php  AdoptionAuthorization.php
+      MutationLease.php  MutationGate.php  MutationKind.php
+      MutationAuthorization.php  MutationRefusal.php
+      DeletionAuthorizer.php  AdoptionAuthorizer.php  MethodChangeAuthorizer.php
+      CreateRecovery.php
+      ApexCapability.php  ApexRouting.php
       ValidationPlan.php  DnsRequirementSet.php  DnsRecordSpec.php
       HttpRequirementSet.php  ManualRequirement.php  ValidationPending.php  DnsBlocker.php
       NullDriver.php  CloudflareSaasDriver.php  CloudflareStatusMap.php
@@ -136,8 +142,12 @@ against one filter set, a URL the plugin emits and a URL it resolves cannot disa
 **Identity is separate from authorization.** In the SSL subsystem, "is this the
 resource we expect?" and "is this installation allowed to mutate it?" are two different
 questions answered by two different components: the driver answers identity, and a
-plugin-owned guard outside the driver answers authorization. Collapsing them is how a
+plugin-owned gate outside the driver answers authorization. Collapsing them is how a
 stale local flag becomes a deletion.
+
+**Authorization never depends on prunable data.** Ownership provenance lives in
+first-class columns on the mapping row. The event log is a support artifact and is
+never read to make a decision.
 
 **Interfaces** — every dependency that touches the outside world (database, DNS,
 clock, scheduler, HTTP, certificate provider) is behind an interface and injected at
@@ -228,6 +238,7 @@ never throws:
 → $a = Idn::idn_to_ascii( $u, UTS46, NONTRANSITIONAL )
 → reject if either step fails, or if round-tripping $a is not stable
 → validate: ≤ 253 bytes, each label 1–63, LDH, no leading/trailing hyphen
+→ reject any label consisting of or beginning with '*'   (no wildcard hosts)
 → return $a
 ```
 
@@ -771,8 +782,10 @@ subtree.
 5. **A URL is emitted only if it round-trips.** Enforced at generation.
 6. **`AuthorityParser` and `UnknownHostGuard` positions are not filterable.** Only the
    allowlist is data.
-7. **Provider deletion requires fresh, installation-bound authorization** (§14.5). No
-   filter grants it.
+7. **Provider mutations require a held lease and a fresh, installation-bound
+   authorization** (§14.4–14.5). No filter grants either.
+8. **Ownership provenance is column state, never derived from events.** No filter
+   writes it.
 
 ### 11.2 Mapping
 
@@ -813,7 +826,6 @@ without the other is the documented mistake.
 | `pd_admin_redirect` | `(bool)` → `true` |
 | `pd_admin_redirect_target` | `(string, HostContext)` → primary host, same path+query |
 | `pd_xmlrpc_on_mapped_hosts` | `(bool)` → `false` |
-| `pd_is_apex` | `(?bool, string $host)` → PSL-derived |
 
 ### 11.5 URL and canonical
 
@@ -839,7 +851,9 @@ without the other is the documented mistake.
 | `pd_dns_resolver` | `(DnsResolver)` → `DohResolver` — **trusted code**, see §13.3 |
 | `pd_ssl_drivers` | `(SslDriver[])` → `[NullDriver, CloudflareSaasDriver]` |
 | `pd_ssl_validation_method` | `(string, Mapping)` → configured method, default `'txt'` |
-| `pd_deletion_authorization_ttl` | `(int seconds)` → `120` |
+| `pd_apex_capability` | `(ApexCapability, string $host, Mapping)` → driver-derived, typed (§14.12) |
+| `pd_mutation_lease_ttl` | `(int seconds)` → `120` |
+| `pd_authorization_ttl` | `(int seconds)` → `120`, never beyond the held lease |
 | `pd_cors_allowed_origin` | `(?string, string, HostContext)` → the origin if verified+active |
 | `pd_asset_proxy_enabled` | `(bool)` → `false` |
 | `pd_asset_proxy_extensions` | `(string[])` → `['woff2','woff','ttf','otf','eot']` |
@@ -853,8 +867,12 @@ without the other is the documented mistake.
 
 `pd_mapping_created`, `pd_mapping_verified`, `pd_mapping_verification_failed`
 (with `DnsOutcome`), `pd_mapping_deleted`, `pd_ssl_state_changed`,
-`pd_ssl_resource_adopted`, `pd_ssl_deletion_refused` (with the failing precondition),
-`pd_request_resolved`, `pd_request_unmatched`, `pd_environment_mismatch_detected`.
+`pd_ssl_resource_adopted`, `pd_ssl_create_recovered`, `pd_ssl_mutation_refused`
+(with the failing precondition), `pd_ssl_method_changed`, `pd_request_resolved`,
+`pd_request_unmatched`, `pd_environment_mismatch_detected`.
+
+Actions are notifications. Nothing in the plugin reads an action's effects, and no
+authorization consults one.
 
 ### 11.8 Hard postconditions
 
@@ -876,8 +894,10 @@ are ignored and logged, never honoured.
 | `pd_scope_enumeration_limit` | Clamped `0..5000`. |
 | `pd_query_scope` | Must return a `QueryScope`. A non-`QueryScope`, or `is_bounded = true` with no constraint, is replaced with `is_bounded = false`. Unbounded is never reachable. |
 | `pd_txt_record_label` | Matches `/^_?[a-z0-9]([a-z0-9-]*[a-z0-9])?$/i`, 1–63 bytes, no dot, lowercased; else the default. Validated at create/rotate only. |
-| `pd_ssl_validation_method` | Must be one of `{http, txt, email}`; else the configured default. `http` is rejected for wildcard hostnames (§14.10). |
-| `pd_deletion_authorization_ttl` | Clamped `30..300` seconds. |
+| `pd_ssl_validation_method` | Must be one of `{http, txt, email}` **and** present in the driver's `DriverCapabilities::$validation_methods`; else the configured default. |
+| `pd_apex_capability` | Must return an `ApexCapability`. `APEX_PROXY` additionally requires a non-empty `targets` array of valid IP literals, a `target_provenance` in `{static_ip_prefix, byoip}`, and `operator_attested === true`; anything short of that is downgraded to `UNSUPPORTED` and a `DnsBlocker` is emitted. Entitlement is never inferred from the mere presence of address strings. |
+| `pd_mutation_lease_ttl` | Clamped `30..600` seconds. |
+| `pd_authorization_ttl` | Clamped `30..300` seconds, and further clamped to the remaining lease lifetime. |
 | `pd_unknown_host_policy`, `pd_unmatched_policy` | Must be a declared enum member; else the default. |
 | `pd_rest_capability` | Non-empty string; else `manage_options`. |
 | `pd_mapping_is_active` | Cast to bool and ANDed with stored state. |
@@ -916,7 +936,8 @@ resolver_class           VARCHAR(191)      NULL
 
 ssl_provider             VARCHAR(60)       NULL
 ssl_ref                  VARCHAR(191)      NULL
-ssl_owned                TINYINT(1)        NOT NULL DEFAULT 0
+ssl_ownership_origin     VARCHAR(10)       NULL          -- 'created' | 'adopted' | NULL
+ssl_owner_installation_id CHAR(36)         NULL
 ssl_adopted_at           DATETIME          NULL
 ssl_adopted_by           BIGINT UNSIGNED   NULL
 ssl_method               VARCHAR(10)       NULL          -- persisted DCV method
@@ -925,8 +946,12 @@ ssl_marker_support       VARCHAR(20)       NULL          -- supported|unavailabl
 ssl_checked_at           DATETIME          NULL
 ssl_next_attempt_at      DATETIME          NULL
 ssl_transient_count      SMALLINT UNSIGNED NOT NULL DEFAULT 0
-ssl_provider_state       TEXT              NULL          -- JSON, raw provider axes + errors
+ssl_provider_state       TEXT              NULL          -- JSON, raw axes + error arrays
 ssl_error                TEXT              NULL          -- JSON {code,message,at}
+
+ssl_mutation_token       CHAR(32)          NULL          -- provider-mutation lease
+ssl_mutation_kind        VARCHAR(20)       NULL          -- create|adopt|method|remove
+ssl_mutation_expires_at  DATETIME          NULL
 
 deletion_requested_at    DATETIME          NULL
 deletion_attempts        SMALLINT UNSIGNED NOT NULL DEFAULT 0
@@ -946,6 +971,7 @@ KEY alias_of (alias_of)
 KEY verify_due   (verification_state, verify_next_attempt_at)
 KEY ssl_due      (ssl_state, ssl_next_attempt_at)
 KEY deletion_due (deletion_next_attempt_at)
+KEY ssl_lease    (ssl_mutation_expires_at)
 ```
 
 `ENGINE=InnoDB`; the actual engine is probed at install and stored in
@@ -966,19 +992,53 @@ No `CHECK` constraints (unreliable across MySQL 5.7 / 8 / MariaDB). Validity is
 enforced in PHP at a single write path, `DbRepository::save()`, the only code that
 touches the table.
 
-**Row shape:**
+**Row invariants:**
 
 ```
 alias_of IS NULL      =>  post_id IS NOT NULL        (canonical row)
 alias_of IS NOT NULL  =>  post_id IS NULL            (alias row)
 alias target must itself have alias_of IS NULL       (no chaining)
+
+ssl_ownership_origin IS NOT NULL
+   <=> ssl_owner_installation_id IS NOT NULL
+   <=> ssl_ref IS NOT NULL
+ssl_ownership_origin = 'adopted'  =>  ssl_adopted_at IS NOT NULL
+ssl_ownership_origin = 'created'  =>  ssl_adopted_at IS NULL
+ssl_mutation_token IS NOT NULL
+   <=> ssl_mutation_kind IS NOT NULL
+   <=> ssl_mutation_expires_at IS NOT NULL
 ```
 
 `alias_of` is a self-reference with no FK (`dbDelta` cannot express one portably);
 orphan cleanup runs in the repository on delete, and a scheduled integrity check
 reports strays.
 
-### 12.2 `{$wpdb->prefix}pd_domain_events`
+### 12.2 Ownership provenance
+
+There is exactly one source of truth for whether this installation may mutate a
+provider resource, and it is column state on the row:
+
+```php
+enum OwnershipOrigin { case CREATED; case ADOPTED; }
+```
+
+| Column | Meaning |
+|---|---|
+| `ssl_ownership_origin` | `created` — this installation created the resource; `adopted` — this installation explicitly adopted it; `NULL` — **no ownership authority** |
+| `ssl_owner_installation_id` | the `pd_installation_id` that created or adopted the binding |
+| `ssl_adopted_at` / `ssl_adopted_by` | when and by whom an adoption happened |
+
+**Authority** is `ssl_ownership_origin IS NOT NULL` **and**
+`ssl_owner_installation_id === pd_installation_id`. Nothing else establishes it. There
+is no boolean flag duplicating this — a second source of truth is precisely what makes
+ownership drift — and there is **no query against the event table in any authorization
+decision**. Pruning an event can never change what a mapping is allowed to do.
+
+Successful creation persists `origin = created` with the current installation id.
+Successful explicit adoption persists `origin = adopted` with the current installation
+id. Clone resolution clears all four columns; restore/move retains them (§14.8).
+
+### 12.3 `{$wpdb->prefix}pd_domain_events`
 
 ```
 id          BIGINT UNSIGNED NOT NULL AUTO_INCREMENT
@@ -996,17 +1056,20 @@ PRIMARY KEY (id)
 KEY domain_created (domain_id, created_at)
 ```
 
-Every state transition, every adoption, and every refused deletion writes one row. This
-is the support artifact — "it stopped working on Tuesday" becomes answerable, and
-`resolver_class` makes it visible which code performed each ownership proof. Retention
-90 days, pruned daily.
+Every state transition, every adoption, every recovered create, and every refused
+mutation writes one row. This is the **support artifact** — "it stopped working on
+Tuesday" becomes answerable, and `resolver_class` makes it visible which code performed
+each ownership proof.
+
+Retention is 90 days, pruned daily. **Events are never decision inputs.** Nothing in
+authorization, routing, or state transition reads this table, so pruning is always safe.
 
 **Atomicity:** when `pd_schema_engine` is InnoDB, the state change and its event row are
 written in one transaction. On any other engine the transaction is skipped and the
-event log is **best-effort** — it can lag or miss rows. Nothing reads it to make a
-decision; it is never an input.
+event log is **best-effort** — it can lag or miss rows, which is tolerable precisely
+because nothing reads it.
 
-### 12.3 Timestamps and storage hygiene
+### 12.4 Timestamps and storage hygiene
 
 All `DATETIME` columns are **UTC**, written with `gmdate('Y-m-d H:i:s')`.
 `current_time()` is never called — a site-local timestamp in a scheduling column
@@ -1015,10 +1078,11 @@ produces silent off-by-hours behaviour across DST. REST emits RFC 3339 with `Z`.
 `ssl_error` is JSON `{code, message, at}`; the message is truncated to 500 bytes and
 passed through a redactor stripping bearer-token, API-key, and `Authorization:` shapes.
 Raw provider bodies are never stored. Credentials never appear in a row, a response, an
-event, or a log line. Deletion authorizations are in-process values only: never
-persisted, never serialized into an event, never logged.
+event, or a log line. Mutation authorizations are in-process values only: never
+persisted, never serialized into an event, never logged. The lease token **is**
+persisted, because the database is where single-use enforcement lives (§12.6).
 
-### 12.4 Compare-and-swap
+### 12.5 Compare-and-swap
 
 ```sql
 UPDATE … SET …, revision = revision + 1, updated_at = ?
@@ -1030,7 +1094,93 @@ attempts) for cron and CLI. REST exposes `revision` and `ETag: "<id>-<revision>"
 `If-Match` is **required** on `PATCH`, `DELETE`, `POST /challenge`, and any `…/ssl`
 mutation: missing ⇒ `428`, stale ⇒ `412`. `POST /verify` is exempt (idempotent probe).
 
-### 12.5 State machines
+CAS alone is sufficient for local writes. It is **not** sufficient for a provider
+mutation, because between the last CAS read and the outbound HTTP call another worker
+can change the row, and the driver — holding only a value object — cannot see it. That
+gap is closed by the lease.
+
+### 12.6 The provider-mutation lease
+
+A persisted, token-owned, per-mapping lease. It is the concrete owner of single-use
+enforcement: an authorization is consumed by a CAS that names the lease token, and the
+lease is then cleared, so the same authorization cannot be applied twice.
+
+```php
+enum MutationKind { case CREATE; case ADOPT; case METHOD_CHANGE; case REMOVE; }
+
+final class MutationLease {
+    public readonly int    $mapping_id;
+    public readonly int    $revision;      // the revision AFTER acquisition
+    public readonly string $token;         // 32 random hex
+    public readonly MutationKind $kind;
+    public readonly DateTimeImmutable $expires_at;
+}
+```
+
+**Acquire** — atomic CAS against the expected revision, refusing while another lease is
+live:
+
+```sql
+UPDATE {prefix}pd_domains
+   SET ssl_mutation_token = :tok, ssl_mutation_kind = :kind,
+       ssl_mutation_expires_at = :exp, revision = revision + 1, updated_at = :now
+ WHERE id = :id AND revision = :rev
+   AND ( ssl_mutation_expires_at IS NULL OR ssl_mutation_expires_at <= :now )
+```
+
+**Release** — compare-and-clear on the owning token, so an expired worker can never
+clear a newer worker's lease:
+
+```sql
+UPDATE {prefix}pd_domains
+   SET ssl_mutation_token = NULL, ssl_mutation_kind = NULL, ssl_mutation_expires_at = NULL,
+       revision = revision + 1, updated_at = :now
+ WHERE id = :id AND ssl_mutation_token = :tok
+```
+
+TTL is `pd_mutation_lease_ttl` (default 120 s, clamped 30–600).
+
+**What the lease blocks.** While a lease is held by another token, every path — REST,
+Admin, cron, reconciliation, CLI — refuses or defers any write that changes a field
+bound into an authorization: `host`, `challenge` (rotation), `ssl_provider`, `ssl_ref`,
+`ssl_method`, the ownership columns, adoption, removal, force-local-delete, and any
+further provider mutation. The refusal is `pd_mutation_in_progress` (409) and it
+**never touches the provider**.
+
+Writes that are not bound into an authorization — `activation_state`, `title`,
+`favicon_attachment_id` — and all read-only diagnostics remain permitted.
+
+**The complete provider-mutation window**, used identically by create, adopt, method
+change, and remove:
+
+1. Read the mapping and its revision.
+2. Acquire the lease by CAS (this bumps the revision).
+3. Build the `SslResourceContext` from the **leased** row.
+4. Perform fresh provider identity and fresh DNS checks.
+5. Produce the bound `MutationAuthorization`.
+6. Perform the provider mutation **while the lease is still valid**.
+7. Apply the result by CAS on `(id, leased revision, ssl_mutation_token)`.
+8. Release the lease by token-owned compare-and-clear.
+
+If the lease expires **before** step 6 begins, authorization is refused and the whole
+window is recomputed from step 1. If it expires **during** step 6, ambiguous-mutation
+reconciliation applies (§14.9): a second worker must read provider state before doing
+anything, and must never blindly repeat the mutation.
+
+**Queue selection** excludes leased rows:
+
+```sql
+… AND ( ssl_mutation_expires_at IS NULL OR ssl_mutation_expires_at <= :utc_now )
+```
+
+**Expired-lease recovery** is a separate pass in `pd_ssl_sweep`: rows whose
+`ssl_mutation_expires_at` has passed while `ssl_mutation_kind` is still set are
+reconciled according to that kind — a provider read first, then the appropriate
+outcome — and only then is the stale lease cleared under CAS. A lease is never cleared
+blindly, because a set `ssl_mutation_kind` is the only record that an outbound mutation
+may have been in flight.
+
+### 12.7 State machines
 
 The three states are independent. Only verification and activation gate serving, and
 only by AND.
@@ -1060,9 +1210,13 @@ With the default 3: failures 1 and 2 keep the mapping verified; failure 3 fails 
 failure both prove the resolver is reachable. Rotation resets both. A manual
 `POST /verify` runs a real check and applies the same arithmetic; it is not a free pass.
 
+Challenge rotation is refused while a provider-mutation lease is held, because a bound
+authorization names the challenge.
+
 **Activation** — written only by admin and REST; never by verification or SSL.
 `inactive ⇄ active`. A mapping may be `active` while `pending`, letting an operator
 pre-stage a domain. Serving requires `verified && active && pd_mapping_is_active`.
+Activation is not bound into any authorization, so it is permitted during a lease.
 
 **SSL** — owned by `Ssl\*`; **never gates serving** (TLS terminates before PHP runs; if
 the request arrived, the certificate question is already settled).
@@ -1074,9 +1228,12 @@ enum SslState { case NONE; case REQUESTED; case PENDING_VALIDATION; case ACTIVE;
 
 | Situation | From | To |
 |---|---|---|
-| `ensure()`, provider accepts | `none`/`failed`/`revoked` | `requested` |
-| `ensure()`, provider reports already issued **and identity matches** | `none`/`requested` | `active` (immediate) |
-| `ensure()`, resource exists but identity does not match | unchanged | `failed` / `unowned_resource` |
+| `create()` accepted, validation needed | `none`/`failed`/`revoked` | `requested` |
+| `create()` accepted, provider reports already issued | `none`/`requested` | `active` |
+| Ambiguous create, resource conclusively absent | unchanged | retryable under a new lease |
+| Ambiguous create recovered by matching marker | `requested` | provider-reported state, reference bound |
+| Ambiguous create, markers unavailable, nothing previously bound | `requested` | `failed` / `provider_create_ambiguous` |
+| Existing resource, identity does not match | unchanged | `failed` / `unowned_resource` |
 | Validation outstanding | `requested` | `pending_validation` |
 | Provider reports issued | `pending_validation` | `active` |
 | Still validating | `pending_validation` | unchanged, `ssl_checked_at` advanced |
@@ -1103,8 +1260,8 @@ value: post-domain-verify=<32 lowercase hex>
 
 Token: 32 hex characters from `random_bytes()`, `UNIQUE` indexed, never reused,
 rotatable (which resets verification to `unverified`), destroyed with the row. **The
-record must remain in DNS permanently** — re-checks read it, and provider-deletion
-authorization re-proves against it. Aliases verify at their own name.
+record must remain in DNS permanently** — re-checks read it, and every provider
+mutation re-proves against it. Aliases verify at their own name.
 
 `pd_txt_record_label` runs **only** at create/rotate; its validated result is persisted
 in `challenge_label`. Ordinary verification composes the name from persisted data and
@@ -1116,7 +1273,7 @@ Full TXT-name validation: composed name ≤ 253 bytes, each label 1–63, ≤ 12
 label charset enforced.
 
 This record is the **plugin's** ownership proof and is entirely separate from any
-provider's own hostname-ownership or certificate-validation records (§14.11). None of
+provider's own hostname-ownership or certificate-validation records (§14.13). None of
 them may be substituted for another.
 
 ### 13.2 Resolver
@@ -1139,7 +1296,7 @@ hard failure is how live domains get deactivated by a resolver hiccup.
   `NO_RECORD`; `3` → `NXDOMAIN`; `2`, timeout, transport error, `429` → `TRANSIENT`.
 
 **These are public verification resolvers, not an authoritative-DNS requirement.** They
-read whatever the domain's own authoritative provider publishes (§14.12).
+read whatever the domain's own authoritative provider publishes (§14.14).
 
 **Transport hardening:** HTTPS enforced on the endpoint; `redirection => 0`; response
 capped at 64 KB; JSON `Content-Type` required; shape validated (`Status` an integer,
@@ -1151,8 +1308,8 @@ only from the default list or the filter; nothing derives an endpoint from reque
 with a hard restriction: **it may emit only `MATCH`, `MISMATCH`, or `TRANSIENT`.** Every
 empty or failed lookup is `TRANSIENT`, so it can never deactivate a verified mapping —
 correct behaviour for a resolver that cannot distinguish "record gone" from "resolver
-unwell." Selecting it raises a persistent admin notice, and it can never satisfy the
-fresh-proof requirement for provider deletion when it returns `TRANSIENT`.
+unwell." Selecting it raises a persistent admin notice, and a `TRANSIENT` from it can
+never satisfy the fresh-proof requirement for a provider mutation.
 
 Multi-string TXT values are concatenated per RFC before matching; comparison is
 `hash_equals`; **all** returned TXT values are examined, since a domain legitimately
@@ -1162,9 +1319,9 @@ carries many.
 
 A custom resolver **substitutes the domain-ownership proof mechanism**; it does not
 integrate with it. A resolver returning `MATCH` unconditionally disables verification
-entirely and would also satisfy the deletion fresh-proof requirement. Installing a
-non-default resolver raises a persistent admin notice naming the class, and the class is
-recorded on every verification event and every deletion authorization.
+entirely and would also satisfy the fresh-proof requirement for provider mutations.
+Installing a non-default resolver raises a persistent admin notice naming the class, and
+the class is recorded on every verification event and every mutation authorization.
 
 ### 13.4 Fresh proof
 
@@ -1177,19 +1334,20 @@ final class FreshProof {
 `FreshProof` performs a live resolution of the mapping's **current persisted** challenge
 under the normal two-resolver agreement rules and returns the outcome. It never reads
 `verification_state`, `verified_at`, or `last_outcome`. It exists because
-**cached verification state is not sufficient authorization for a provider deletion**
-(§14.5), and because a rotated challenge must invalidate any authority a copy of the
-database might otherwise claim.
+**cached verification state is not sufficient authorization for a provider mutation**,
+and because a rotated challenge must invalidate any authority a copy of the database
+might otherwise claim.
 
 ### 13.5 Queue, budget, and leases
 
 **Due-work queries** select directly on persisted next-attempt columns — no table
-scans, no heuristics:
+scans, no heuristics — and exclude rows under a live provider-mutation lease:
 
 ```sql
 SELECT … FROM {prefix}pd_domains
 WHERE verification_state IN (…) AND integrity_error IS NULL
   AND verify_next_attempt_at IS NOT NULL AND verify_next_attempt_at <= :utc_now
+  AND ( ssl_mutation_expires_at IS NULL OR ssl_mutation_expires_at <= :utc_now )
 ORDER BY verify_next_attempt_at ASC
 LIMIT :batch
 ```
@@ -1205,15 +1363,16 @@ remain due, the run schedules **one** continuation 60 s out rather than looping,
 5,000-domain backlog drains across ticks instead of timing out the same first batch
 forever. Diagnostics reports backlog depth and the oldest due timestamp.
 
-**Token-owned locks:** the sweep lock holds `{token, expires_at}`; acquisition is a
-conditional insert, release is compare-and-delete on the token, so a slow run whose
+**Token-owned sweep locks:** the sweep lock holds `{token, expires_at}`; acquisition is
+a conditional insert, release is compare-and-delete on the token, so a slow run whose
 lock has expired cannot release a newer run's lock.
 
-**Per-mapping lease:** acquired by CAS before any DNS query, and the result applied
-under CAS on `(id, revision, verify_lease_token)`. **If that CAS fails the DNS result is
-discarded — never replayed.** The row changed underneath the attempt (rotated challenge,
-retarget, deletion) and the result answers a question no longer being asked. The next
-sweep resolves again. `verify_lease_token` doubles as the attempt id on the event.
+**Per-mapping verification lease:** acquired by CAS before any DNS query, and the result
+applied under CAS on `(id, revision, verify_lease_token)`. **If that CAS fails the DNS
+result is discarded — never replayed.** The row changed underneath the attempt (rotated
+challenge, retarget, deletion) and the result answers a question no longer being asked.
+The next sweep resolves again. `verify_lease_token` doubles as the attempt id on the
+event. This lease is distinct from, and independent of, the provider-mutation lease.
 
 ### 13.6 Cron topology
 
@@ -1221,7 +1380,7 @@ sweep resolves again. `verify_lease_token` doubles as the attempt id on the even
 |---|---|---|
 | `pd_verify_pending` | 15 min | due `pending` rows, batched |
 | `pd_verify_established` | hourly sweep, ~daily per row | due `verified` and transient-backoff rows |
-| `pd_ssl_sweep` | 15 min | `requested`, `pending_validation`, `pending_removal`, stale `active` |
+| `pd_ssl_sweep` | 15 min | `requested`, `pending_validation`, `pending_removal`, stale `active`, plus expired-lease recovery |
 | `pd_maintenance` | daily | event pruning, orphan-alias check, full `Reconciler` pass, dangling-target scan |
 
 WP-Cron is unreliable on low-traffic sites. The README documents the system-cron
@@ -1233,35 +1392,43 @@ rather than inferred.
 
 ## 14. SSL subsystem
 
-The whole subsystem rests on one separation: **identity** is what the provider says a
-resource is; **authorization** is whether this installation may change it. The driver
-answers the first. A plugin-owned guard, outside every driver, answers the second.
+The subsystem rests on one separation: **identity** is what the provider says a resource
+is; **authorization** is whether this installation may change it. The driver answers the
+first. A plugin-owned gate outside every driver answers the second, using column state
+and live proofs only.
 
 ### 14.1 Resource context
 
 Provider operations never receive a bare host. A host alone cannot express the
-mapping-specific rules this design requires, so every call carries a typed context:
+mapping-specific rules this design requires, so every call carries a typed context built
+from the **leased** row:
 
 ```php
 final class SslResourceContext {
     public readonly int     $mapping_id;
-    public readonly string  $host;              // normalized ASCII
-    public readonly string  $installation_id;
-    public readonly string  $provider_id;       // stored on the mapping
-    public readonly ?string $provider_ref;      // stored resource reference, when present
-    public readonly string  $challenge_name;    // persisted composed TXT name
-    public readonly string  $challenge_value;   // persisted expected value
-    public readonly int     $revision;          // mapping revision at read time
-    public readonly ?string $requested_method;  // persisted DCV method
-    public readonly bool    $is_wildcard;
+    public readonly string  $host;                    // normalized ASCII, exact host
+    public readonly string  $installation_id;         // current pd_installation_id
+    public readonly string  $provider_id;             // stored on the mapping
+    public readonly ?string $provider_ref;            // stored resource reference, if bound
+    public readonly ?OwnershipOrigin $ownership_origin;
+    public readonly ?string $owner_installation_id;
+    public readonly string  $challenge_name;          // persisted composed TXT name
+    public readonly string  $challenge_value;         // persisted expected value
+    public readonly int     $revision;                // leased revision
+    public readonly ?string $lease_token;             // held lease, for mutations
+    public readonly ?string $requested_method;        // persisted DCV method
 }
 ```
 
 ### 14.2 Identity
 
 ```php
-enum IdentityVerdict { case MATCH; case MISMATCH; case ABSENT; case AMBIGUOUS; case UNKNOWN; }
-enum MarkerSupport   { case SUPPORTED; case UNAVAILABLE; case UNKNOWN; }
+enum IdentityVerdict {
+    case MATCH;               // bound resource, confirmed
+    case RECOVERABLE_CREATE;  // unbound, but the provider marker names this install+mapping
+    case MISMATCH; case ABSENT; case AMBIGUOUS; case UNKNOWN;
+}
+enum MarkerSupport { case SUPPORTED; case UNAVAILABLE; case UNKNOWN; }
 
 final class ProviderMarker {
     public readonly ?string $installation_id;
@@ -1271,10 +1438,10 @@ final class ProviderMarker {
 
 final class IdentityResult {
     public readonly IdentityVerdict $verdict;
-    public readonly ?string $expected_ref;        // what we stored
+    public readonly ?string $expected_ref;        // what we stored (null before binding)
     public readonly ?string $observed_ref;        // what the provider returned
     public readonly ?string $observed_hostname;   // the exact hostname on the resource
-    public readonly ?ProviderMarker $marker;      // parsed marker, when the provider has one
+    public readonly ?ProviderMarker $marker;
     public readonly MarkerSupport   $marker_support;
     public readonly bool    $read_complete;       // complete and authoritative
     public readonly bool    $transient;
@@ -1283,43 +1450,51 @@ final class IdentityResult {
 }
 ```
 
-`MATCH` requires **all** of: `read_complete`; `observed_ref === expected_ref`;
-`observed_hostname === $ctx->host` byte-for-byte after normalization; and no conflicting
-marker. Anything less is `MISMATCH`, `AMBIGUOUS`, `ABSENT`, or `UNKNOWN`.
+`MATCH` requires **all** of: `read_complete`; `expected_ref !== null`;
+`observed_ref === expected_ref`; `observed_hostname === $ctx->host` byte-for-byte after
+normalization; and no conflicting marker. This rule is not relaxed for already-bound
+resources under any circumstance.
+
+`RECOVERABLE_CREATE` is reachable **only** when `expected_ref === null` — that is,
+during recovery of an ambiguous first create. It requires `read_complete`, a resource
+whose `observed_hostname === $ctx->host`, and a marker naming **both** this installation
+and this mapping. It is not adoption and never substitutes for it.
 
 **Markers are defence in depth, never the basis of ownership.** A marker naming this
 installation is *additional* evidence. A marker naming a different installation, or a
 different mapping, **blocks mutation**. An *absent* marker establishes nothing either
-way — it neither proves nor disproves ownership, and it must not block when the provider
-does not support markers at all. `marker_support = UNAVAILABLE` (see §14.9 on Cloudflare
-error 1413) means the account cannot store markers; the driver must keep working, using
-the reference-plus-hostname binding and the plugin's fresh DNS proof instead.
+way — it neither proves nor disproves ownership, and must not block when the provider
+does not support markers at all. `marker_support = UNAVAILABLE` (§14.11, Cloudflare
+error 1413) means the account cannot store markers; the driver keeps working, using the
+reference-plus-hostname binding, the persisted ownership provenance, and the plugin's
+fresh DNS proof instead.
 
 ### 14.3 Driver contract
 
 ```php
 final class DriverCapabilities {
-    public readonly bool $supports_markers;
-    public readonly bool $supports_http_dcv;
-    public readonly bool $supports_apex_targets;
-    public readonly array $validation_methods;   // e.g. ['http','txt','email']
+    public readonly bool  $supports_markers;
+    public readonly array $validation_methods;   // subset of ['http','txt','email']
+    public readonly bool  $supports_apex_proxy_targets;
 }
 
 interface SslDriver {
     public function id(): string;
     public function capabilities(): DriverCapabilities;
 
-    public function ensure(   SslResourceContext $ctx ): SslStatus;      // idempotent
     public function status(   SslResourceContext $ctx ): SslStatus;
     public function identify( SslResourceContext $ctx ): IdentityResult;
 
-    public function adopt( SslResourceContext $ctx, AdoptionAuthorization $auth ): SslStatus;
-    public function remove( SslResourceContext $ctx, DeletionAuthorization $auth ): RemovalResult;
+    public function create( SslResourceContext $ctx, MutationAuthorization $auth ): SslStatus;
+    public function adopt(  SslResourceContext $ctx, MutationAuthorization $auth ): SslStatus;
+    public function change_validation_method(
+        SslResourceContext $ctx, string $method, MutationAuthorization $auth ): SslStatus;
+    public function remove( SslResourceContext $ctx, MutationAuthorization $auth ): RemovalResult;
 
     /** @param SslResourceContext[] $contexts */
     public function reconcile( array $contexts ): ReconcileReport;
 
-    public function validation_plan( SslResourceContext $ctx, bool $is_apex ): ValidationPlan;
+    public function validation_plan( SslResourceContext $ctx, ApexCapability $apex ): ValidationPlan;
 }
 
 enum RemovalOutcome { case REMOVED; case PENDING; case TRANSIENT; case FAILED; }
@@ -1327,10 +1502,11 @@ enum RemovalOutcome { case REMOVED; case PENDING; case TRANSIENT; case FAILED; }
 final class SslStatus {
     public readonly SslState $state;
     public readonly ?string  $ref;
-    public readonly ?string  $code;       // sanitized
-    public readonly ?string  $message;    // sanitized, ≤ 500 bytes
-    public readonly bool     $transient;  // true => caller must not change state
-    public readonly ?array   $provider_state;   // raw axes + error arrays, for storage
+    public readonly ?string  $code;              // sanitized
+    public readonly ?string  $message;           // sanitized, ≤ 500 bytes
+    public readonly ?string  $confirmed_method;  // provider-reported ssl.method after a read
+    public readonly bool     $transient;         // true => caller must not change state
+    public readonly ?array   $provider_state;    // raw axes + error arrays, for storage
 }
 final class RemovalResult {
     public readonly RemovalOutcome $outcome;
@@ -1345,16 +1521,11 @@ final class ReconcileReport {
 }
 ```
 
-`ensure()` returns immediately with whatever the provider says now, never blocks on
-issuance, and is safe to call repeatedly — a double-clicked button or a retried cron
-cannot create two resources. `$transient === true` means "no information": the caller
-advances neither state nor `ssl_checked_at`.
+Every mutating method asserts that the supplied authorization's `kind` matches the
+operation and that its bindings match the context it was handed; a mismatch is refused
+before any network activity.
 
-**Duplicate handling never adopts.** When `ensure()` finds an existing resource for the
-host, it calls `identify()`. `MATCH` ⇒ return the current state, which is what makes the
-call idempotent. Anything else ⇒ `SslStatus` with `state = FAILED`,
-`code = unowned_resource`; the reference is **not** stored, `ssl_owned` is **not** set,
-and nothing at the provider is touched.
+`status()` and `identify()` are read-only and need no lease.
 
 `remove()` returning an enum rather than `void` separates "gone" from "we asked".
 `REMOVED` ⇒ `revoked`, row proceeds to hard delete. `PENDING` ⇒ stays `pending_removal`.
@@ -1366,150 +1537,146 @@ the force-delete ceiling.
 nothing and the reconciler must not infer `provider_resource_missing`; only observed
 rows are updated and the reason is logged.
 
-### 14.4 Registry
+### 14.4 Authorization
 
 ```php
-final class SslDriverRegistry {
-    public function register( SslDriver $d ): void;   // via pd_ssl_drivers
-    public function get( string $id ): ?SslDriver;
-    public function default(): SslDriver;             // site setting; NullDriver fallback
-}
-```
-
-A mapping **always** uses the driver id stored in `ssl_provider`, set once when SSL is
-first requested. Changing the site default never migrates existing mappings. An
-unregistered stored id ⇒ no operations attempted, serving unaffected, reported as
-`ssl_driver_missing`. Every mutation additionally requires the stored `ssl_provider` to
-equal the driver actually selected for the call; a mismatch is refused before any
-network activity.
-
-### 14.5 Deletion authorization
-
-`Ssl\DeletionAuthorizer` lives **outside** every driver and is the only producer of a
-`DeletionAuthorization`. No driver may delete without one, and no driver may construct
-one.
-
-```php
-final class DeletionAuthorization {   // in-process only: never persisted, serialized, or logged
-    public readonly string $token;            // random, single-use
+final class MutationAuthorization {   // in-process only: never persisted, serialized, or logged
+    public readonly MutationKind $kind;
+    public readonly string $lease_token;       // the held lease; its DB row is the enforcement
     public readonly int    $mapping_id;
-    public readonly int    $revision;
+    public readonly int    $revision;          // the leased revision
     public readonly string $host;
     public readonly string $provider_id;
-    public readonly string $provider_ref;
-    public readonly string $challenge_hash;   // hash of the persisted challenge name + value
-    public readonly DateTimeImmutable $expires_at;   // pd_deletion_authorization_ttl, default 120 s
+    public readonly ?string $provider_ref;     // null only for CREATE
+    public readonly string $challenge_hash;    // hash of persisted challenge name + value
+    public readonly ?string $requested_method; // METHOD_CHANGE only
+    public readonly bool   $override_foreign_marker;  // ADOPT only
+    public readonly DateTimeImmutable $expires_at;    // never beyond the lease
 }
-final class DeletionRefusal {
-    public readonly string $precondition;   // which one failed
-    public readonly bool   $transient;
+final class MutationRefusal {
+    public readonly string  $precondition;   // which one failed
+    public readonly bool    $transient;
     public readonly ?string $detail;
 }
 ```
 
-**All of the following must hold**, evaluated in order; the first failure returns a
-`DeletionRefusal` and nothing at the provider is touched:
+**Single-use has a concrete owner.** `Ssl\MutationGate` consumes an authorization by
+performing step 7's CAS on `(id, leased revision, ssl_mutation_token)` and then releasing
+the lease. Because that CAS bumps the revision and the release clears the token, the same
+authorization can never be applied twice — enforcement lives in the database, not in a
+flag on a readonly object.
 
-1. The environment / clone check is **resolved** — no outstanding
-   `pd_environment_mismatch`.
-2. The stored `ssl_provider` matches the selected driver, and that driver is registered.
-3. A **fresh** `identify()` returns `MATCH` with `read_complete = true`, confirming that
-   the stored `provider_ref` belongs to **exactly** the mapped host, and carrying no
-   conflicting marker.
-4. The resource was created by this installation (`ssl_owned = 1` with a matching
-   `installation_id`) **or** was explicitly adopted (§14.6), evidenced by
-   `ssl_adopted_at` and a recorded adoption event.
-5. `FreshProof::prove()` returns `MATCH` for the mapping's **current persisted**
-   challenge, under the normal two-resolver agreement rules. Cached verification state
-   is never sufficient.
-6. An immediate re-read under CAS confirms that `revision`, `challenge`, `ssl_provider`,
-   `host`, and `ssl_ref` are unchanged since the checks above.
+Three authorizers produce these, sharing a common precondition core:
 
-The token is single-use and bound to every value in the struct. The driver must verify
-those bindings against the `SslResourceContext` it was handed and refuse otherwise. Any
-concurrent mapping change invalidates it, as does expiry.
+| Precondition | `CREATE` | `ADOPT` | `METHOD_CHANGE` | `REMOVE` |
+|---|:--:|:--:|:--:|:--:|
+| Environment / clone check resolved | ✔ | ✔ | ✔ | ✔ |
+| Stored `ssl_provider` matches the selected, registered driver | ✔ (on set) | ✔ | ✔ | ✔ |
+| Provider-mutation lease held for this `kind` | ✔ | ✔ | ✔ | ✔ |
+| Fresh `identify()`, `read_complete = true` | ✔ | ✔ | ✔ | ✔ |
+| Verdict `MATCH` against the stored reference and exact hostname | — | — | ✔ | ✔ |
+| No conflicting provider marker | ✔ | ✔ (unless overridden) | ✔ | ✔ |
+| Fresh `FreshProof::prove()` = `MATCH` on the current permanent challenge | ✔ | ✔ | ✔ | ✔ |
+| Ownership authority per §12.2 (`origin` set, installation matches) | — | — | ✔ | ✔ |
+| Explicit operator confirmation | — | ✔ | — | — |
+| Requested method validated against `DriverCapabilities` | — | — | ✔ | — |
+| CAS confirmation of the leased revision and bound values | ✔ | ✔ | ✔ | ✔ |
 
-**Blocking, non-destructive conditions:** a transient DNS result, resolver disagreement,
-provider ambiguity, an incomplete provider read, or a concurrent mapping change all
-block deletion **without changing provider state**. The mapping stays in
-`pending_removal`, `deletion_attempts` is not incremented for transient refusals, and
-the next attempt is scheduled.
-
-**`ssl_owned` alone is never sufficient.** It is local state that a database restore or
-a manual provider edit can falsify; it is one of six preconditions, not the decision.
+Any failure returns a `MutationRefusal` naming the precondition; nothing at the provider
+is touched. A transient DNS result, resolver disagreement, provider ambiguity, an
+incomplete provider read, or a concurrent mapping change all block **without** changing
+provider state; the mapping's next attempt is scheduled and `deletion_attempts` is not
+incremented for transient refusals.
 
 **Consequences that fall out of this design, by construction:**
 
-- A **clone** rotates every challenge and clears `ssl_owned`, so preconditions 4 and 5
-  can never pass against the original installation's resources. A clone cannot delete
-  them, and no additional rule is needed to prevent it.
-- A **restore or move** that retains the installation identity and the challenges is the
-  same installation; all six preconditions pass normally.
-- `FOREIGN`, conflicting, or mismatched resources fail precondition 3 and are never
-  deleted.
-- `UNKNOWN` or incomplete identity is transient and non-destructive.
+- A **clone** rotates every challenge and clears the ownership columns, so the ownership
+  and fresh-proof preconditions can never pass against the original installation's
+  resources. A clone cannot delete or change them, and no extra rule is needed.
+- A **restore or move** that retains the installation identity, the ownership columns,
+  and the challenges is the same installation; every precondition passes normally.
+- `MISMATCH`, foreign markers, and conflicting references fail identity and are never
+  mutated.
+- `UNKNOWN`, `AMBIGUOUS`, and incomplete reads are transient and non-destructive.
+
+### 14.5 Deletion
+
+`Ssl\DeletionAuthorizer` produces a `REMOVE` authorization under the table above. The
+ownership precondition reads **columns**, never events: `ssl_ownership_origin IS NOT NULL`
+and `ssl_owner_installation_id === pd_installation_id`. Pruning the adoption event has no
+effect on deletability.
 
 **Forced local deletion** (`DELETE …?force=true`) removes the **local row only**, writes
 an event recording that a provider resource may have been left behind, and **never**
-bypasses this guard or issues an unauthorized provider deletion.
+bypasses this gate or issues a provider deletion. It still requires the mutation lease,
+so it cannot race an in-flight provider call.
 
-### 14.6 Adoption
+### 14.6 Creation and ambiguous-create recovery
 
-Adoption is a provider mutation workflow with its own driver operation, not merely a
-REST route.
+`create()` is called under a `CREATE` lease, which is what prevents two simultaneous
+first-create calls for the same mapping: the second request refuses with
+`pd_mutation_in_progress` and **never sends a second POST**.
 
-```php
-final class AdoptionAuthorization {
-    public readonly string $token;            // single-use, same binding rules as deletion
-    public readonly int    $mapping_id;
-    public readonly int    $revision;
-    public readonly string $host;
-    public readonly string $provider_id;
-    public readonly string $observed_ref;     // the resource being adopted
-    public readonly string $challenge_hash;
-    public readonly bool   $override_foreign_marker;
-    public readonly DateTimeImmutable $expires_at;
-}
-final class AdoptionAuthorizer { public function authorize( Mapping $m, array $request ): AdoptionAuthorization|DeletionRefusal; }
-```
+| Case | Behaviour |
+|---|---|
+| **A. POST succeeds, complete resource returned** | verify the returned hostname equals `$ctx->host`; persist `ssl_ref`, `ssl_provider`, `ssl_ownership_origin = created`, `ssl_owner_installation_id`, `ssl_method`, and the resulting state — all under CAS on the leased revision and token |
+| **B. POST outcome ambiguous** (timeout, reset, 5xx) | issue a **complete provider read** before considering any retry; never blindly repeat the POST |
+| **C. Read finds no resource conclusively** | a later attempt may retry under a **newly acquired** lease |
+| **D. Read finds a resource whose marker names exactly this installation and mapping** | `RECOVERABLE_CREATE`: verify the exact hostname, bind `observed_ref` under CAS, persist `origin = created`, record that an ambiguous create was recovered. **This is not adoption.** |
+| **E. Read finds a resource, but markers are unavailable or absent, and no reference was previously persisted** | do **not** auto-bind. Set `ssl_state = failed`, `code = provider_create_ambiguous`, and require the explicit adoption workflow (§14.7) with confirmation and a fresh DNS proof |
+| **F. Read finds a foreign or conflicting marker** | `unowned_resource`; nothing mutated, nothing bound |
 
-Preconditions: environment resolved; driver matches; a fresh `identify()` with
-`read_complete = true` returning a resource whose `observed_hostname === host`; an
-explicit `confirm: true`; and a fresh `FreshProof::prove()` returning `MATCH`. When the
-observed marker names a **different** installation, adoption additionally requires
+**Qualified idempotency.** `create()` is idempotent **once the provider identity has been
+durably bound**. Initial creation is duplicate-safe and ambiguity-safe. A marker-free
+create-then-timeout may require explicit adoption, because the plugin refuses to guess
+which unbound resource is its own. That boundary is stated plainly rather than papered
+over with an idempotency claim the design cannot honour.
+
+### 14.7 Adoption
+
+Adoption is a provider mutation workflow with its own driver operation and its own
+authorization, never an implicit consequence of anything.
+
+`Ssl\AdoptionAuthorizer` requires, in addition to the shared core: an explicit
+`confirm: true`; a fresh `identify()` with `read_complete = true` returning a resource
+whose `observed_hostname === host`; and a fresh `FreshProof::prove()` of `MATCH`. When
+the observed marker names a **different** installation, adoption additionally requires
 `override_foreign_marker: true` — a deliberate second key for taking over another
 installation's resource.
 
-`adopt()` writes the marker when the provider supports markers, and the plugin sets
-`ssl_owned = 1`, `ssl_adopted_at`, `ssl_adopted_by`, and `ssl_ref = observed_ref`,
-recording an event that names any prior marker. **Adoption is never automatic and never
-implicit**: finding a duplicate resource does not adopt it, reconciliation does not adopt
-anything, and `ensure()` cannot adopt.
+`adopt()` writes the marker where the provider supports one. The plugin then persists
+`ssl_ref = observed_ref`, `ssl_ownership_origin = adopted`,
+`ssl_owner_installation_id = pd_installation_id`, `ssl_adopted_at`, and `ssl_adopted_by`
+under CAS, and records an event naming any prior marker. Where markers are unavailable,
+adoption records the binding locally only and the event says so.
 
-### 14.7 Environment and clone detection
+**Adoption is never automatic and never implicit**: finding a duplicate resource does not
+adopt it, ambiguous-create recovery does not adopt, and reconciliation adopts nothing.
+
+### 14.8 Environment and clone detection
 
 Options `pd_installation_id` (UUID, generated at install) and
 `pd_installation_primary_host` (the `home` host at install). Checked on `admin_init` and
 at the top of every sweep — never on the front-end path. A mismatch sets
 `pd_environment_mismatch` and, while set:
 
-- **every provider mutation is blocked** — `ensure`, `adopt`, `remove`, `reconcile`
-  refuse with `environment_unresolved`, and `DeletionAuthorizer` fails at precondition 1.
-  Provider reads for diagnostics are allowed.
+- **every provider mutation is blocked** — create, adopt, method change, remove, and
+  reconciliation refuse with `environment_unresolved`, and every authorizer fails at the
+  first precondition. Provider reads for diagnostics are allowed.
 - DNS verification continues (read-only, harmless); serving is unaffected.
 - A blocking admin notice appears on every screen.
 
 | Operator choice | Effect |
 |---|---|
-| **Restore / Move** | keep the installation id, challenges, and `ssl_owned`; update the stored primary host; clear the flag. This remains the same installation. |
-| **Clone** | generate a **new** installation id; `ssl_owned = 0`, `ssl_ref = NULL`, `ssl_state = none`, `ssl_provider_state = NULL`, `ssl_adopted_at = NULL` on every row; reset all rows to `unverified` with **rotated challenges**; never auto-adopt any remote resource |
+| **Restore / Move** | keep the installation id, the challenges, and all ownership columns; update the stored primary host; clear the flag. This remains the same installation. |
+| **Clone** | generate a **new** installation id; clear `ssl_ownership_origin`, `ssl_owner_installation_id`, `ssl_adopted_at`, `ssl_adopted_by`, `ssl_ref`, `ssl_provider_state`, and any stale mutation lease; set `ssl_state = none`; reset every row to `unverified` with **rotated challenges**; adopt nothing remotely |
 
 A database copy is not evidence of domain control, so a clone re-proves from scratch and
-— by §14.5 — cannot touch the original's provider resources.
+— by §14.4 — cannot touch the original's provider resources.
 **Limitation:** a clone restored onto the *same* primary host is undetectable by this
 mechanism.
 
-### 14.8 Provider cooldowns and ambiguous mutations
+### 14.9 Cooldowns and ambiguous mutations
 
 Option `pd_provider_cooldowns`, keyed by **driver id**:
 `{ "cloudflare-saas": { "until": "…Z", "reason": "429", "source": "retry_after" } }`.
@@ -1518,14 +1685,43 @@ continuation. A 429 halts that provider **across all rows** and suppresses conti
 until expiry. Other drivers and DNS verification are unaffected.
 
 No non-idempotent call is retried blind. On timeout, connection reset, or 5xx from a
-`POST`, `PATCH`, or `DELETE`, the driver first issues a read (`identify()` / `status()`)
-to learn the provider's actual state — create-then-timeout is otherwise the classic way
-to produce a duplicate or a phantom resource. `Retry-After` is parsed (delta-seconds or
-HTTP-date), converted to UTC, and written to the relevant next-attempt column; the
+`POST`, `PATCH`, or `DELETE`, the driver first issues a complete read (`identify()` /
+`status()`) to learn the provider's actual state. `Retry-After` is parsed (delta-seconds
+or HTTP-date), converted to UTC, and written to the relevant next-attempt column; the
 outcome is `TRANSIENT`, with no state change, no attempt increment, and no further calls
 to that provider in the same sweep.
 
-### 14.9 Cloudflare for SaaS driver
+If a lease expired while a mutation was in flight, expired-lease recovery (§12.6) runs
+the same read-first reconciliation for the recorded `ssl_mutation_kind` before clearing
+the lease.
+
+### 14.10 Changing the validation method
+
+`change_validation_method()` is a first-class driver operation, not an implied use of
+`create()`. `Ssl\MethodChangeAuthorizer` produces its `METHOD_CHANGE` authorization
+under the §14.4 table, which for this operation requires the full set: environment
+resolved, driver match, lease held, fresh complete `identify()` returning `MATCH`
+against the stored reference and exact hostname, no conflicting marker, a fresh
+two-resolver proof of the permanent challenge, a requested method validated against
+`DriverCapabilities`, ownership authority, and CAS confirmation of the leased revision.
+
+The flow is: authorize → provider `PATCH` → **provider re-read** → persist locally
+**only after the provider's resulting method is confirmed** (`SslStatus::$confirmed_method`)
+→ CAS → release lease.
+
+On timeout, connection reset, or 5xx, the `PATCH` is **not** retried blindly. The driver
+re-reads provider state:
+
+| Re-read says | Outcome |
+|---|---|
+| the requested method | treat the mutation as successful; persist under CAS |
+| the prior method | retryable under a **newly acquired** lease and authorization |
+| incomplete or ambiguous | leave local method state unchanged; report a transient ambiguous outcome |
+
+Reconciliation compares stored `ssl_method` with the provider's `ssl.method` and
+**reports** divergence as an event and in Diagnostics; it never auto-patches.
+
+### 14.11 Cloudflare for SaaS driver
 
 The API exposes two independent axes:
 
@@ -1538,17 +1734,19 @@ pointing at the SaaS target. **Local `ACTIVE` requires precisely that combinatio
 
 Operations:
 
-- `ensure()` → `POST /zones/{zone}/custom_hostnames` with `hostname`, `ssl.method`
-  (§14.10), `ssl.type: dv`, and — **only when available** — the ownership marker in
-  `custom_metadata`. A `duplicate_record` error routes to `identify()` per §14.3.
-- `identify()` → `GET /zones/{zone}/custom_hostnames?hostname=` plus, when a stored ref
-  exists, `GET …/custom_hostnames/{id}`. It reports the observed id, the exact
+- `create()` → `POST /zones/{zone}/custom_hostnames` with `hostname`, `ssl.method`
+  (§14.12), `ssl.type: dv`, and — **only when available** — the ownership marker in
+  `custom_metadata`. Per the pinned API contract the request omits any wildcard field,
+  or sends it explicitly false; the plugin never requests a wildcard certificate
+  (§14.16). A `duplicate_record` error routes into the §14.6 recovery table.
+- `identify()` → `GET /zones/{zone}/custom_hostnames?hostname=` plus, when a reference
+  is bound, `GET …/custom_hostnames/{id}`. It reports the observed id, the exact
   `hostname` on the resource, any parsed `custom_metadata` marker, and whether the read
-  was complete (pagination completed, no partial result).
-- `adopt()` → `PATCH …/custom_hostnames/{id}` writing `custom_metadata` when supported;
-  when markers are unavailable, adoption records the binding locally only, and the
-  event says so.
-- `remove()` → verifies the `DeletionAuthorization` bindings, then
+  was complete (pagination finished, no partial result).
+- `adopt()` → `PATCH …/custom_hostnames/{id}` writing `custom_metadata` when supported.
+- `change_validation_method()` → `PATCH …/custom_hostnames/{id}` with the new
+  `ssl.method` and the existing `ssl.type`, followed by a re-read.
+- `remove()` → verifies the authorization bindings, then
   `DELETE …/custom_hostnames/{id}`. A 404 counts as `REMOVED`, which is what idempotent
   removal requires for the deletion workflow to terminate.
 - All calls go through the injected `HttpClient`, 10 s timeout, one retry on connection
@@ -1568,14 +1766,23 @@ On seeing it the driver sets `marker_support = UNAVAILABLE`, persists that in
 `ssl_marker_support`, retries the same call once **without** `custom_metadata`, and never
 treats 1413 as retryable thereafter. A single admin notice explains that marker-based
 defence in depth is off for this account and that identity rests on the
-reference-plus-hostname binding and the plugin's fresh DNS proof.
+reference-plus-hostname binding, the persisted ownership provenance, and the plugin's
+fresh DNS proof.
 
-Credentials come from `Ssl\Credentials` — constants (`PD_CLOUDFLARE_API_TOKEN`,
-`PD_CLOUDFLARE_ZONE_ID`, `PD_CLOUDFLARE_CNAME_TARGET`, optional
-`PD_CLOUDFLARE_APEX_TARGETS`) or the `pd_ssl_credentials` option. Never on a mapping
-row, never in a REST response, never in an event or log.
+Credentials come from `Ssl\Credentials` — constants or the `pd_ssl_credentials` option:
 
-### 14.10 Certificate validation method
+| Credential | Purpose |
+|---|---|
+| `PD_CLOUDFLARE_API_TOKEN` | API authentication |
+| `PD_CLOUDFLARE_ZONE_ID` | the SaaS zone |
+| `PD_CLOUDFLARE_CNAME_TARGET` | the customer-facing CNAME target (§14.13) |
+| `PD_CLOUDFLARE_SSL_METHOD` | DCV method (§14.12) |
+| `PD_CLOUDFLARE_APEX_PROXY_TARGETS` | Apex Proxying / BYOIP addresses (§14.13) |
+| `PD_CLOUDFLARE_APEX_PROXY_PROVENANCE` | `static_ip_prefix` or `byoip` |
+
+None of these appear on a mapping row, in a REST response, in an event, or in a log.
+
+### 14.12 Certificate validation method
 
 The API accepts exactly one `ssl.method` value: `http`, `txt`, or `email`.
 
@@ -1583,32 +1790,30 @@ The API accepts exactly one `ssl.method` value: `http`, `txt`, or `email`.
 
 | Question | Answer |
 |---|---|
-| Configuration source | `PD_CLOUDFLARE_SSL_METHOD` constant, else `pd_ssl_credentials['ssl_method']`, else the default |
+| Configuration source | `PD_CLOUDFLARE_SSL_METHOD`, else `pd_ssl_credentials['ssl_method']`, else the default |
 | Filter | `pd_ssl_validation_method( string $method, Mapping $m )` |
 | Allowed values | `http`, `txt`, `email` — validated against `DriverCapabilities::$validation_methods`; anything else falls back to the default with an admin notice |
 | Default | `txt` |
-| Persisted per mapping | yes — `ssl_method`, written when SSL is first requested |
+| Persisted per mapping | yes — `ssl_method`, written when the provider confirms it |
 | Site-setting change | affects **new** requests only; existing provider resources are never mutated as a side effect |
-| Method change for one mapping | explicit: `PATCH /domains/{id}/ssl {"method": "…"}`, which issues a provider `PATCH` under the same identity-plus-fresh-proof preconditions as any other mutation, then re-reads. Never a blind mutation. |
-| Reconciliation | compares stored `ssl_method` with the provider's `ssl.method` and **reports** a divergence; it never auto-patches |
+| Per-mapping change | explicit: `PATCH /domains/{id}/ssl {"method": "…"}` → §14.10 |
+| Reconciliation | reports divergence; never auto-patches |
 | Unsupportable method | a `DnsBlocker`; `ssl_state` unchanged; never a silent substitution |
 
 **Why `email` is not an automated default:** it requires a human to receive mail at a
 WHOIS or role address and click a link. It cannot be completed by publishing a record,
 cannot be observed by the plugin, and cannot be automated. It remains selectable, and
-when selected the plan surfaces a `ManualRequirement` stating that the operator or
-domain owner must complete it out of band.
+when selected the plan surfaces a `ManualRequirement` stating that a person must complete
+it out of band.
 
-**Wildcards:** HTTP DCV is not permitted for wildcard hostnames. The driver rejects
-`http` for a wildcard host and emits a `DnsBlocker` naming `txt` as the required method.
+**Automatic HTTP DCV is a valid success path.** For the exact (non-wildcard) hostnames
+this plugin maps, Cloudflare attempts automatic HTTP DCV once the hostname points at the
+SaaS target, *even when `txt` was selected*. The plugin therefore treats the
+`ssl_validation` TXT requirement as satisfiable by either route: reaching
+`ssl.status: active` without the TXT record ever appearing is a success, not an anomaly,
+and no blocker is raised for the unfulfilled record.
 
-**Non-wildcard nuance:** for non-wildcard hostnames Cloudflare attempts automatic HTTP
-DCV once the hostname points at the SaaS target, *even when `txt` was selected*. The
-plugin therefore treats the `ssl_validation` TXT requirement as satisfiable by either
-route: reaching `ssl.status: active` without the TXT record ever appearing is a success,
-not an anomaly, and no blocker is raised for the unfulfilled record.
-
-### 14.11 Validation plan
+### 14.13 Validation plan
 
 ```php
 final class DnsRecordSpec     { string $type; string $name; string $value; int $ttl; }
@@ -1618,19 +1823,19 @@ final class DnsRequirementSet {          // ALL records in a chosen set are requ
     string $id; string $label;
     DnsRecordSpec[] $records;
     bool $apex_compatible; string $source;   // 'core' | driver id
-    bool $removable_once_active;             // provider-ownership records may be
+    bool $removable_once_active;
 }
-final class HttpRequirementSet {         // HTTP DCV tokens are NOT DNS records
+final class HttpRequirementSet {         // HTTP tokens are NOT DNS records
     string $purpose; string $id; string $label;
     string $url; string $body; string $source;
+    bool $removable_once_active;
 }
 final class ManualRequirement {          // e.g. email DCV
     string $purpose; string $id; string $label;
     string $instruction; array $contacts; string $source;
 }
 final class ValidationPending {
-    string $purpose; string $reason;      // 'provider_records_not_yet_issued'
-    ?int $retry_after;
+    string $purpose; string $reason; ?int $retry_after;
 }
 final class DnsBlocker { string $code; string $message; string $remedy; string $source; }
 
@@ -1649,54 +1854,107 @@ final class ValidationPlan {
 | Purpose | Source | Meaning | Lifetime |
 |---|---|---|---|
 | `ownership` | `core` | the plugin's permanent TXT challenge (§13.1) | **permanent** — must never be removed |
-| `provider_ownership` | driver | Cloudflare `ownership_verification` / `_http` | may be removed by the customer once `status: active`; `removable_once_active = true` |
-| `ssl_validation` | driver | from `ssl.validation_records` | appears when the CA issues tokens, disappears when `ssl.status` reaches `active` |
+| `provider_ownership` | driver | Cloudflare `ownership_verification` / `_http` | may be removed once the provider reports `status: active` |
+| `ssl_validation` | driver | from `ssl.validation_records` | appears when the CA issues tokens; gone once `ssl.status: active` |
 | `routing` | driver | where the customer points the hostname | permanent while the mapping serves |
 
-**Translation from Cloudflare `ssl.validation_records[]`**, whose entries carry
-`txt_name`, `txt_value`, `http_url`, `http_body`, and `emails[]`:
+**Translation — provider hostname ownership** (`ownership_verification`,
+`ownership_verification_http`):
 
 | Provider data | Becomes |
 |---|---|
-| `txt_name` + `txt_value` | `DnsRequirementSet{purpose:'ssl_validation', id:'cf-dcv-txt', records:[TXT], apex_compatible:true}` |
-| `http_url` + `http_body` | `HttpRequirementSet` — **never** a DNS record |
+| `ownership_verification` with complete `type`, `name`, `value` | `DnsRequirementSet{purpose:'provider_ownership', id:'cf-hostname-txt', records:[TXT name = value], removable_once_active:true}` |
+| `ownership_verification_http` with complete `http_url` and `http_body` | `HttpRequirementSet{purpose:'provider_ownership', id:'cf-hostname-http', removable_once_active:true}` |
+| **both** present | rendered as **OR alternatives**, because Cloudflare's contract establishes either method as sufficient on its own |
+| neither present while `status` is pending | `ValidationPending{purpose:'provider_ownership', reason:'provider_records_not_yet_issued'}` |
+| `status` already `active` | completed provider-ownership instructions are suppressed and, where shown historically, clearly marked removable |
+| malformed or incomplete entry | `DnsBlocker{code:'provider_record_malformed'}`; raw shape kept in `ssl_provider_state` |
+| provider replaced the token | recomputed from the latest read and recorded as an event |
+
+A provider ownership proof is **never** rendered as the permanent plugin challenge and
+**never** substituted for `ssl_validation`.
+
+**Translation — certificate validation** (`ssl.validation_records[]`, whose entries carry
+`txt_name`, `txt_value`, `http_url`, `http_body`, `emails[]`):
+
+| Provider data | Becomes |
+|---|---|
+| `txt_name` + `txt_value` | `DnsRequirementSet{purpose:'ssl_validation', id:'cf-dcv-txt', apex_compatible:true}` |
+| `http_url` + `http_body` | `HttpRequirementSet{purpose:'ssl_validation'}` — **never** a DNS record |
 | Delegated DCV CNAME | `DnsRequirementSet{id:'cf-dcv-delegated', records:[CNAME _acme-challenge…]}` |
-| `emails[]` | `ManualRequirement` with the contact list; not automatable |
-| Several records in one entry that must all be satisfied | one set containing all of them (ALL semantics) |
-| Genuinely alternative record groups from the provider | multiple sets under the same purpose (OR semantics) |
+| `emails[]` | `ManualRequirement`; not automatable |
+| several records that must all be satisfied | one set containing all of them (ALL semantics) |
+| genuinely alternative groups | multiple sets under the same purpose (OR semantics) |
 | `validation_records` empty shortly after create | `ValidationPending{reason:'provider_records_not_yet_issued'}` — **not** a blocker |
-| Malformed, incomplete, or unrecognised entry | `DnsBlocker{code:'provider_record_malformed'}`, with the raw shape stored in `ssl_provider_state` |
+| malformed, incomplete, or unrecognised entry | `DnsBlocker{code:'provider_record_malformed'}` |
 
 **The plugin never invents a DNS record, and never renders a literal such as
 `unsupported` as a record type.** An unsatisfiable configuration is a `DnsBlocker`; an
-unissued record is `ValidationPending`.
+unissued record is `ValidationPending`. Alternatives are rendered as OR **only** where the
+provider's semantics establish that either option genuinely suffices; everything else is
+ALL.
 
 **Plan lifetime.** The plan is recomputed from the latest provider read every time it is
-rendered; it is never cached. Requirements therefore appear when the provider issues
-them, change when the provider replaces them, and disappear when the provider no longer
-reports them. Changes are recorded as events so an operator can see that a token was
-replaced rather than silently swapped under them.
+rendered; it is never cached. Requirements appear when the provider issues them, change
+when the provider replaces them, and disappear when the provider no longer reports them.
+Changes are recorded as events so an operator sees that a token was replaced rather than
+silently swapped. Raw provider values live only in the sanitized `ssl_provider_state`.
 
-**Routing.** No CNAME is assumed. Routing values come from the driver's configured
-customer-facing **CNAME target** (`PD_CLOUDFLARE_CNAME_TARGET`) — a distinct value, not
-the fallback origin and not derivable from it. For Cloudflare for SaaS:
+**Routing and apex.**
 
-- non-apex with a CNAME target configured ⇒ one routing set, `CNAME`,
-  `apex_compatible: false`
-- apex with A/AAAA targets configured (`PD_CLOUDFLARE_APEX_TARGETS`) ⇒ one routing set
-  containing **all** required A/AAAA records, `apex_compatible: true`
-- apex with no apex-capable target ⇒ **no routing set**, plus a `DnsBlocker` naming what
-  must be configured
+```php
+enum ApexRouting { case CNAME_FLATTENING; case ALIAS_OR_ANAME; case APEX_PROXY; case UNSUPPORTED; }
+
+final class ApexCapability {
+    public readonly ApexRouting $routing;
+    public readonly string      $reason;
+    /** @var string[] valid only for APEX_PROXY */ public readonly array $targets;
+    public readonly ?string     $target_provenance;   // 'static_ip_prefix' | 'byoip'
+    public readonly bool        $operator_attested;
+}
+```
+
+No CNAME is assumed, and no A/AAAA record is emitted casually. Routing values come from
+the driver's configured customer-facing **CNAME target**
+(`PD_CLOUDFLARE_CNAME_TARGET`) — a distinct value, not the fallback origin and not
+derivable from it.
+
+Rules:
+
+- **Non-apex hosts** ⇒ one routing set, `CNAME` to the configured target,
+  `apex_compatible: false`.
+- **Apex on a Cloudflare-authoritative customer zone** ⇒ ordinarily an apex `CNAME` to
+  the configured target, relying on Cloudflare's CNAME flattening
+  (`ApexRouting::CNAME_FLATTENING`).
+- **Apex on another DNS provider** ⇒ permitted where that provider has a demonstrated
+  compatible flattening, ALIAS, or ANAME capability (`ApexRouting::ALIAS_OR_ANAME`).
+- **A/AAAA routing records may be emitted only under `ApexRouting::APEX_PROXY`**, which
+  requires Apex Proxying or BYOIP to have been explicitly configured for the SaaS
+  account. Cloudflare assigns Static IP prefixes to the account for this purpose, or uses
+  the account's own BYOIP addresses; these are **entitlement-gated and distinct from
+  ordinary addresses**. Configured values must therefore be identified as
+  `static_ip_prefix` or `byoip` and accompanied by an explicit operator attestation.
+- **Ordinary fallback-origin addresses, origin-server addresses, and ordinary Cloudflare
+  zone addresses must never be emitted as apex proxy targets.** The plugin does not infer
+  an Apex Proxying entitlement from the mere presence of address strings, which is why
+  `operator_attested` exists and why `pd_apex_capability` returns a typed, validated
+  object rather than a boolean.
+- **Absence of a supported apex-routing capability** ⇒ no routing set and a `DnsBlocker`
+  naming what must be configured.
+- The **default driver configuration assumes no paid Apex Proxying entitlement**;
+  `supports_apex_proxy_targets` is false until targets and provenance are configured.
+
+Diagnostics and the README explain the required entitlement and the provenance of the
+addresses, so nobody pastes an origin IP into a field labelled "apex targets."
 
 Apex determination uses a maintained Public Suffix List
 (`jeremykendall/php-domain-parser`) comparing against the registrable domain — never a
-label count, which is wrong for `example.co.uk`. `pd_is_apex` allows a driver or
-integrator to override with its own policy.
+label count, which is wrong for `example.co.uk`.
 
 The admin renders alternatives as "create any one of these", which is what an OR group
 means to the person editing a zone file.
 
-### 14.12 Authoritative DNS deployment posture
+### 14.14 Authoritative DNS deployment posture
 
 **The core plugin is authoritative-DNS-provider-neutral.** A mapped domain may use any
 authoritative DNS provider capable of publishing the required records. Nothing in the
@@ -1716,88 +1974,104 @@ Boundaries, stated explicitly because these roles are easy to conflate:
 - **Cloudflare authoritative DNS is recommended** for operational consistency, DNSSEC,
   account controls, and apex CNAME flattening.
 - **Apex domains on another provider** require demonstrated compatible CNAME-flattening,
-  ALIAS, or ANAME behaviour. Where that is absent and no apex-capable A/AAAA target is
-  configured, the plan reports a routing `DnsBlocker` rather than printing a record the
-  domain owner cannot create.
+  ALIAS, or ANAME behaviour. Where that is absent and no attested Apex Proxying or BYOIP
+  capability is configured, the plan reports a routing `DnsBlocker` rather than printing
+  a record the domain owner cannot create.
 - **The current scope generates and verifies DNS instructions. It does not mutate
   customer DNS through any API.** There is no DNS-write credential anywhere in this
   design.
 - Recommending Cloudflare authoritative DNS implies **no** access to paid Custom
-  Metadata (§14.9) and **no** access to Enterprise Apex Proxying.
+  Metadata (§14.11) and **no** access to Apex Proxying (§14.13).
 - Documentation recommends **client-owned Cloudflare accounts**, strong authentication,
   DNSSEC, and delegated least-privilege access — not one shared account owning every
   client zone.
 - A future DNS-management adapter would be a **separate capability** and is not part of
   this implementation.
 
-### 14.13 Durable deletion
+### 14.15 Durable deletion
 
-The local row is **never** deleted before external cleanup succeeds.
+**The normal deletion path never deletes the local row before external cleanup
+succeeds.** The sole exception is an explicit force-local-delete after the documented
+ceiling; it issues no provider deletion and records that the provider resource may
+remain.
 
 1. `DELETE /domains/{id}` (with `If-Match`) sets `deletion_requested_at`, forces
    `activation_state = inactive` — **serving stops immediately** — and, when a driver
    holds a resource, sets `ssl_state = pending_removal`. Returns **`202 Accepted`**.
-   Refused `409` while aliases point at it.
-2. `pd_ssl_sweep` asks `DeletionAuthorizer` for an authorization (§14.5). A refusal is
-   recorded with its failing precondition; transient refusals do not increment
-   `deletion_attempts`.
-3. With an authorization, `remove()` is called. `REMOVED` ⇒ `revoked` ⇒ hard delete, with
-   a final event carrying the `host` snapshot.
+   Refused `409` while aliases point at it, and `409 pd_mutation_in_progress` while
+   another provider mutation holds the lease.
+2. `pd_ssl_sweep` opens a `REMOVE` window (§12.6) and asks `DeletionAuthorizer` for an
+   authorization. A refusal is recorded with its failing precondition; transient refusals
+   do not increment `deletion_attempts`.
+3. With an authorization, `remove()` is called inside the lease. `REMOVED` ⇒ `revoked` ⇒
+   hard delete, with a final event carrying the `host` snapshot.
 4. `NullDriver`, or `ssl_state = none`, means nothing external exists ⇒ hard delete
-   immediately, `200 OK`. No authorization is required because no provider mutation
-   occurs.
+   immediately, `200 OK`. No provider authorization is required because no provider
+   mutation occurs.
 5. After 12 attempts / 24 h the row remains, an admin notice names the probable orphan,
-   and an operator may `DELETE …?force=true` — which removes the local row, records that
-   a provider resource may remain, and issues **no** provider deletion.
+   and an operator may `DELETE …?force=true` — which acquires the lease, removes the
+   local row, records that a provider resource may remain, and issues **no** provider
+   deletion.
 
 A row awaiting removal never serves and never re-verifies.
 
-### 14.14 Reconciliation
+### 14.16 Wildcard scope
+
+Mapped hosts are exact hosts. `HostNormalizer` rejects any label containing `*`, so a
+wildcard mapping cannot exist, and there is no schema field, REST input, or setting that
+could supply one. Cloudflare wildcard certificate provisioning is therefore **out of
+scope**, no wildcard flag appears in any contract, and no unreachable wildcard branch is
+carried in the code.
+
+A future wildcard-certificate capability would need its own schema, an entitlement probe,
+a distinct validation lifecycle (wildcards cannot use automatic HTTP DCV), and its own
+design review. It is noted here so the omission is deliberate rather than accidental.
+
+### 14.17 Reconciliation
 
 The daily `Reconciler` calls `reconcile()` with `SslResourceContext` objects, in chunks,
-and adopts provider truth for **state**, with three hard rules: a local/provider mismatch
-never triggers a delete at the provider; a transient response changes nothing; and
-reconciliation **never adopts ownership** of anything. Divergences — including a stored
-`ssl_method` that differs from the provider's — are written as events and surfaced in
-Diagnostics, so an operator sees "we think active, Cloudflare says pending" rather than
-discovering it from a browser warning.
+and adopts provider truth for **state**, with four hard rules: a local/provider mismatch
+never triggers a delete at the provider; a transient response changes nothing;
+reconciliation **never adopts ownership** of anything; and it never auto-patches a
+divergent validation method. It skips rows under a live mutation lease. Divergences —
+state, method, marker support, unbound-but-present resources — are written as events and
+surfaced in Diagnostics, so an operator sees "we think active, Cloudflare says pending"
+rather than discovering it from a browser warning.
 
-### 14.15 Status map provenance and generation
+### 14.18 Status map provenance and generation
 
-Both provider status axes are enumerated by the current Cloudflare API schema. The map
-is **generated from a pinned schema input**, not transcribed, and generation is
-reproducible offline.
+Both provider status axes are enumerated by the current Cloudflare API schema. The map is
+**generated from a pinned schema input**, not transcribed, and generation is reproducible
+offline.
 
 The implementation must:
 
 - commit a **pinned schema snapshot** at `references/cloudflare-api-schema.<date>.json`
 - commit `references/cloudflare-schema-provenance.json` recording the **source URL**,
   the **retrieval date** (UTC), and the **SHA-256 digest** of the snapshot
-- maintain `references/cloudflare-status-policy.php` — the human-authored
-  classification policy mapping each enum value to an internal state
+- maintain `references/cloudflare-status-policy.php` — the human-authored classification
+  policy mapping each enum value to an internal state
 - generate `references/cloudflare-status-map.php` from **schema × policy** via
   `bin/generate-cloudflare-status-map.php`
 - generate or validate the enum fixtures from the **same** pinned input
 - treat the **pinned schema input as the source of truth**; the map and the fixtures are
   derived artifacts
-- **fail generation and CI** when: any schema value lacks an explicit classification in
-  the policy; a duplicate value appears; an expected value is missing; the structure is
-  unexpected; or the cardinality differs from the recorded expectation of **16
-  hostname-status values** and **21 SSL-status values**
+- **fail generation and CI** when: any schema value lacks an explicit classification; a
+  duplicate value appears; an expected value is missing; the structure is unexpected; or
+  the cardinality differs from the recorded expectation of **16 hostname-status values**
+  and **21 SSL-status values**
 - keep normal builds free of live network access
 
-An **optional CI drift check** may compare the pinned snapshot against the live schema
-and report that an intentional update is required. It never auto-updates, and it never
-fails the normal build.
-
-Relationships, stated once:
+An **optional CI drift check** may compare the pinned snapshot against the live schema and
+report that an intentional update is required. It never auto-updates, and it never fails
+the normal build.
 
 ```
-pinned upstream schema   →  which enum values exist          (source of truth)
-classification policy    →  what each value means            (human-authored)
-generated PHP map        →  schema × policy                  (derived)
-generated fixtures       →  one test case per schema value   (derived)
-runtime unknown-value rule →  non-destructive and alerting   (independent safety net)
+pinned upstream schema     →  which enum values exist          (source of truth)
+classification policy      →  what each value means            (human-authored)
+generated PHP map          →  schema × policy                  (derived)
+generated fixtures         →  one test case per schema value   (derived)
+runtime unknown-value rule →  non-destructive and alerting     (independent safety net)
 ```
 
 **Combination of the two axes:**
@@ -1812,16 +2086,16 @@ runtime unknown-value rule →  non-destructive and alerting   (independent safe
 | **unknown on either axis** | — | `PENDING_VALIDATION` + `unknown_provider_state` event + admin alert |
 
 **Unknown future provider values are non-destructive and alerting by construction** —
-they can never produce `FAILED` or `REVOKED`, so a schema addition cannot cause the
-plugin to tear down a working certificate.
+they can never produce `FAILED` or `REVOKED`, so a schema addition cannot cause the plugin
+to tear down a working certificate.
 
 **`caa_error` is not a status-axis enum value** and is not obtained from the status-map
 generator. CAA problems surface in the **error arrays** — hostname `verification_errors[]`
 and `ssl.validation_errors[]` — as messages such as
 `SERVFAIL looking up CAA for app.example.com`. A separate error classifier reads those
 arrays and may **annotate** a state with `code: caa_error` and a remediation hint. It
-never sources a state from them and never feeds them into the generator. Raw axes and
-raw error arrays are both persisted in `ssl_provider_state` for diagnostics.
+never sources a state from them and never feeds them into the generator. Raw axes and raw
+error arrays are both persisted in `ssl_provider_state` for diagnostics.
 
 ---
 
@@ -1856,9 +2130,11 @@ discovery everywhere else. Capability `manage_options` per route via
   "activation": { "state": "active" },
   "ssl": {
     "state": "active", "provider": "cloudflare-saas",
-    "owned": true, "adopted_at": null,
+    "ownership_origin": "created", "owned_by_this_installation": true,
+    "adopted_at": null,
     "method": "txt", "marker_support": "unavailable",
     "checked_at": "…Z", "next_attempt_at": null, "error": null,
+    "mutation_in_progress": null,
     "provider_state": {
       "hostname_status": "active", "ssl_status": "active",
       "verification_errors": [], "validation_errors": []
@@ -1886,8 +2162,13 @@ discovery everywhere else. Capability `manage_options` per route via
 
 `host` is always the stored ASCII form; `host_display` is decorative. The `challenge`
 **is** exposed — it is a value the domain owner must publish in public DNS, not a
-credential. SSL credentials, markers' raw account data, and deletion authorizations
-appear in no response, ever.
+credential. SSL credentials, raw marker account data, lease tokens, and mutation
+authorizations appear in no response, ever. `mutation_in_progress` reports only the
+mutation *kind* and its expiry, never the token.
+
+`owned_by_this_installation` is computed from `ssl_ownership_origin` and
+`ssl_owner_installation_id` per §12.2; the raw installation id is not exposed on the
+mapping resource.
 
 `target` links come from the post type via `get_post_type_object()`: `rest_link` only
 when `show_in_rest` is true, built from that type's real `rest_base` and
@@ -1919,14 +2200,14 @@ computed on the resource and on its own route.
 | Method | Route | Notes |
 |---|---|---|
 | `GET` | `/domains` | paginated; filters `verification_state`, `activation_state`, `ssl_state`, `post_id`, `search` |
-| `POST` | `/domains` | `{host, post_id?, alias_of?, title?, favicon_attachment_id?}` |
+| `POST` | `/domains` | `{host, post_id?, alias_of?, title?, favicon_attachment_id?}`; wildcard hosts rejected |
 | `GET` | `/domains/{id}` | |
 | `PATCH` | `/domains/{id}` | `post_id`, `activation_state`, `title`, `favicon_attachment_id` only |
 | `DELETE` | `/domains/{id}` | 202 + durable removal; `?force=true` removes locally only |
 | `POST` | `/domains/{id}/verify` | on-demand check; rate-limited 1/min per mapping |
-| `POST` | `/domains/{id}/challenge` | rotates; resets verification; response says so |
+| `POST` | `/domains/{id}/challenge` | rotates; resets verification; refused under a live lease |
 | `GET` | `/domains/{id}/plan` | returns a `ValidationPlan` |
-| `POST` | `/domains/{id}/ssl` | `ensure()`, idempotent |
+| `POST` | `/domains/{id}/ssl` | provision — `create()` under a `CREATE` lease |
 | `PATCH` | `/domains/{id}/ssl` | `{method}` — explicit DCV method change (§14.10) |
 | `DELETE` | `/domains/{id}/ssl` | authorized removal (§14.5) |
 | `POST` | `/domains/{id}/ssl/adopt` | `{confirm:true, override_foreign_marker?:bool}` |
@@ -1935,22 +2216,25 @@ computed on the resource and on its own route.
 
 `PATCH /domains/{id}` excluding verification and SSL state is the API expression of
 invariant 1: there is no request that makes a mapping verified. `verification`, `ssl`
-state, `revision`, and `deletion` are read-only there. `post_id` on an alias row returns
-`pd_alias_no_target`.
+state, ownership columns, `revision`, and `deletion` are read-only there. `post_id` on an
+alias row returns `pd_alias_no_target`. Every `…/ssl` mutation and `…/challenge` requires
+`If-Match` and acquires the mutation lease; a live lease held elsewhere returns
+`pd_mutation_in_progress`.
 
 ### 15.3 Errors
 
-`pd_host_invalid` (400), `pd_host_malformed_authority` (400),
+`pd_host_invalid` (400), `pd_host_malformed_authority` (400), `pd_host_wildcard` (400),
 `pd_host_exists` (409), `pd_host_too_long` (400, naming the composed TXT length),
 `pd_label_invalid` (400), `pd_alias_chain` (400), `pd_alias_no_target` (400),
 `pd_post_invalid` (400), `pd_alias_in_use` (409), `pd_conflict` (409),
 `pd_precondition_required` (428), `pd_precondition_failed` (412),
 `pd_rate_limited` (429), `pd_environment_unresolved` (409),
-`pd_unowned_resource` (409), `pd_deletion_unauthorized` (409, naming the failing
-precondition), `pd_method_unsupported` (400), `pd_forbidden` (403).
+`pd_mutation_in_progress` (409), `pd_mutation_unauthorized` (409, naming the failing
+precondition), `pd_unowned_resource` (409), `pd_provider_create_ambiguous` (409),
+`pd_method_unsupported` (400), `pd_forbidden` (403).
 
-Any of these requested on a non-primary host produces a plain 404 from WordPress,
-because the route does not exist there.
+Any of these requested on a non-primary host produces a plain 404 from WordPress, because
+the route does not exist there.
 
 ---
 
@@ -1961,12 +2245,13 @@ because the route does not exist there.
 **Domains** — host (Unicode display, ASCII on hover), target, and three state chips.
 The computed `serving` chip appears only on expanded rows, matching the collection
 split. Row actions: verify now, rotate challenge, provision SSL, deactivate, delete.
-Bulk: activate, deactivate, verify.
+Bulk: activate, deactivate, verify. Actions that require the mutation lease are disabled,
+with an explanation, while one is held.
 
 **Add domain** — one screen, three steps, no server-side wizard state: host → target
 post (post-type-agnostic search restricted to the configured types) → the validation
 plan. The row is created `pending`/`inactive` at step one so the challenge exists before
-instructions are displayed.
+instructions are displayed. Wildcard input is rejected at entry.
 
 **Domain detail** — the validation plan, rendered so an operator can tell the four
 purposes apart at a glance:
@@ -1975,29 +2260,35 @@ purposes apart at a glance:
 |---|---|
 | Ownership (post-domain) | permanent; **must never be removed** |
 | Hostname ownership (provider) | may be removed once the provider reports the hostname active |
-| Certificate validation (provider) | appears when the CA issues tokens; may be TXT, a delegated CNAME, an HTTP token, or a manual email step |
-| Routing | where the customer points the hostname |
+| Certificate validation (provider) | appears when the CA issues tokens; TXT, a delegated CNAME, an HTTP token, or a manual email step |
+| Routing | where the customer points the hostname, including which apex mechanism applies |
 | Awaiting provider | records not yet issued — a wait, not a failure |
 | Blockers | what must be fixed before this can work |
 
 Alternatives inside a purpose are rendered as "create any one of these"; every record
 inside a chosen set is marked required. HTTP tokens are shown as a URL and body to serve,
-never as a DNS record. Also on this screen: a live "last checked / next attempt / last
-outcome" block; the event log; raw `ssl_provider_state`; SSL actions.
+never as a DNS record. Also on this screen: ownership provenance (created / adopted / no
+authority, and whether this installation is the owner); a live "last checked / next
+attempt / last outcome" block; any lease currently held, with its kind and expiry; the
+event log, labelled as history rather than as the source of any decision; raw
+`ssl_provider_state`; SSL actions.
 
-**Delete** — shows the authorization checklist (§14.5) with the outcome of each
+**Delete** — shows the authorization checklist (§14.4) with the outcome of each
 precondition, so a refused deletion says *which* check failed rather than "try again".
-Force-delete is presented separately and states plainly that a provider resource may be
-left behind.
+Force-local-delete is presented separately and states plainly that it removes only the
+local row and that a provider resource may be left behind.
 
-**Settings** — target post types, SSL driver, DCV method, DoH endpoints,
-admin-redirect toggle, asset-proxy toggle, and generated web-server/CDN snippets for the
-421 rule and CORS.
+**Settings** — target post types, SSL driver, DCV method, DoH endpoints, apex routing
+configuration (with the entitlement and provenance explained inline), admin-redirect
+toggle, asset-proxy toggle, and generated web-server/CDN snippets for the 421 rule and
+CORS.
 
 **Diagnostics** — sweep backlog depth and oldest due timestamp; WP-Cron health;
 round-trip failures; path collisions; absolute primary-host URLs found in a rendered
-mapped page; the browser-side CORS probe; unowned, missing, or divergent SSL resources;
-marker support; the environment-mismatch banner.
+mapped page; the browser-side CORS probe; SSL resources that are unowned, missing,
+divergent in method, or ambiguous after a create; marker support; stale or expired
+mutation leases awaiting recovery; apex configuration status; the environment-mismatch
+banner.
 
 ### 16.2 Operator flows
 
@@ -2009,11 +2300,16 @@ routing requirements to the same plan. Nothing serves until verified **and** act
 (three hard failures, `failed`) from "our resolver was unreachable" (transient, still
 verified) without anyone reading a log file.
 
+*Ambiguous provisioning*: when a create times out on an account without markers, the
+detail screen says a resource may exist, shows what was observed, and offers the explicit
+adoption workflow. Nothing is bound automatically.
+
 *Move / restore / clone*: the blocking banner forces the choice before any provider
 mutation runs.
 
-*Remove a domain*: `202`, serving stops immediately, the authorization guard runs, and
-cleanup retries durably; hard delete only after confirmation.
+*Remove a domain*: `202`, serving stops immediately, the authorization checklist runs
+inside a lease, and cleanup retries durably; the local row is removed only after external
+cleanup succeeds, or by an explicit force-local-delete that issues no provider deletion.
 
 ---
 
@@ -2022,39 +2318,76 @@ cleanup retries durably; hard delete only after confirmation.
 **Unit (no WordPress):** `AuthorityParser` over a malformed-input table — `host:`,
 `host:0`, `host:99999`, `host:abc`, `[::1`, `::1:80`, `a b`, `a\tb`, `user@host`,
 `host/path`, embedded NUL and control characters — each asserted to reach
-`MALFORMED_400`, plus the assertion that **no malformed authority can reach the
-allowlist comparison**; `IdnaNormalizer` against the fixed UTS-46 vectors, including
-Unicode ⇄ punycode deduplication; `PathDecomposer`; `PathNormalizer`; `Subtree`
+`MALFORMED_400`, plus the assertion that **no malformed authority can reach the allowlist
+comparison**; wildcard host rejection; `IdnaNormalizer` against the fixed UTS-46 vectors,
+including Unicode ⇄ punycode deduplication; `PathDecomposer`; `PathNormalizer`; `Subtree`
 round-trip as a **property** over a generated fixture tree; collision ambiguity; grace
 arithmetic and counter resets; `CanonicalPolicy`; `UrlPolicy`; `Classifier`; the
 Cloudflare status map, one case per schema value, generated from the pinned input;
-generator failure when a schema value lacks a classification; DoH response-shape
-rejection; `HostValue` / `AbsoluteUrl` validators including scheme-downgrade rejection;
-validation-record translation for TXT, delegated CNAME, HTTP token, email, empty,
-malformed, multiple-required, and genuine-alternative cases, asserting that all four
-purposes stay distinct and that no DNS record is ever invented.
+generator failure when a schema value lacks a classification or the cardinality differs;
+DoH response-shape rejection; `HostValue` / `AbsoluteUrl` validators including
+scheme-downgrade rejection; `ApexCapability` validation, including rejection of
+`APEX_PROXY` without attested provenance and the assertion that an ordinary origin
+address can never become an emitted A record.
+
+**Translation (unit + recorded fixtures):** every `ssl.validation_records` case — TXT,
+delegated CNAME, HTTP token, email, empty, malformed, multiple-required,
+genuine-alternative; every `ownership_verification` / `ownership_verification_http` case —
+TXT only, HTTP only, both present rendered as OR, neither present while pending rendered
+as `ValidationPending`, `status: active` suppressing completed instructions, malformed
+data rendered as a blocker, and token replacement recomputed and evented. All four
+purposes asserted distinct, with no substitution and no invented record.
 
 **Integration (wp-env):** the §7.2 compatibility matrix asserted on **rendered output**,
-not on filter registration; query-string preservation through the unmatched redirect;
-the full disposition matrix (400 / 421 / 404 / 503 / serve) across host states, with an
+not on filter registration; query-string preservation through the unmatched redirect; the
+full disposition matrix (400 / 421 / 404 / 503 / serve) across host states, with an
 allowlisted host and a malformed near-match of it asserted to diverge; admin redirect
 method-awareness (302 vs 307) and the admin-ajax exemption; REST management absent from
 discovery on a mapped host; CORS header presence and exact value; feed and sitemap
 membership enforcement with an injected non-member; empty `post__in` short-circuit; CAS
-conflict returning 409; lease conflict discarding a DNS result; uninstall leaving posts
-untouched.
+conflict returning 409; verification-lease conflict discarding a DNS result; uninstall
+leaving posts untouched.
 
-**SSL authorization (integration, against a fake driver and a recorded-fixture
-Cloudflare client):** each of the six deletion preconditions failing individually and
-producing a refusal with no provider mutation; a token rejected after a concurrent
-revision bump; a token rejected when host, provider, ref, or challenge differ; expiry;
-single use; a clone unable to delete the original installation's resource; a restore
-retaining authority; adoption refused without `confirm`, without a fresh proof, and
-without `override_foreign_marker` against a foreign marker; `ensure()` on a duplicate
-returning `unowned_resource` without adopting; error 1413 setting
-`marker_support = UNAVAILABLE`, retrying once without `custom_metadata`, and never being
-retried as transient; the driver operating end to end with markers unavailable;
-reconciliation with `snapshot_complete = false` never inferring a missing resource.
+**Lease and authorization (integration, against a fake driver and a recorded-fixture
+Cloudflare client):**
+
+- lease acquisition refused while another lease is live, with no provider call
+- challenge rotation, provider change, method change, adoption, removal, and
+  force-delete all refused under a foreign lease; activation and branding permitted
+- expired lease cleared only after read-first reconciliation, never blindly
+- an expired worker unable to clear a newer worker's lease
+- queue selection skipping leased rows
+- each of the deletion preconditions failing individually, producing a refusal with no
+  provider mutation
+- authorization rejected after a concurrent revision bump, and when host, provider, ref,
+  challenge, or kind differ; expiry; single use enforced by the consuming CAS
+- ownership provenance read from columns: deletion still authorized after **all** events
+  for the mapping have been pruned
+- a clone unable to delete or change the original installation's resource; a restore
+  retaining authority
+- adoption refused without `confirm`, without a fresh proof, and without
+  `override_foreign_marker` against a foreign marker
+
+**Create and recovery (integration):**
+
+- simultaneous first-create requests: exactly one POST is sent
+- create succeeds but the response is lost, marker matches ⇒ `RECOVERABLE_CREATE`, bound,
+  recorded as recovery and **not** as adoption
+- create succeeds but the response is lost, markers unavailable ⇒
+  `provider_create_ambiguous`, nothing bound, adoption required
+- conclusive absence ⇒ safe retry under a new lease
+- conflicting marker ⇒ `unowned_resource`, nothing mutated
+- CAS failure while persisting the returned reference
+- mutation lease expiring during ambiguous-create reconciliation
+
+**Method change (integration):** lease conflict; stale authorization; provider ambiguity
+leaving local state unchanged; success persisted only after the provider re-read confirms
+the method; reconciliation reporting divergence without auto-patching.
+
+**Provider behaviour:** error 1413 setting `marker_support = UNAVAILABLE`, retrying once
+without `custom_metadata`, and never being retried as transient; the driver operating end
+to end with markers unavailable; reconciliation with `snapshot_complete = false` never
+inferring a missing resource.
 
 ---
 
@@ -2066,9 +2399,9 @@ prefixing all vendor code into `PostDomain\Vendor\` so the shipped plugin cannot
 with or be hijacked by another plugin's autoloader. The release artifact is the prefixed
 build, never the raw vendor tree. PHPCS against WordPress-Extra; PHPStan level 8.
 
-The Cloudflare status map is generated at build time from the pinned snapshot (§14.15);
-CI fails if the committed map differs from a fresh generation, or if any schema value
-lacks a classification.
+The Cloudflare status map is generated at build time from the pinned snapshot (§14.18);
+CI fails if the committed map differs from a fresh generation, if any schema value lacks
+a classification, or if the enum cardinality differs from the recorded expectation.
 
 Minimum: **WordPress 6.4, PHP 8.1.** No PHP extension is a hard requirement.
 
@@ -2078,6 +2411,11 @@ Minimum: **WordPress 6.4, PHP 8.1.** No PHP extension is a hard requirement.
 `pd_provider_cooldowns`, and all cron events. **No post, meta, or option belonging to
 anything else is touched.**
 
+Uninstalling destroys the ownership provenance along with the rows, so any provider
+resources still outstanding become unowned from the plugin's perspective. The README says
+so: delete mappings — which runs the durable-deletion workflow — **before** uninstalling,
+or clean the provider up by hand afterwards.
+
 ---
 
 ## 19. Documentation deliverables
@@ -2085,6 +2423,7 @@ anything else is touched.**
 A README covering:
 
 - installation, and the WordPress/PHP minimums
+- that mapped hosts are exact hosts and wildcards are out of scope (§14.16)
 - the DNS records a domain owner must create, which of the four purposes each belongs
   to, and why the post-domain ownership TXT record must **stay** while a provider
   ownership record may be removed once active
@@ -2092,23 +2431,31 @@ A README covering:
 - the `init : 99` registration requirement and the early-URL limitation
 - the `SslDriver` interface, `SslResourceContext`, and how to add a driver, including how
   a driver expresses its own ownership-proof mechanism
-- the deletion-authorization model: what a provider deletion requires, why cached
-  verification is not enough, and what a refusal means
+- ownership provenance: what `created`, `adopted`, and "no authority" mean, that it lives
+  in columns rather than in the event log, and that events are history only
+- the provider-mutation lease: what it blocks, why challenge rotation and method changes
+  are refused while one is held, and how expired leases are recovered
+- the authorization model: what a provider mutation requires, why cached verification is
+  not enough, and what each refusal means
+- creation ambiguity: why a marker-free create-then-timeout may require explicit adoption
 - adoption: when it is needed, what it requires, and what it records
 - clone detection and the restore/move/clone choice
 - the `pd_dns_resolver` trust boundary
-- the DCV method choice, the `txt` default, why `email` is not automated, and the
-  wildcard restriction
-- the **authoritative-DNS deployment posture** (§14.12): provider neutrality, Cloudflare
+- the DCV method choice, the `txt` default, why `email` is not automated, and that
+  automatic HTTP DCV is a valid success path
+- apex routing: CNAME flattening, ALIAS/ANAME, and that A/AAAA targets are permitted only
+  with an attested Apex Proxying or BYOIP entitlement — never ordinary origin addresses
+- the **authoritative-DNS deployment posture** (§14.14): provider neutrality, Cloudflare
   DNS as a recommendation rather than a requirement, the separation of DoH resolvers /
   Cloudflare for SaaS / authoritative DNS, apex requirements on other providers, that no
-  DNS is mutated by API, that no paid Custom Metadata or Enterprise Apex Proxying is
-  assumed, and the client-owned-account recommendation
+  DNS is mutated by API, that no paid Custom Metadata or Apex Proxying is assumed, and
+  the client-owned-account recommendation
 - the multisite exclusion and its reasoning
 - the 421 default, the exact infrastructure allowlist, and the web-server rule the plugin
   cannot apply
 - the CORS hosting boundary
 - the auth consequences of mapped-host REST and admin-ajax
+- deleting mappings before uninstalling, and what uninstall does to ownership provenance
 
 ---
 
@@ -2119,6 +2466,6 @@ One item is deliberately deferred to implementation:
 **`CteSubtreeAdapter` capability matrix.** The concrete MySQL and MariaDB
 minimum-version matrix (nominally MySQL 8.0, MariaDB 10.2.2) must be confirmed against
 the actual target environments before the adapter is enabled there. Deferring this is
-safe by construction: the adapter is explicitly capability-gated, has its own
-integration tests, returns post IDs rather than injecting raw JOIN or WHERE fragments,
-falls back to enumeration, and an unbounded scope is never executed.
+safe by construction: the adapter is explicitly capability-gated, has its own integration
+tests, returns post IDs rather than injecting raw JOIN or WHERE fragments, falls back to
+enumeration, and an unbounded scope is never executed.
