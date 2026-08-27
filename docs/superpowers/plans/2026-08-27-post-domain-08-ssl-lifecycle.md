@@ -26,9 +26,22 @@ Inherit Plans 01–07, and add:
   where applicable, and the consumption CAS (spec §14.4).
 - **A refusal after acquisition releases the reservation** (spec §12.6).
 - **A failed `finalize()` means fenced:** discard the local result, write nothing
-  further, delete nothing, retry nothing (spec §12.6).
+  further, delete nothing, retry nothing (spec §12.6) — and **return a fenced
+  result, not the provider's status**. A provider call that succeeded is not the
+  same fact as a mutation that took effect.
+- **Every service returns `MutationResult`** (Plan 07 Task 4), which carries an
+  `SslStatus` only for `COMMITTED`. `FENCED` and `CONFIRMED_NOT_PERSISTED` are
+  told apart by re-reading the row: a replaced token or a `RECOVERING` phase
+  means recovery took it; anything else means the write simply did not land.
 - **The in-flight revision comes from `GateResult`,** never from
   `lease revision + 1` (spec §12.6).
+- **A state change and its event are written together** through
+  `AtomicTransition::commit()` (spec §12.3). No success event is ever written
+  before the CAS that establishes it.
+- **Drivers come from `DriverFactory`** and nowhere else, so REST, cron,
+  reconciliation, and recovery cannot disagree about which driver owns a row.
+- **Every CAS result is checked.** A zero-row write is never counted, reported,
+  or logged as though it had happened.
 - **Adoption is never automatic** (spec §14.7).
 - **The normal deletion path never deletes the local row before external cleanup
   succeeds;** force-local-delete is the only exception and issues no provider
@@ -296,10 +309,10 @@ than claiming a resource it cannot identify."
 - Test: `tests/integration/Ssl/CreateServiceTest.php`
 
 **Interfaces:**
-- Consumes: `AuthorizerSupport`, `MutationGate`, `MutationLease`, `SslDriverRegistry`, `TimingPolicy` (Plan 07); `FreshProof` (Plan 06); `CreateRecovery` (Task 1).
+- Consumes: `AuthorizerSupport`, `MutationGate`, `MutationLease`, `DriverFactory`, `MutationResult`, `TimingPolicy` (Plan 07); `AtomicTransition` (Plan 02); `FreshProof` (Plan 06); `CreateRecovery` (Task 1).
 - Produces:
   - `PostDomain\Ssl\CreateAuthorizer::authorize( Mapping $m ): array{auth: MutationAuthorization, context: SslResourceContext, driver: SslDriver, lease: array{token: string, revision: int}, mapping: Mapping}|MutationRefusal`.
-  - `PostDomain\Ssl\CreateService::__construct( MappingRepository $repo, SslDriverRegistry $registry, CreateAuthorizer $authorizer, MutationLease $lease, MutationGate $gate, Clock $clock )` with `::provision( Mapping $m ): SslStatus|MutationRefusal` and the static test helper `::for_tests( SslDriver $driver, FreshProof $proof ): self`.
+  - `PostDomain\Ssl\CreateService::__construct( MappingRepository $repo, CreateAuthorizer $authorizer, MutationLease $lease, MutationGate $gate, Clock $clock )` with `::provision( Mapping $m ): MutationResult` and the static test helper `::for_tests( SslDriver $driver, FreshProof $proof ): self`.
 
 Create runs the **same** precondition set as every other operation, minus the
 bound-identity requirement (the reference may legitimately be null) and plus the
@@ -318,13 +331,14 @@ namespace PostDomain\Tests\Integration\Ssl;
 use PostDomain\Contracts\DnsResolver;
 use PostDomain\Mapping\ActivationState;
 use PostDomain\Mapping\DbRepository;
+use PostDomain\Mapping\EventLog;
 use PostDomain\Mapping\Mapping;
 use PostDomain\Mapping\OwnershipOrigin;
 use PostDomain\Mapping\SslState;
 use PostDomain\Mapping\VerificationState;
 use PostDomain\Ssl\CreateService;
 use PostDomain\Ssl\Environment;
-use PostDomain\Ssl\MutationRefusal;
+use PostDomain\Ssl\MutationDisposition;
 use PostDomain\Support\Schema;
 use PostDomain\Support\SystemClock;
 use PostDomain\Tests\Integration\Ssl\Fixtures\RecordingDriver;
@@ -396,7 +410,7 @@ final class CreateServiceTest extends WP_UnitTestCase {
 
 		$result = CreateService::for_tests( $driver, $this->proof( DnsOutcome::MATCH ) )->provision( $m );
 
-		$this->assertInstanceOf( MutationRefusal::class, $result );
+		$this->assertSame( MutationDisposition::REFUSED, $result->disposition );
 		$this->assertSame( 0, $driver->create_calls );
 		$this->assert_released( $m->id );
 	}
@@ -407,8 +421,8 @@ final class CreateServiceTest extends WP_UnitTestCase {
 
 		$result = CreateService::for_tests( $driver, $this->proof( DnsOutcome::NO_RECORD ) )->provision( $m );
 
-		$this->assertInstanceOf( MutationRefusal::class, $result );
-		$this->assertSame( 'fresh_proof_failed', $result->precondition );
+		$this->assertSame( MutationDisposition::REFUSED, $result->disposition );
+		$this->assertSame( 'fresh_proof_failed', $result->refusal?->precondition );
 		$this->assertSame( 0, $driver->create_calls, 'cached verification is not a fresh proof' );
 		$this->assert_released( $m->id );
 	}
@@ -418,8 +432,8 @@ final class CreateServiceTest extends WP_UnitTestCase {
 		$result = CreateService::for_tests( $driver, $this->proof( DnsOutcome::TRANSIENT ) )
 			->provision( $this->mapping() );
 
-		$this->assertInstanceOf( MutationRefusal::class, $result );
-		$this->assertTrue( $result->transient );
+		$this->assertSame( MutationDisposition::REFUSED, $result->disposition );
+		$this->assertTrue( $result->refusal?->transient );
 		$this->assertSame( 0, $driver->create_calls );
 	}
 
@@ -429,7 +443,7 @@ final class CreateServiceTest extends WP_UnitTestCase {
 
 		$result = CreateService::for_tests( $driver, $this->proof( DnsOutcome::MATCH ) )->provision( $m );
 
-		$this->assertInstanceOf( MutationRefusal::class, $result );
+		$this->assertSame( MutationDisposition::REFUSED, $result->disposition );
 		$this->assertSame( 0, $driver->create_calls );
 		$this->assert_released( $m->id );
 	}
@@ -440,8 +454,8 @@ final class CreateServiceTest extends WP_UnitTestCase {
 
 		$result = CreateService::for_tests( $driver, $this->proof( DnsOutcome::MATCH ) )->provision( $m );
 
-		$this->assertInstanceOf( MutationRefusal::class, $result );
-		$this->assertSame( 'conflicting_marker', $result->precondition );
+		$this->assertSame( MutationDisposition::REFUSED, $result->disposition );
+		$this->assertSame( 'conflicting_marker', $result->refusal?->precondition );
 		$this->assertSame( 0, $driver->create_calls );
 	}
 
@@ -453,7 +467,7 @@ final class CreateServiceTest extends WP_UnitTestCase {
 		$service->provision( $m );
 		$second = $service->provision( $m );
 
-		$this->assertInstanceOf( MutationRefusal::class, $second );
+		$this->assertSame( MutationDisposition::REFUSED, $second->disposition );
 		$this->assertSame( 1, $driver->create_calls, 'exactly one POST' );
 	}
 
@@ -520,6 +534,32 @@ final class CreateServiceTest extends WP_UnitTestCase {
 		$this->assertGreaterThanOrEqual( 2, $driver->identify_calls, 'a read precedes any retry' );
 	}
 
+	public function test_a_successful_create_reports_a_committed_result(): void {
+		$result = CreateService::for_tests( RecordingDriver::succeeding( 'ref-1' ), $this->proof( DnsOutcome::MATCH ) )
+			->provision( $this->mapping() );
+
+		$this->assertSame( MutationDisposition::COMMITTED, $result->disposition );
+		$this->assertNotNull( $result->status );
+	}
+
+	public function test_an_ambiguous_create_is_reported_as_retained_not_successful(): void {
+		$result = CreateService::for_tests( RecordingDriver::ambiguous_then_absent(), $this->proof( DnsOutcome::MATCH ) )
+			->provision( $this->mapping() );
+
+		$this->assertSame( MutationDisposition::AMBIGUOUS_RETAINED, $result->disposition );
+		$this->assertNull( $result->status, 'nothing here is confirmed enough to report as a status' );
+	}
+
+	public function test_a_refusal_carries_no_status(): void {
+		$result = CreateService::for_tests(
+			RecordingDriver::succeeding( 'ref-1' ),
+			$this->proof( DnsOutcome::NO_RECORD )
+		)->provision( $this->mapping() );
+
+		$this->assertNull( $result->status );
+		$this->assertFalse( $result->succeeded() );
+	}
+
 	public function test_a_fenced_worker_writes_nothing(): void {
 		global $wpdb;
 
@@ -540,15 +580,55 @@ final class CreateServiceTest extends WP_UnitTestCase {
 			}
 		);
 
-		CreateService::for_tests( $driver, $this->proof( DnsOutcome::MATCH ) )->provision( $m );
+		$result = CreateService::for_tests( $driver, $this->proof( DnsOutcome::MATCH ) )->provision( $m );
 
 		$after = $this->repo->by_id( $m->id );
 
 		$this->assertNull( $after?->ssl_ref, 'a fenced worker must not apply its result' );
 		$this->assertNull( $after?->ssl_ownership_origin );
 
+		// The provider succeeded. The mutation did not. Those are different facts
+		// and the caller has to be able to tell them apart.
+		$this->assertSame( MutationDisposition::FENCED, $result->disposition );
+		$this->assertNull( $result->status );
+		$this->assertFalse( $result->succeeded() );
+
 		remove_all_actions( 'pd_test_after_provider_call' );
 		unset( $wpdb );
+	}
+
+	public function test_a_fenced_worker_records_no_success_event(): void {
+		$m = $this->mapping();
+
+		add_action(
+			'pd_test_after_provider_call',
+			static function () use ( $m ): void {
+				global $wpdb;
+
+				$wpdb->update( // phpcs:ignore WordPress.DB
+					Schema::domains_table(),
+					array(
+						'ssl_mutation_token' => str_repeat( '7', 32 ),
+						'ssl_mutation_phase' => 'recovering',
+					),
+					array( 'id' => $m->id )
+				);
+			}
+		);
+
+		CreateService::for_tests( RecordingDriver::succeeding( 'ref-1' ), $this->proof( DnsOutcome::MATCH ) )
+			->provision( $m );
+
+		$this->assertSame(
+			array(),
+			array_filter(
+				EventLog::for_domain( $m->id ),
+				static fn( array $e ): bool => 'created' === $e['to_state']
+			),
+			'no history for work that was discarded'
+		);
+
+		remove_all_actions( 'pd_test_after_provider_call' );
 	}
 }
 ```
@@ -578,7 +658,6 @@ final class CreateAuthorizer {
 
 	public function __construct(
 		private readonly MappingRepository $repo,
-		private readonly SslDriverRegistry $registry,
 		private readonly FreshProof $proof,
 		private readonly MutationLease $lease,
 		private readonly Clock $clock
@@ -590,7 +669,6 @@ final class CreateAuthorizer {
 	public function authorize( Mapping $mapping ) {
 		$window = AuthorizerSupport::open_window(
 			$this->repo,
-			$this->registry,
 			$this->lease,
 			$mapping,
 			MutationOperation::CREATE
@@ -673,6 +751,7 @@ use PostDomain\Mapping\EventLog;
 use PostDomain\Mapping\Mapping;
 use PostDomain\Mapping\OwnershipOrigin;
 use PostDomain\Mapping\SslState;
+use PostDomain\Support\AtomicTransition;
 use PostDomain\Support\SystemClock;
 use PostDomain\Verification\FreshProof;
 
@@ -687,33 +766,43 @@ final class CreateService {
 	) {}
 
 	public static function for_tests( SslDriver $driver, FreshProof $proof ): self {
-		$clock    = new SystemClock();
-		$lease    = new MutationLease( $clock );
-		$repo     = new DbRepository();
-		$registry = new SslDriverRegistry( new NullDriver() );
-		$registry->register( $driver );
+		$clock = new SystemClock();
+		$lease = new MutationLease( $clock );
+		$repo  = new DbRepository();
+
+		// Production resolves drivers through DriverFactory, so tests install
+		// theirs the same way a site would rather than injecting a registry.
+		add_filter(
+			'pd_ssl_drivers',
+			static function ( array $drivers ) use ( $driver ): array {
+				$drivers[] = $driver;
+
+				return $drivers;
+			}
+		);
+		update_option( 'pd_settings', array( 'ssl_driver' => $driver->id() ), false );
+		DriverFactory::reset();
 
 		return new self(
 			$repo,
-			new CreateAuthorizer( $repo, $registry, $proof, $lease, $clock ),
+			new CreateAuthorizer( $repo, $proof, $lease, $clock ),
 			$lease,
 			new MutationGate( $lease, $clock ),
 			$clock
 		);
 	}
 
-	/** @return SslStatus|MutationRefusal */
-	public function provision( Mapping $mapping ) {
+	public function provision( Mapping $mapping ): MutationResult {
 		$authorized = $this->authorizer->authorize( $mapping );
 
 		if ( $authorized instanceof MutationRefusal ) {
-			return $authorized;
+			return MutationResult::refused( $authorized );
 		}
 
 		$gated = $this->gate->execute( $authorized['driver'], $authorized['context'], $authorized['auth'] );
 
 		if ( $gated instanceof MutationRefusal ) {
-			return $gated;
+			return MutationResult::refused( $gated );
 		}
 
 		/** For the fencing race test: fires after the provider call, before finalize. */
@@ -723,7 +812,7 @@ final class CreateService {
 		$status = $gated->result;
 
 		if ( ! $status->transient && null !== $status->ref ) {
-			$this->apply(
+			return $this->apply(
 				$authorized,
 				$gated,
 				LeaseOutcome::bound(
@@ -732,10 +821,10 @@ final class CreateService {
 					$authorized['driver']->id(),
 					OwnershipOrigin::CREATED,
 					$authorized['context']->installation_id
-				)
+				),
+				$status,
+				'created'
 			);
-
-			return $status;
 		}
 
 		// Ambiguous: read before considering anything else. Never a second POST.
@@ -763,38 +852,61 @@ final class CreateService {
 			default                        => LeaseOutcome::checked(),
 		};
 
-		$this->apply( $authorized, $gated, $outcome, $decision );
+		$applied = $this->apply( $authorized, $gated, $outcome, $status, $decision );
 
-		return $status;
+		if ( ! $applied->succeeded() ) {
+			return $applied;
+		}
+
+		// A recovered create is a completed mutation; every other ambiguous
+		// decision leaves the truth with the provider, so say so rather than
+		// dressing it up as a success.
+		return CreateRecovery::BIND === $decision
+			? $applied
+			: MutationResult::ambiguous( $decision );
 	}
 
 	/**
+	 * Applies the outcome and its event as one transition, and reports precisely
+	 * what became of the attempt.
+	 *
 	 * @param array{auth: MutationAuthorization, context: SslResourceContext, driver: SslDriver, lease: array{token: string, revision: int}, mapping: Mapping} $authorized
 	 */
-	private function apply( array $authorized, GateResult $gated, LeaseOutcome $outcome, string $note = 'created' ): void {
-		$applied = $this->lease->finalize(
-			$authorized['mapping']->id,
-			$gated->in_flight_revision,
-			$gated->lease_token,
-			MutationKind::CREATE,
-			MutationPhase::IN_FLIGHT,
-			$outcome
+	private function apply(
+		array $authorized,
+		GateResult $gated,
+		LeaseOutcome $outcome,
+		SslStatus $status,
+		string $note
+	): MutationResult {
+		$mapping_id = $authorized['mapping']->id;
+
+		$applied = AtomicTransition::commit(
+			fn (): bool => $this->lease->finalize(
+				$mapping_id,
+				$gated->in_flight_revision,
+				$gated->lease_token,
+				MutationKind::CREATE,
+				MutationPhase::IN_FLIGHT,
+				$outcome
+			),
+			fn (): bool => EventLog::record(
+				$mapping_id,
+				$authorized['mapping']->host,
+				'ssl',
+				null,
+				$note,
+				'cron',
+				array( 'create' => $note )
+			)
 		);
 
-		if ( ! $applied ) {
-			// Fenced by recovery: discard, write nothing, retry nothing.
-			return;
+		if ( $applied ) {
+			return MutationResult::committed( $status, $note );
 		}
 
-		EventLog::record(
-			$authorized['mapping']->id,
-			$authorized['mapping']->host,
-			'ssl',
-			null,
-			$note,
-			'cron',
-			array( 'create' => $note )
-		);
+		// Fenced or simply not persisted — the row itself says which.
+		return MutationResult::lost( $this->repo->by_id( $mapping_id ), $gated->lease_token );
 	}
 }
 ```
@@ -802,7 +914,7 @@ final class CreateService {
 - [ ] **Step 4: Run the test to verify it passes**
 
 Run: `composer test:integration -- --filter CreateServiceTest`
-Expected: PASS — 13 tests
+Expected: PASS — 17 tests
 
 - [ ] **Step 5: Commit**
 
@@ -825,7 +937,7 @@ POST, and a fenced worker applies nothing."
 
 **Interfaces:**
 - Consumes: Plan 07's authorization machinery, `FreshProof` (Plan 06).
-- Produces: `AdoptionAuthorizer::authorize( Mapping $m, array $request )` and `AdoptionService::adopt( Mapping $m, array $request ): SslStatus|MutationRefusal`, plus `AdoptionService::for_tests()`.
+- Produces: `AdoptionAuthorizer::authorize( Mapping $m, array $request )` and `AdoptionService::take_ownership( Mapping $m, array $request ): MutationResult`, plus `AdoptionService::for_tests()`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -840,6 +952,7 @@ namespace PostDomain\Tests\Integration\Ssl;
 use PostDomain\Contracts\DnsResolver;
 use PostDomain\Mapping\ActivationState;
 use PostDomain\Mapping\DbRepository;
+use PostDomain\Mapping\EventLog;
 use PostDomain\Mapping\Mapping;
 use PostDomain\Mapping\OwnershipOrigin;
 use PostDomain\Mapping\SslState;
@@ -847,7 +960,7 @@ use PostDomain\Mapping\VerificationState;
 use PostDomain\Ssl\AdoptionService;
 use PostDomain\Ssl\CreateService;
 use PostDomain\Ssl\Environment;
-use PostDomain\Ssl\MutationRefusal;
+use PostDomain\Ssl\MutationDisposition;
 use PostDomain\Support\Schema;
 use PostDomain\Tests\Integration\Ssl\Fixtures\RecordingDriver;
 use PostDomain\Verification\DnsOutcome;
@@ -897,7 +1010,7 @@ final class AdoptionTest extends WP_UnitTestCase {
 		AdoptionService::for_tests(
 			RecordingDriver::ambiguous_then_unmarked( 'ref-9' ),
 			$this->proof( DnsOutcome::MATCH )
-		)->adopt( $m, array( 'confirm' => true ) );
+		)->take_ownership( $m, array( 'confirm' => true ) );
 
 		$after = $this->repo->by_id( $m->id );
 
@@ -913,10 +1026,10 @@ final class AdoptionTest extends WP_UnitTestCase {
 		$result = AdoptionService::for_tests(
 			RecordingDriver::ambiguous_then_unmarked( 'ref-9' ),
 			$this->proof( DnsOutcome::MATCH )
-		)->adopt( $m, array() );
+		)->take_ownership( $m, array() );
 
-		$this->assertInstanceOf( MutationRefusal::class, $result );
-		$this->assertSame( 'confirmation_required', $result->precondition );
+		$this->assertSame( MutationDisposition::REFUSED, $result->disposition );
+		$this->assertSame( 'confirmation_required', $result->refusal?->precondition );
 		$this->assertNull( $this->repo->by_id( $m->id )?->ssl_mutation_token );
 	}
 
@@ -925,10 +1038,10 @@ final class AdoptionTest extends WP_UnitTestCase {
 		$result = AdoptionService::for_tests(
 			RecordingDriver::ambiguous_then_unmarked( 'ref-9' ),
 			$this->proof( DnsOutcome::MISMATCH )
-		)->adopt( $m, array( 'confirm' => true ) );
+		)->take_ownership( $m, array( 'confirm' => true ) );
 
-		$this->assertInstanceOf( MutationRefusal::class, $result );
-		$this->assertSame( 'fresh_proof_failed', $result->precondition );
+		$this->assertSame( MutationDisposition::REFUSED, $result->disposition );
+		$this->assertSame( 'fresh_proof_failed', $result->refusal?->precondition );
 		$this->assertNull( $this->repo->by_id( $m->id )?->ssl_mutation_token );
 	}
 
@@ -937,10 +1050,10 @@ final class AdoptionTest extends WP_UnitTestCase {
 		$result = AdoptionService::for_tests(
 			RecordingDriver::ambiguous_then_foreign( 'ref-9' ),
 			$this->proof( DnsOutcome::MATCH )
-		)->adopt( $m, array( 'confirm' => true ) );
+		)->take_ownership( $m, array( 'confirm' => true ) );
 
-		$this->assertInstanceOf( MutationRefusal::class, $result );
-		$this->assertSame( 'foreign_marker_override_required', $result->precondition );
+		$this->assertSame( MutationDisposition::REFUSED, $result->disposition );
+		$this->assertSame( 'foreign_marker_override_required', $result->refusal?->precondition );
 	}
 
 	public function test_a_foreign_marker_can_be_overridden_deliberately(): void {
@@ -949,7 +1062,7 @@ final class AdoptionTest extends WP_UnitTestCase {
 		AdoptionService::for_tests(
 			RecordingDriver::ambiguous_then_foreign( 'ref-9' ),
 			$this->proof( DnsOutcome::MATCH )
-		)->adopt( $m, array( 'confirm' => true, 'override_foreign_marker' => true ) );
+		)->take_ownership( $m, array( 'confirm' => true, 'override_foreign_marker' => true ) );
 
 		$this->assertSame( OwnershipOrigin::ADOPTED, $this->repo->by_id( $m->id )?->ssl_ownership_origin );
 	}
@@ -959,10 +1072,49 @@ final class AdoptionTest extends WP_UnitTestCase {
 		$result = AdoptionService::for_tests(
 			RecordingDriver::ambiguous_then_absent(),
 			$this->proof( DnsOutcome::MATCH )
-		)->adopt( $m, array( 'confirm' => true ) );
+		)->take_ownership( $m, array( 'confirm' => true ) );
 
-		$this->assertInstanceOf( MutationRefusal::class, $result );
-		$this->assertSame( 'identity_not_confirmed', $result->precondition );
+		$this->assertSame( MutationDisposition::REFUSED, $result->disposition );
+		$this->assertSame( 'identity_not_confirmed', $result->refusal?->precondition );
+	}
+
+	public function test_a_fenced_adoption_claims_nothing(): void {
+		$m = $this->mapping();
+
+		add_action(
+			'pd_test_after_provider_call',
+			static function () use ( $m ): void {
+				global $wpdb;
+
+				$wpdb->update( // phpcs:ignore WordPress.DB
+					Schema::domains_table(),
+					array(
+						'ssl_mutation_token' => str_repeat( '7', 32 ),
+						'ssl_mutation_phase' => 'recovering',
+					),
+					array( 'id' => $m->id )
+				);
+			}
+		);
+
+		$result = AdoptionService::for_tests(
+			RecordingDriver::ambiguous_then_unmarked( 'ref-9' ),
+			$this->proof( DnsOutcome::MATCH )
+		)->take_ownership( $m, array( 'confirm' => true ) );
+
+		$after = $this->repo->by_id( $m->id );
+
+		$this->assertSame( MutationDisposition::FENCED, $result->disposition );
+		$this->assertNull( $after?->ssl_ownership_origin, 'ownership is exactly what must not survive a lost CAS' );
+		$this->assertSame(
+			array(),
+			array_filter(
+				EventLog::for_domain( $m->id ),
+				static fn( array $e ): bool => 'adopted' === $e['to_state']
+			)
+		);
+
+		remove_all_actions( 'pd_test_after_provider_call' );
 	}
 
 	public function test_provisioning_never_adopts(): void {
@@ -1006,7 +1158,6 @@ final class AdoptionAuthorizer {
 
 	public function __construct(
 		private readonly MappingRepository $repo,
-		private readonly SslDriverRegistry $registry,
 		private readonly FreshProof $proof,
 		private readonly MutationLease $lease,
 		private readonly Clock $clock
@@ -1023,7 +1174,6 @@ final class AdoptionAuthorizer {
 
 		$window = AuthorizerSupport::open_window(
 			$this->repo,
-			$this->registry,
 			$this->lease,
 			$mapping,
 			MutationOperation::ADOPT
@@ -1101,16 +1251,25 @@ declare( strict_types = 1 );
 namespace PostDomain\Ssl;
 
 use PostDomain\Contracts\Clock;
+use PostDomain\Contracts\MappingRepository;
 use PostDomain\Contracts\SslDriver;
 use PostDomain\Mapping\DbRepository;
 use PostDomain\Mapping\EventLog;
 use PostDomain\Mapping\Mapping;
+use PostDomain\Support\AtomicTransition;
 use PostDomain\Support\SystemClock;
 use PostDomain\Verification\FreshProof;
 
+/**
+ * The public method is `take_ownership()`, not `adopt()`: `adopt` is a driver
+ * method name, and the enforcement scan in Plan 07 flags that name anywhere
+ * outside MutationGate. A service that borrowed it would make the scan noisy
+ * exactly where it needs to be precise.
+ */
 final class AdoptionService {
 
 	public function __construct(
+		private readonly MappingRepository $repo,
 		private readonly AdoptionAuthorizer $authorizer,
 		private readonly MutationLease $lease,
 		private readonly MutationGate $gate,
@@ -1118,14 +1277,26 @@ final class AdoptionService {
 	) {}
 
 	public static function for_tests( SslDriver $driver, FreshProof $proof ): self {
-		$clock    = new SystemClock();
-		$lease    = new MutationLease( $clock );
-		$repo     = new DbRepository();
-		$registry = new SslDriverRegistry( new NullDriver() );
-		$registry->register( $driver );
+		$clock = new SystemClock();
+		$lease = new MutationLease( $clock );
+		$repo  = new DbRepository();
+
+		// Production resolves drivers through DriverFactory, so tests install
+		// theirs the same way a site would rather than injecting a registry.
+		add_filter(
+			'pd_ssl_drivers',
+			static function ( array $drivers ) use ( $driver ): array {
+				$drivers[] = $driver;
+
+				return $drivers;
+			}
+		);
+		update_option( 'pd_settings', array( 'ssl_driver' => $driver->id() ), false );
+		DriverFactory::reset();
 
 		return new self(
-			new AdoptionAuthorizer( $repo, $registry, $proof, $lease, $clock ),
+			$repo,
+			new AdoptionAuthorizer( $repo, $proof, $lease, $clock ),
 			$lease,
 			new MutationGate( $lease, $clock ),
 			$clock
@@ -1134,55 +1305,59 @@ final class AdoptionService {
 
 	/**
 	 * @param array{confirm?: bool, override_foreign_marker?: bool} $request
-	 * @return SslStatus|MutationRefusal
 	 */
-	public function adopt( Mapping $mapping, array $request ) {
+	public function take_ownership( Mapping $mapping, array $request ): MutationResult {
 		$authorized = $this->authorizer->authorize( $mapping, $request );
 
 		if ( $authorized instanceof MutationRefusal ) {
-			return $authorized;
+			return MutationResult::refused( $authorized );
 		}
 
 		$gated = $this->gate->execute( $authorized['driver'], $authorized['context'], $authorized['auth'] );
 
 		if ( $gated instanceof MutationRefusal ) {
-			return $gated;
+			return MutationResult::refused( $gated );
 		}
+
+		do_action( 'pd_test_after_provider_call' );
 
 		/** @var SslStatus $status */
 		$status = $gated->result;
 
-		$applied = $this->lease->finalize(
-			$authorized['mapping']->id,
-			$gated->in_flight_revision,
-			$gated->lease_token,
-			MutationKind::ADOPT,
-			MutationPhase::IN_FLIGHT,
-			LeaseOutcome::adopted(
-				$status->state,
-				$authorized['observed_ref'],
-				$authorized['driver']->id(),
-				$authorized['context']->installation_id,
-				get_current_user_id()
+		$mapping_id = $authorized['mapping']->id;
+		$actor      = 'admin:' . get_current_user_id();
+
+		$applied = AtomicTransition::commit(
+			fn (): bool => $this->lease->finalize(
+				$mapping_id,
+				$gated->in_flight_revision,
+				$gated->lease_token,
+				MutationKind::ADOPT,
+				MutationPhase::IN_FLIGHT,
+				LeaseOutcome::adopted(
+					$status->state,
+					$authorized['observed_ref'],
+					$authorized['driver']->id(),
+					$authorized['context']->installation_id,
+					get_current_user_id()
+				)
+			),
+			fn (): bool => EventLog::record(
+				$mapping_id,
+				$authorized['mapping']->host,
+				'ssl',
+				null,
+				'adopted',
+				$actor,
+				array( 'observed_ref' => $authorized['observed_ref'] )
 			)
 		);
 
-		if ( ! $applied ) {
-			// Fenced by recovery: claim nothing.
-			return $status;
-		}
-
-		EventLog::record(
-			$authorized['mapping']->id,
-			$authorized['mapping']->host,
-			'ssl',
-			null,
-			'adopted',
-			'admin:' . get_current_user_id(),
-			array( 'observed_ref' => $authorized['observed_ref'] )
-		);
-
-		return $status;
+		// Claiming ownership is exactly the write that must not survive a lost
+		// CAS, and no event may say it happened.
+		return $applied
+			? MutationResult::committed( $status, 'adopted' )
+			: MutationResult::lost( $this->repo->by_id( $mapping_id ), $gated->lease_token );
 	}
 }
 ```
@@ -1190,7 +1365,7 @@ final class AdoptionService {
 - [ ] **Step 4: Run the test to verify it passes**
 
 Run: `composer test:integration -- --filter AdoptionTest`
-Expected: PASS — 7 tests
+Expected: PASS — 8 tests
 
 - [ ] **Step 5: Commit**
 
@@ -1212,7 +1387,7 @@ Provisioning never reaches this path, which a test asserts directly."
 
 **Interfaces:**
 - Consumes: Plan 07 machinery.
-- Produces: `MethodChangeAuthorizer::METHODS` (`http`, `txt`, `email`), `::authorize( Mapping $m, string $method )`, and `MethodChangeService::change( Mapping $m, string $method ): SslStatus|MutationRefusal`, plus `::for_tests()`.
+- Produces: `MethodChangeAuthorizer::METHODS` (`http`, `txt`, `email`), `::authorize( Mapping $m, string $method )`, and `MethodChangeService::change( Mapping $m, string $method ): MutationResult`, plus `::for_tests()`.
 
 Local persistence happens **only after** the provider's resulting method is
 confirmed by a re-read (spec §14.10).
@@ -1236,7 +1411,7 @@ use PostDomain\Mapping\SslState;
 use PostDomain\Mapping\VerificationState;
 use PostDomain\Ssl\Environment;
 use PostDomain\Ssl\MethodChangeService;
-use PostDomain\Ssl\MutationRefusal;
+use PostDomain\Ssl\MutationDisposition;
 use PostDomain\Support\Schema;
 use PostDomain\Tests\Integration\Ssl\Fixtures\RecordingDriver;
 use PostDomain\Verification\DnsOutcome;
@@ -1323,8 +1498,8 @@ final class MethodChangeTest extends WP_UnitTestCase {
 
 		$result = MethodChangeService::for_tests( $driver, $this->proof( DnsOutcome::MATCH ) )->change( $m, 'email' );
 
-		$this->assertInstanceOf( MutationRefusal::class, $result );
-		$this->assertSame( 'method_unsupported', $result->precondition );
+		$this->assertSame( MutationDisposition::REFUSED, $result->disposition );
+		$this->assertSame( 'method_unsupported', $result->refusal?->precondition );
 		$this->assertSame( 0, $driver->method_calls );
 		$this->assertNull( $this->repo->by_id( $m->id )?->ssl_mutation_token );
 	}
@@ -1335,7 +1510,7 @@ final class MethodChangeTest extends WP_UnitTestCase {
 			$this->proof( DnsOutcome::MATCH )
 		)->change( $this->mapping(), 'carrier-pigeon' );
 
-		$this->assertInstanceOf( MutationRefusal::class, $result );
+		$this->assertSame( MutationDisposition::REFUSED, $result->disposition );
 	}
 
 	public function test_a_failed_fresh_proof_refuses_and_releases(): void {
@@ -1344,7 +1519,7 @@ final class MethodChangeTest extends WP_UnitTestCase {
 
 		$result = MethodChangeService::for_tests( $driver, $this->proof( DnsOutcome::NO_RECORD ) )->change( $m, 'http' );
 
-		$this->assertInstanceOf( MutationRefusal::class, $result );
+		$this->assertSame( MutationDisposition::REFUSED, $result->disposition );
 		$this->assertSame( 0, $driver->method_calls );
 		$this->assertNull( $this->repo->by_id( $m->id )?->ssl_mutation_token );
 	}
@@ -1356,8 +1531,30 @@ final class MethodChangeTest extends WP_UnitTestCase {
 			$this->proof( DnsOutcome::MATCH )
 		)->change( $m, 'http' );
 
-		$this->assertInstanceOf( MutationRefusal::class, $result );
-		$this->assertSame( 'no_ownership_authority', $result->precondition );
+		$this->assertSame( MutationDisposition::REFUSED, $result->disposition );
+		$this->assertSame( 'no_ownership_authority', $result->refusal?->precondition );
+	}
+
+	public function test_a_confirmed_change_reports_a_committed_result(): void {
+		$result = MethodChangeService::for_tests(
+			RecordingDriver::confirming_method( 'http' ),
+			$this->proof( DnsOutcome::MATCH )
+		)->change( $this->mapping(), 'http' );
+
+		$this->assertSame( MutationDisposition::COMMITTED, $result->disposition );
+	}
+
+	public function test_an_unconfirmed_change_is_reported_as_ambiguous(): void {
+		$result = MethodChangeService::for_tests(
+			RecordingDriver::confirming_method( 'txt' ),
+			$this->proof( DnsOutcome::MATCH )
+		)->change( $this->mapping(), 'http' );
+
+		$this->assertSame(
+			MutationDisposition::AMBIGUOUS_RETAINED,
+			$result->disposition,
+			'the provider did not do what was asked; that is not success'
+		);
 	}
 
 	public function test_a_fenced_worker_does_not_persist_the_method(): void {
@@ -1376,10 +1573,14 @@ final class MethodChangeTest extends WP_UnitTestCase {
 			}
 		);
 
-		MethodChangeService::for_tests( RecordingDriver::confirming_method( 'http' ), $this->proof( DnsOutcome::MATCH ) )
-			->change( $m, 'http' );
+		$result = MethodChangeService::for_tests(
+			RecordingDriver::confirming_method( 'http' ),
+			$this->proof( DnsOutcome::MATCH )
+		)->change( $m, 'http' );
 
 		$this->assertSame( 'txt', $this->repo->by_id( $m->id )?->ssl_method );
+		$this->assertSame( MutationDisposition::FENCED, $result->disposition );
+		$this->assertNull( $result->status );
 
 		remove_all_actions( 'pd_test_after_provider_call' );
 	}
@@ -1413,7 +1614,6 @@ final class MethodChangeAuthorizer {
 
 	public function __construct(
 		private readonly MappingRepository $repo,
-		private readonly SslDriverRegistry $registry,
 		private readonly FreshProof $proof,
 		private readonly MutationLease $lease,
 		private readonly Clock $clock
@@ -1429,7 +1629,6 @@ final class MethodChangeAuthorizer {
 
 		$window = AuthorizerSupport::open_window(
 			$this->repo,
-			$this->registry,
 			$this->lease,
 			$mapping,
 			MutationOperation::CHANGE_METHOD
@@ -1506,16 +1705,19 @@ declare( strict_types = 1 );
 namespace PostDomain\Ssl;
 
 use PostDomain\Contracts\Clock;
+use PostDomain\Contracts\MappingRepository;
 use PostDomain\Contracts\SslDriver;
 use PostDomain\Mapping\DbRepository;
 use PostDomain\Mapping\EventLog;
 use PostDomain\Mapping\Mapping;
+use PostDomain\Support\AtomicTransition;
 use PostDomain\Support\SystemClock;
 use PostDomain\Verification\FreshProof;
 
 final class MethodChangeService {
 
 	public function __construct(
+		private readonly MappingRepository $repo,
 		private readonly MethodChangeAuthorizer $authorizer,
 		private readonly MutationLease $lease,
 		private readonly MutationGate $gate,
@@ -1523,26 +1725,37 @@ final class MethodChangeService {
 	) {}
 
 	public static function for_tests( SslDriver $driver, FreshProof $proof ): self {
-		$clock    = new SystemClock();
-		$lease    = new MutationLease( $clock );
-		$repo     = new DbRepository();
-		$registry = new SslDriverRegistry( new NullDriver() );
-		$registry->register( $driver );
+		$clock = new SystemClock();
+		$lease = new MutationLease( $clock );
+		$repo  = new DbRepository();
+
+		// Production resolves drivers through DriverFactory, so tests install
+		// theirs the same way a site would rather than injecting a registry.
+		add_filter(
+			'pd_ssl_drivers',
+			static function ( array $drivers ) use ( $driver ): array {
+				$drivers[] = $driver;
+
+				return $drivers;
+			}
+		);
+		update_option( 'pd_settings', array( 'ssl_driver' => $driver->id() ), false );
+		DriverFactory::reset();
 
 		return new self(
-			new MethodChangeAuthorizer( $repo, $registry, $proof, $lease, $clock ),
+			$repo,
+			new MethodChangeAuthorizer( $repo, $proof, $lease, $clock ),
 			$lease,
 			new MutationGate( $lease, $clock ),
 			$clock
 		);
 	}
 
-	/** @return SslStatus|MutationRefusal */
-	public function change( Mapping $mapping, string $method ) {
+	public function change( Mapping $mapping, string $method ): MutationResult {
 		$authorized = $this->authorizer->authorize( $mapping, $method );
 
 		if ( $authorized instanceof MutationRefusal ) {
-			return $authorized;
+			return MutationResult::refused( $authorized );
 		}
 
 		$gated = $this->gate->execute(
@@ -1553,43 +1766,51 @@ final class MethodChangeService {
 		);
 
 		if ( $gated instanceof MutationRefusal ) {
-			return $gated;
+			return MutationResult::refused( $gated );
 		}
 
 		do_action( 'pd_test_after_provider_call' );
 
 		/** @var SslStatus $status */
-		$status = $gated->result;
+		$status    = $gated->result;
+		$confirmed = $status->confirmed_method === $method;
 
 		// Persist only what the provider's own re-read confirms.
-		$outcome = $status->confirmed_method === $method
+		$outcome = $confirmed
 			? LeaseOutcome::method_confirmed( $method )
 			: LeaseOutcome::checked();
 
-		$applied = $this->lease->finalize(
-			$authorized['mapping']->id,
-			$gated->in_flight_revision,
-			$gated->lease_token,
-			MutationKind::METHOD,
-			MutationPhase::IN_FLIGHT,
-			$outcome
+		$mapping_id = $authorized['mapping']->id;
+
+		$applied = AtomicTransition::commit(
+			fn (): bool => $this->lease->finalize(
+				$mapping_id,
+				$gated->in_flight_revision,
+				$gated->lease_token,
+				MutationKind::METHOD,
+				MutationPhase::IN_FLIGHT,
+				$outcome
+			),
+			fn (): bool => EventLog::record(
+				$mapping_id,
+				$authorized['mapping']->host,
+				'ssl',
+				$authorized['mapping']->ssl_method,
+				$status->confirmed_method,
+				'admin:' . get_current_user_id(),
+				array( 'requested' => $method, 'confirmed' => $status->confirmed_method )
+			)
 		);
 
 		if ( ! $applied ) {
-			return $status;
+			return MutationResult::lost( $this->repo->by_id( $mapping_id ), $gated->lease_token );
 		}
 
-		EventLog::record(
-			$authorized['mapping']->id,
-			$authorized['mapping']->host,
-			'ssl',
-			$authorized['mapping']->ssl_method,
-			$status->confirmed_method,
-			'admin:' . get_current_user_id(),
-			array( 'requested' => $method, 'confirmed' => $status->confirmed_method )
-		);
-
-		return $status;
+		// The lease released cleanly, but the provider did not confirm the change
+		// it was asked for. That is not a completed method change.
+		return $confirmed
+			? MutationResult::committed( $status, 'method_changed' )
+			: MutationResult::ambiguous( 'the provider did not confirm the requested method' );
 	}
 }
 ```
@@ -1597,7 +1818,7 @@ final class MethodChangeService {
 - [ ] **Step 4: Run the test to verify it passes**
 
 Run: `composer test:integration -- --filter MethodChangeTest`
-Expected: PASS — 7 tests
+Expected: PASS — 9 tests
 
 - [ ] **Step 5: Commit**
 
@@ -1814,8 +2035,59 @@ final class DeletionServiceTest extends WP_UnitTestCase {
 
 		$this->assertSame( 'fenced', $outcome );
 		$this->assertNotNull( $this->repo->by_id( $m->id ), 'recovery owns this row now' );
+		$this->assertSame(
+			array(),
+			array_filter(
+				EventLog::for_domain( $m->id ),
+				static fn( array $e ): bool => 'deleted' === $e['to_state']
+			),
+			'no deletion event for a deletion that did not happen'
+		);
 
 		remove_all_actions( 'pd_test_after_provider_call' );
+	}
+
+	public function test_a_confirmed_removal_records_its_event_only_with_the_delete(): void {
+		$m       = $this->owned();
+		$service = DeletionService::for_tests( RecordingDriver::removing( RemovalOutcome::REMOVED ), $this->proof( DnsOutcome::MATCH ) );
+
+		$service->request( $m );
+		$service->process( $this->repo->by_id( $m->id ) );
+
+		$deleted = array_filter(
+			EventLog::for_domain( $m->id ),
+			static fn( array $e ): bool => 'deleted' === $e['to_state']
+		);
+
+		$this->assertCount( 1, $deleted );
+		$this->assertSame( 'mapped.test', reset( $deleted )['host'], 'the host snapshot outlives the row' );
+	}
+
+	public function test_a_local_delete_that_loses_its_cas_records_nothing(): void {
+		global $wpdb;
+
+		$m = $this->repo->save(
+			new Mapping(
+				0, 'plain.test', null, self::factory()->post->create(), 1,
+				VerificationState::VERIFIED, ActivationState::ACTIVE, SslState::NONE,
+				null, str_repeat( 'e', 32 ), '_post-domain-challenge'
+			)
+		);
+
+		$stale = $this->repo->by_id( $m->id );
+
+		// Someone bumps the revision between our read and our acquire.
+		$wpdb->update( // phpcs:ignore WordPress.DB
+			Schema::domains_table(),
+			array( 'revision' => $stale->revision + 3 ),
+			array( 'id' => $m->id )
+		);
+
+		$service = DeletionService::for_tests( new NullDriver(), $this->proof( DnsOutcome::MATCH ) );
+
+		$this->assertFalse( $service->request( $stale ) );
+		$this->assertNotNull( $this->repo->by_id( $m->id ) );
+		$this->assertSame( array(), EventLog::for_domain( $m->id ) );
 	}
 
 	public function test_a_mapping_with_no_provider_resource_deletes_under_its_own_lease(): void {
@@ -1914,6 +2186,7 @@ namespace PostDomain\Ssl;
 
 use PostDomain\Mapping\EventLog;
 use PostDomain\Mapping\Mapping;
+use PostDomain\Support\AtomicTransition;
 use PostDomain\Support\SystemClock;
 
 /**
@@ -1931,12 +2204,29 @@ final class ForceLocalDelete {
 			return false;
 		}
 
-		$deleted = $lease->delete_row(
-			$mapping->id,
-			$held['revision'],
-			$held['token'],
-			MutationKind::REMOVE,
-			MutationPhase::RESERVED
+		// The host snapshot is captured before the row can vanish, and the event
+		// is written inside the same transaction as the delete.
+		$host  = $mapping->host;
+		$id    = $mapping->id;
+		$actor = 'admin:' . get_current_user_id();
+
+		$deleted = AtomicTransition::commit(
+			static fn (): bool => $lease->delete_row(
+				$id,
+				$held['revision'],
+				$held['token'],
+				MutationKind::REMOVE,
+				MutationPhase::RESERVED
+			),
+			static fn (): bool => EventLog::record(
+				$id,
+				$host,
+				'ssl',
+				null,
+				'force_deleted',
+				$actor,
+				array( 'note' => 'provider_resource_may_remain' )
+			)
 		);
 
 		if ( ! $deleted ) {
@@ -1944,16 +2234,6 @@ final class ForceLocalDelete {
 
 			return false;
 		}
-
-		EventLog::record(
-			$mapping->id,
-			$mapping->host,
-			'ssl',
-			null,
-			'force_deleted',
-			'admin:' . get_current_user_id(),
-			array( 'note' => 'provider_resource_may_remain' )
-		);
 
 		return true;
 	}
@@ -1976,6 +2256,7 @@ use PostDomain\Mapping\DbRepository;
 use PostDomain\Mapping\EventLog;
 use PostDomain\Mapping\Mapping;
 use PostDomain\Mapping\SslState;
+use PostDomain\Support\AtomicTransition;
 use PostDomain\Support\Schema;
 use PostDomain\Support\SystemClock;
 use PostDomain\Verification\FreshProof;
@@ -1991,15 +2272,26 @@ final class DeletionService {
 	) {}
 
 	public static function for_tests( SslDriver $driver, FreshProof $proof ): self {
-		$clock    = new SystemClock();
-		$lease    = new MutationLease( $clock );
-		$repo     = new DbRepository();
-		$registry = new SslDriverRegistry( new NullDriver() );
-		$registry->register( $driver );
+		$clock = new SystemClock();
+		$lease = new MutationLease( $clock );
+		$repo  = new DbRepository();
+
+		// Production resolves drivers through DriverFactory, so tests install
+		// theirs the same way a site would rather than injecting a registry.
+		add_filter(
+			'pd_ssl_drivers',
+			static function ( array $drivers ) use ( $driver ): array {
+				$drivers[] = $driver;
+
+				return $drivers;
+			}
+		);
+		update_option( 'pd_settings', array( 'ssl_driver' => $driver->id() ), false );
+		DriverFactory::reset();
 
 		return new self(
 			$repo,
-			new DeletionAuthorizer( $repo, $registry, $proof, $lease, $clock ),
+			new DeletionAuthorizer( $repo, $proof, $lease, $clock ),
 			$lease,
 			new MutationGate( $lease, $clock ),
 			$clock
@@ -2062,43 +2354,62 @@ final class DeletionService {
 		$result = $gated->result;
 
 		if ( RemovalOutcome::REMOVED === $result->outcome ) {
-			// Record the event first: the row, and its host, are about to vanish.
-			EventLog::record(
-				$mapping->id,
-				$mapping->host,
-				'ssl',
-				$mapping->ssl_state->value,
-				'deleted',
-				'cron',
-				array( 'cleanup' => 'confirmed' )
+			// The host is snapshotted now because the row is about to vanish, but
+			// the event is written inside the delete's own transaction — never
+			// before it. A fenced worker must leave no record of a deletion it
+			// did not perform, and must never delete a row recovery now owns.
+			$host  = $mapping->host;
+			$id    = $mapping->id;
+			$from  = $mapping->ssl_state->value;
+			$lease = $this->lease;
+
+			$deleted = AtomicTransition::commit(
+				static fn (): bool => $lease->delete_row(
+					$id,
+					$gated->in_flight_revision,
+					$gated->lease_token,
+					MutationKind::REMOVE,
+					MutationPhase::IN_FLIGHT
+				),
+				static fn (): bool => EventLog::record(
+					$id,
+					$host,
+					'ssl',
+					$from,
+					'deleted',
+					'cron',
+					array( 'cleanup' => 'confirmed' )
+				)
 			);
 
-			$deleted = $this->lease->delete_row(
-				$mapping->id,
-				$gated->in_flight_revision,
-				$gated->lease_token,
-				MutationKind::REMOVE,
-				MutationPhase::IN_FLIGHT
-			);
-
-			// A fenced worker must never delete a row recovery now owns.
 			return $deleted ? 'removed' : 'fenced';
 		}
 
 		$outcome = RemovalOutcome::FAILED === $result->outcome
 			? LeaseOutcome::attempted(
 				$this->attempts( $mapping ) + 1,
-				TimingPolicy::recovery_backoff( $this->attempts( $mapping ) )
+				TimingPolicy::attempt_backoff( $this->attempts( $mapping ) )
 			)
 			: LeaseOutcome::checked();
 
-		$applied = $this->lease->finalize(
-			$mapping->id,
-			$gated->in_flight_revision,
-			$gated->lease_token,
-			MutationKind::REMOVE,
-			MutationPhase::IN_FLIGHT,
-			$outcome
+		$applied = AtomicTransition::commit(
+			fn (): bool => $this->lease->finalize(
+				$mapping->id,
+				$gated->in_flight_revision,
+				$gated->lease_token,
+				MutationKind::REMOVE,
+				MutationPhase::IN_FLIGHT,
+				$outcome
+			),
+			fn (): bool => EventLog::record(
+				$mapping->id,
+				$mapping->host,
+				'ssl',
+				$mapping->ssl_state->value,
+				'removal_' . $result->outcome->value,
+				'cron',
+				array( 'cleanup' => $result->outcome->value )
+			)
 		);
 
 		if ( ! $applied ) {
@@ -2116,22 +2427,29 @@ final class DeletionService {
 			return false;
 		}
 
-		EventLog::record(
-			$mapping->id,
-			$mapping->host,
-			'ssl',
-			$mapping->ssl_state->value,
-			'deleted',
-			'admin:' . get_current_user_id(),
-			array( 'cleanup' => 'no_provider_resource' )
-		);
+		$id    = $mapping->id;
+		$host  = $mapping->host;
+		$from  = $mapping->ssl_state->value;
+		$actor = 'admin:' . get_current_user_id();
+		$lease = $this->lease;
 
-		$deleted = $this->lease->delete_row(
-			$mapping->id,
-			$held['revision'],
-			$held['token'],
-			MutationKind::REMOVE,
-			MutationPhase::RESERVED
+		$deleted = AtomicTransition::commit(
+			static fn (): bool => $lease->delete_row(
+				$id,
+				$held['revision'],
+				$held['token'],
+				MutationKind::REMOVE,
+				MutationPhase::RESERVED
+			),
+			static fn (): bool => EventLog::record(
+				$id,
+				$host,
+				'ssl',
+				$from,
+				'deleted',
+				$actor,
+				array( 'cleanup' => 'no_provider_resource' )
+			)
 		);
 
 		if ( ! $deleted ) {
@@ -2152,17 +2470,22 @@ final class DeletionService {
 		);
 	}
 
-	private function bump_attempts( Mapping $mapping ): void {
+	/** @return bool True only when exactly one row was counted. */
+	private function bump_attempts( Mapping $mapping ): bool {
 		global $wpdb;
 
 		$table = Schema::domains_table();
 
-		$wpdb->query( // phpcs:ignore WordPress.DB
+		// Unleased and at the revision we read: a refusal that races a real
+		// mutation must not inflate that mutation's attempt counter.
+		return 1 === $wpdb->query( // phpcs:ignore WordPress.DB
 			$wpdb->prepare(
-				"UPDATE {$table} SET deletion_attempts = deletion_attempts + 1, updated_at = %s
-				  WHERE id = %d AND ssl_mutation_token IS NULL",
+				"UPDATE {$table}
+				    SET deletion_attempts = deletion_attempts + 1, revision = revision + 1, updated_at = %s
+				  WHERE id = %d AND revision = %d AND ssl_mutation_token IS NULL",
 				$this->clock->mysql(),
-				$mapping->id
+				$mapping->id,
+				$mapping->revision
 			)
 		);
 	}
@@ -2172,7 +2495,7 @@ final class DeletionService {
 - [ ] **Step 4: Run the test to verify it passes**
 
 Run: `composer test:integration -- --filter DeletionServiceTest`
-Expected: PASS — 23 tests (including the two six-case lease-state providers)
+Expected: PASS — 26 tests (including the two six-case lease-state providers)
 
 - [ ] **Step 5: Commit**
 
@@ -2195,11 +2518,11 @@ resource still takes a lease before deleting, and a fenced worker returns
 - Test: `tests/integration/Ssl/DriverRecoveryResolverTest.php`, `tests/integration/Ssl/ReconcilerTest.php`
 
 **Interfaces:**
-- Consumes: `RecoveryResolver`, `LeaseRecovery`, `CreateRecovery`, `SslDriverRegistry`.
+- Consumes: `RecoveryResolver`, `LeaseRecovery`, `CreateRecovery`, `DriverFactory` (Plan 07); `AtomicTransition` (Plan 02).
 - Produces:
-  - `PostDomain\Ssl\DriverRecoveryResolver::__construct( SslDriverRegistry $registry )` implementing `RecoveryResolver` and dispatching by `MutationKind`.
-  - `PostDomain\Ssl\Reconciler::run( SslDriver $driver, Mapping[] $mappings ): array{updated: int, divergences: int}`.
-  - `Plugin::sweep_ssl(): void` wiring recovery and reconciliation.
+  - `PostDomain\Ssl\DriverRecoveryResolver` implementing `RecoveryResolver`, dispatching by `MutationKind` and resolving its driver through `DriverFactory`.
+  - `PostDomain\Ssl\Reconciler::run( Mapping[] $mappings ): array{updated: int, divergences: int, skipped: int}` — groups mappings by their resolved driver, so a site running more than one provider reconciles correctly.
+  - `Plugin::sweep_ssl(): void` wiring recovery and reconciliation through the same factory REST uses.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -2219,9 +2542,8 @@ use PostDomain\Mapping\SslState;
 use PostDomain\Mapping\VerificationState;
 use PostDomain\Ssl\DriverRecoveryResolver;
 use PostDomain\Ssl\Environment;
+use PostDomain\Ssl\DriverFactory;
 use PostDomain\Ssl\MutationKind;
-use PostDomain\Ssl\NullDriver;
-use PostDomain\Ssl\SslDriverRegistry;
 use PostDomain\Support\Schema;
 use PostDomain\Tests\Integration\Ssl\Fixtures\RecordingDriver;
 use WP_UnitTestCase;
@@ -2238,10 +2560,18 @@ final class DriverRecoveryResolverTest extends WP_UnitTestCase {
 	}
 
 	private function resolver( RecordingDriver $driver ): DriverRecoveryResolver {
-		$registry = new SslDriverRegistry( new NullDriver() );
-		$registry->register( $driver );
+		add_filter(
+			'pd_ssl_drivers',
+			static function ( array $drivers ) use ( $driver ): array {
+				$drivers[] = $driver;
 
-		return new DriverRecoveryResolver( $registry );
+				return $drivers;
+			}
+		);
+		update_option( 'pd_settings', array( 'ssl_driver' => $driver->id() ), false );
+		DriverFactory::reset();
+
+		return new DriverRecoveryResolver();
 	}
 
 	private function mapping( ?string $ref = 'ref-1' ): Mapping {
@@ -2355,6 +2685,7 @@ use PostDomain\Mapping\OwnershipOrigin;
 use PostDomain\Mapping\SslState;
 use PostDomain\Mapping\VerificationState;
 use PostDomain\Ssl\DriverCapabilities;
+use PostDomain\Ssl\DriverFactory;
 use PostDomain\Ssl\Environment;
 use PostDomain\Ssl\ExecutionPermit;
 use PostDomain\Ssl\IdentityResult;
@@ -2378,7 +2709,30 @@ final class ReconcilerTest extends WP_UnitTestCase {
 		parent::set_up();
 		Schema::install();
 		Environment::remember_primary_host();
+		delete_option( 'pd_settings' );
+		DriverFactory::reset();
 		$this->repo = new DbRepository();
+	}
+
+	public function tear_down(): void {
+		remove_all_filters( 'pd_ssl_drivers' );
+		delete_option( 'pd_settings' );
+		DriverFactory::reset();
+		parent::tear_down();
+	}
+
+	/** Installs a driver the way a site would, through the one factory. */
+	private function install( SslDriver $driver ): void {
+		add_filter(
+			'pd_ssl_drivers',
+			static function ( array $drivers ) use ( $driver ): array {
+				$drivers[] = $driver;
+
+				return $drivers;
+			}
+		);
+		update_option( 'pd_settings', array( 'ssl_driver' => $driver->id() ), false );
+		DriverFactory::reset();
 	}
 
 	/** @param array<string, SslStatus> $statuses */
@@ -2463,7 +2817,8 @@ final class ReconcilerTest extends WP_UnitTestCase {
 		$m      = $this->mapping( SslState::PENDING_VALIDATION );
 		$driver = $this->driver( array( 'mapped.test' => new SslStatus( SslState::ACTIVE, 'ref-1' ) ), true );
 
-		Reconciler::run( $driver, array( $m ) );
+		$this->install( $driver );
+		Reconciler::run( array( $m ) );
 
 		$this->assertSame( SslState::ACTIVE, $this->repo->by_id( $m->id )?->ssl_state );
 	}
@@ -2471,7 +2826,8 @@ final class ReconcilerTest extends WP_UnitTestCase {
 	public function test_an_incomplete_snapshot_never_infers_a_missing_resource(): void {
 		$m = $this->mapping( SslState::ACTIVE );
 
-		Reconciler::run( $this->driver( array(), false ), array( $m ) );
+		$this->install( $this->driver( array(), false ) );
+		Reconciler::run( array( $m ) );
 
 		$this->assertSame( SslState::ACTIVE, $this->repo->by_id( $m->id )?->ssl_state );
 	}
@@ -2483,7 +2839,8 @@ final class ReconcilerTest extends WP_UnitTestCase {
 			true
 		);
 
-		Reconciler::run( $driver, array( $m ) );
+		$this->install( $driver );
+		Reconciler::run( array( $m ) );
 
 		$this->assertSame( SslState::ACTIVE, $this->repo->by_id( $m->id )?->ssl_state );
 	}
@@ -2495,7 +2852,8 @@ final class ReconcilerTest extends WP_UnitTestCase {
 			true
 		);
 
-		$result = Reconciler::run( $driver, array( $m ) );
+		$this->install( $driver );
+		$result = Reconciler::run( array( $m ) );
 
 		$this->assertSame( 'txt', $this->repo->by_id( $m->id )?->ssl_method );
 		$this->assertGreaterThan( 0, $result['divergences'] );
@@ -2512,12 +2870,91 @@ final class ReconcilerTest extends WP_UnitTestCase {
 			array( 'id' => $m->id )
 		);
 
-		Reconciler::run(
-			$this->driver( array( 'mapped.test' => new SslStatus( SslState::ACTIVE, 'ref-1' ) ), true ),
-			array( $this->repo->by_id( $m->id ) )
-		);
+		$this->install( $this->driver( array( 'mapped.test' => new SslStatus( SslState::ACTIVE, 'ref-1' ) ), true ) );
+		Reconciler::run( array( $this->repo->by_id( $m->id ) ) );
 
 		$this->assertNull( $this->repo->by_id( $m->id )?->ssl_ownership_origin );
+	}
+
+	public function test_a_revision_race_is_not_counted_as_an_update(): void {
+		global $wpdb;
+
+		$m = $this->mapping( SslState::PENDING_VALIDATION );
+		$this->install( $this->driver( array( 'mapped.test' => new SslStatus( SslState::ACTIVE, 'ref-1' ) ), true ) );
+
+		// The snapshot was read at revision N; someone else has since moved on.
+		$stale = $this->repo->by_id( $m->id );
+		$wpdb->update( // phpcs:ignore WordPress.DB
+			Schema::domains_table(),
+			array( 'revision' => $stale->revision + 7 ),
+			array( 'id' => $m->id )
+		);
+
+		$result = Reconciler::run( array( $stale ) );
+
+		$this->assertSame( 0, $result['updated'], 'a zero-row write is not an update' );
+		$this->assertSame( 1, $result['skipped'] );
+		$this->assertSame( SslState::PENDING_VALIDATION, $this->repo->by_id( $m->id )?->ssl_state );
+	}
+
+	public function test_a_lease_acquired_after_the_snapshot_blocks_the_write(): void {
+		global $wpdb;
+
+		$m     = $this->mapping( SslState::PENDING_VALIDATION );
+		$stale = $this->repo->by_id( $m->id );
+
+		$this->install( $this->driver( array( 'mapped.test' => new SslStatus( SslState::ACTIVE, 'ref-1' ) ), true ) );
+
+		$wpdb->update( // phpcs:ignore WordPress.DB
+			Schema::domains_table(),
+			array(
+				'ssl_mutation_token'      => str_repeat( '8', 32 ),
+				'ssl_mutation_kind'       => MutationKind::CREATE->value,
+				'ssl_mutation_phase'      => 'in_flight',
+				'ssl_mutation_expires_at' => gmdate( 'Y-m-d H:i:s', time() + 600 ),
+			),
+			array( 'id' => $m->id )
+		);
+
+		$result = Reconciler::run( array( $stale ) );
+
+		$this->assertSame( 0, $result['updated'] );
+		$this->assertSame( SslState::PENDING_VALIDATION, $this->repo->by_id( $m->id )?->ssl_state );
+	}
+
+	public function test_a_discarded_update_records_no_transition_event(): void {
+		global $wpdb;
+
+		$m     = $this->mapping( SslState::PENDING_VALIDATION );
+		$stale = $this->repo->by_id( $m->id );
+
+		$this->install( $this->driver( array( 'mapped.test' => new SslStatus( SslState::ACTIVE, 'ref-1' ) ), true ) );
+
+		$wpdb->update( // phpcs:ignore WordPress.DB
+			Schema::domains_table(),
+			array( 'revision' => $stale->revision + 7 ),
+			array( 'id' => $m->id )
+		);
+
+		Reconciler::run( array( $stale ) );
+
+		$this->assertSame(
+			array(),
+			array_filter(
+				EventLog::for_domain( $m->id ),
+				static fn( array $e ): bool => 'active' === $e['to_state']
+			)
+		);
+	}
+
+	public function test_a_mapping_whose_driver_is_unavailable_is_skipped(): void {
+		$m = $this->mapping( SslState::PENDING_VALIDATION );
+
+		// No driver installed at all: the stored provider resolves to nothing.
+		$result = Reconciler::run( array( $this->repo->by_id( $m->id ) ) );
+
+		$this->assertSame( 0, $result['updated'] );
+		$this->assertSame( 1, $result['skipped'] );
 	}
 
 	public function test_leased_rows_are_skipped(): void {
@@ -2535,12 +2972,11 @@ final class ReconcilerTest extends WP_UnitTestCase {
 			array( 'id' => $m->id )
 		);
 
-		Reconciler::run(
-			$this->driver( array( 'mapped.test' => new SslStatus( SslState::ACTIVE, 'ref-1' ) ), true ),
-			array( $this->repo->by_id( $m->id ) )
-		);
+		$this->install( $this->driver( array( 'mapped.test' => new SslStatus( SslState::ACTIVE, 'ref-1' ) ), true ) );
+		$result = Reconciler::run( array( $this->repo->by_id( $m->id ) ) );
 
 		$this->assertSame( SslState::PENDING_VALIDATION, $this->repo->by_id( $m->id )?->ssl_state );
+		$this->assertSame( 1, $result['skipped'], 'a leased row is not even read' );
 	}
 }
 ```
@@ -2571,15 +3007,16 @@ use PostDomain\Verification\Challenge;
  */
 final class DriverRecoveryResolver implements RecoveryResolver {
 
-	public function __construct( private readonly SslDriverRegistry $registry ) {}
+	// No constructor: there is one production source of drivers and this is not
+	// a place that may disagree with it.
 
 	public function resolve( Mapping $mapping, MutationKind $kind, string $recovery_token ): RecoveryOutcome {
-		$driver = null === $mapping->ssl_provider
-			? $this->registry->default()
-			: $this->registry->get( $mapping->ssl_provider );
+		$driver = DriverFactory::for_mapping( $mapping );
 
-		if ( null === $driver ) {
-			return RecoveryOutcome::inconclusive( 'driver not registered' );
+		if ( $driver instanceof DriverUnavailable ) {
+			// Inconclusive, never conclusive: without the owning driver there is
+			// no way to learn what happened, and guessing would be worse.
+			return RecoveryOutcome::inconclusive( 'driver unavailable: ' . $driver->reason );
 		}
 
 		$name = Challenge::record_name( $mapping->challenge_label, $mapping->host );
@@ -2718,19 +3155,57 @@ final class Reconciler {
 
 	/**
 	 * @param Mapping[] $mappings
-	 * @return array{updated: int, divergences: int}
+	 * @return array{updated: int, divergences: int, skipped: int}
 	 */
-	public static function run( SslDriver $driver, array $mappings ): array {
+	public static function run( array $mappings ): array {
+		$totals = array( 'updated' => 0, 'divergences' => 0, 'skipped' => 0 );
+
+		/** @var array<string, array{driver: SslDriver, mappings: Mapping[]}> $groups */
+		$groups = array();
+
+		foreach ( $mappings as $mapping ) {
+			// A leased row belongs to whoever holds the lease. Reconciliation
+			// never writes through one, so it does not even read one here.
+			if ( null !== $mapping->ssl_mutation_token ) {
+				++$totals['skipped'];
+
+				continue;
+			}
+
+			$driver = DriverFactory::for_mapping( $mapping );
+
+			if ( $driver instanceof DriverUnavailable ) {
+				++$totals['skipped'];
+
+				continue;
+			}
+
+			$groups[ $driver->id() ]['driver']     = $driver;
+			$groups[ $driver->id() ]['mappings'][] = $mapping;
+		}
+
+		foreach ( $groups as $group ) {
+			$result = self::reconcile_group( $group['driver'], $group['mappings'] );
+
+			$totals['updated']     += $result['updated'];
+			$totals['divergences'] += $result['divergences'];
+			$totals['skipped']     += $result['skipped'];
+		}
+
+		return $totals;
+	}
+
+	/**
+	 * @param Mapping[] $mappings
+	 * @return array{updated: int, divergences: int, skipped: int}
+	 */
+	private static function reconcile_group( SslDriver $driver, array $mappings ): array {
 		global $wpdb;
 
 		$contexts = array();
 		$by_host  = array();
 
 		foreach ( $mappings as $mapping ) {
-			if ( null !== $mapping->ssl_mutation_token ) {
-				continue;
-			}
-
 			$name = Challenge::record_name( $mapping->challenge_label, $mapping->host );
 
 			if ( null === $name ) {
@@ -2746,12 +3221,13 @@ final class Reconciler {
 		}
 
 		if ( array() === $contexts ) {
-			return array( 'updated' => 0, 'divergences' => 0 );
+			return array( 'updated' => 0, 'divergences' => 0, 'skipped' => 0 );
 		}
 
 		$report      = $driver->reconcile( $contexts );
 		$updated     = 0;
 		$divergences = 0;
+		$skipped     = 0;
 
 		foreach ( $report->statuses as $host => $status ) {
 			$mapping = $by_host[ $host ] ?? null;
@@ -2763,6 +3239,8 @@ final class Reconciler {
 			if ( null !== $status->confirmed_method && $status->confirmed_method !== $mapping->ssl_method ) {
 				++$divergences;
 
+				// Reported, never patched: the local method is an operator
+				// decision, and this is a read.
 				EventLog::record(
 					$mapping->id,
 					$mapping->host,
@@ -2778,27 +3256,45 @@ final class Reconciler {
 				continue;
 			}
 
-			$wpdb->query( // phpcs:ignore WordPress.DB
-				$wpdb->prepare(
-					'UPDATE ' . Schema::domains_table()
-					. ' SET ssl_state = %s, ssl_checked_at = %s, revision = revision + 1, updated_at = %s'
-					. ' WHERE id = %d AND revision = %d AND ssl_mutation_token IS NULL',
-					$status->state->value,
-					gmdate( 'Y-m-d H:i:s' ),
-					gmdate( 'Y-m-d H:i:s' ),
+			// The CAS result decides whether this counts. A row whose revision
+			// moved, or which acquired a lease since the snapshot, was changed by
+			// someone with better information than a batch read.
+			$applied = AtomicTransition::commit(
+				static fn (): bool => 1 === $wpdb->query( // phpcs:ignore WordPress.DB
+					$wpdb->prepare(
+						'UPDATE ' . Schema::domains_table()
+						. ' SET ssl_state = %s, ssl_checked_at = %s, revision = revision + 1, updated_at = %s'
+						. ' WHERE id = %d AND revision = %d AND ssl_mutation_token IS NULL',
+						$status->state->value,
+						gmdate( 'Y-m-d H:i:s' ),
+						gmdate( 'Y-m-d H:i:s' ),
+						$mapping->id,
+						$mapping->revision
+					)
+				),
+				static fn (): bool => EventLog::record(
 					$mapping->id,
-					$mapping->revision
+					$mapping->host,
+					'ssl',
+					$mapping->ssl_state->value,
+					$status->state->value,
+					'cron',
+					array( 'source' => 'reconciliation' )
 				)
 			);
 
-			++$updated;
+			if ( $applied ) {
+				++$updated;
+			} else {
+				++$skipped;
+			}
 		}
 
 		if ( ! $report->snapshot_complete ) {
 			EventLog::record( 0, '', 'ssl', null, null, 'cron', array( 'snapshot_incomplete' => $report->incomplete_reason ) );
 		}
 
-		return array( 'updated' => $updated, 'divergences' => $divergences );
+		return array( 'updated' => $updated, 'divergences' => $divergences, 'skipped' => $skipped );
 	}
 }
 ```
@@ -2813,40 +3309,26 @@ and the method:
 
 ```php
 	public function sweep_ssl(): void {
-		$clock    = new \PostDomain\Support\SystemClock();
-		$lease    = new \PostDomain\Ssl\MutationLease( $clock );
-		$registry = $this->ssl_registry();
+		$clock = new \PostDomain\Support\SystemClock();
+		$lease = new \PostDomain\Ssl\MutationLease( $clock );
 
+		// No registry is built here. Cron resolves drivers through exactly the
+		// factory REST uses, so the two can never disagree about a row's owner.
 		$recovery = new \PostDomain\Ssl\LeaseRecovery( $lease, $this->repository, $clock );
-		$resolver = new \PostDomain\Ssl\DriverRecoveryResolver( $registry );
+		$resolver = new \PostDomain\Ssl\DriverRecoveryResolver();
 
 		foreach ( $recovery->due( 50 ) as $mapping ) {
 			$recovery->recover( $mapping, $resolver );
 		}
 
-		\PostDomain\Ssl\Reconciler::run( $registry->default(), $this->repository->all() );
-	}
-
-	public function ssl_registry(): \PostDomain\Ssl\SslDriverRegistry {
-		$registry = new \PostDomain\Ssl\SslDriverRegistry( new \PostDomain\Ssl\NullDriver() );
-
-		/** @var \PostDomain\Contracts\SslDriver[] $drivers */
-		$drivers = (array) apply_filters( 'pd_ssl_drivers', array() );
-
-		foreach ( $drivers as $driver ) {
-			if ( $driver instanceof \PostDomain\Contracts\SslDriver ) {
-				$registry->register( $driver );
-			}
-		}
-
-		return $registry;
+		\PostDomain\Ssl\Reconciler::run( $this->repository->all() );
 	}
 ```
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `composer test:integration -- --filter DriverRecoveryResolverTest && composer test:integration -- --filter ReconcilerTest`
-Expected: PASS — 9 and 6 tests
+Expected: PASS — 9 and 11 tests
 
 - [ ] **Step 5: Run the full suite**
 
@@ -2860,7 +3342,9 @@ git add src/Ssl/DriverRecoveryResolver.php src/Ssl/Reconciler.php src/Plugin.php
 git commit -m "Resolve fenced mutations by kind, reading only
 
 Recovery calls status() and identify() and nothing else; the reconciler adopts
-provider truth for state alone, never ownership and never a method."
+provider truth for state alone, never ownership and never a method. Both resolve
+their drivers through the same factory REST uses, and the reconciler counts an
+update only when its CAS actually affected a row."
 ```
 
 ---
@@ -2873,6 +3357,9 @@ composer lint && composer analyse && composer test && composer test:integration
 
 Plus: every authorizer's individual precondition failures prove zero mutating
 provider calls and a released reservation; the fencing tests prove a failed
-finalize writes nothing and deletes nothing; `DeletionServiceTest` proves
+finalize writes nothing, deletes nothing, records no success event, and returns
+`FENCED` rather than the provider's status; `DeletionServiceTest` proves
 force-local-delete and the no-provider local delete both refuse across all six
-lease phase-and-expiry states.
+lease phase-and-expiry states; `ReconcilerTest` proves a zero-row update is
+neither counted nor logged; and `Plugin::sweep_ssl()` builds no registry of its
+own.

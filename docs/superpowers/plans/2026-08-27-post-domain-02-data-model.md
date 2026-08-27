@@ -648,7 +648,12 @@ default label costs 23. The limit is structural rather than a runtime check."
 **Interfaces:**
 - Consumes: `Schema` (Task 2), the enums (Task 1).
 - Produces:
-  - `PostDomain\Mapping\Mapping` — readonly, with `int $id`, `string $host`, `?int $alias_of`, `?int $post_id`, `int $revision`, `VerificationState $verification_state`, `ActivationState $activation_state`, `SslState $ssl_state`, `?string $integrity_error`, `string $challenge`, `string $challenge_label`, `?OwnershipOrigin $ssl_ownership_origin`, `?string $ssl_owner_installation_id`, `?string $ssl_provider`, `?string $ssl_ref`, `?string $ssl_method`, `?string $ssl_mutation_token`, `?MutationKind $ssl_mutation_kind`, `?MutationPhase $ssl_mutation_phase`, `?string $ssl_mutation_expires_at`.
+  - `PostDomain\Mapping\Mapping` — readonly, with `int $id`, `string $host`, `?int $alias_of`, `?int $post_id`, `int $revision`, `VerificationState $verification_state`, `ActivationState $activation_state`, `SslState $ssl_state`, `?string $integrity_error`, `string $challenge`, `string $challenge_label`, `?OwnershipOrigin $ssl_ownership_origin`, `?string $ssl_owner_installation_id`, `?string $ssl_provider`, `?string $ssl_ref`, `?string $ssl_method`, `?string $ssl_mutation_token`, `?MutationKind $ssl_mutation_kind`, `?MutationPhase $ssl_mutation_phase`, `?string $ssl_mutation_expires_at`, `?string $ssl_next_attempt_at`, `int $ssl_transient_count`.
+
+  `ssl_next_attempt_at` and `ssl_transient_count` are **readable but not
+  writable through `save()`** — they are scheduling state owned by the
+  verification and lease CAS writers. A `save()` that carried them would let an
+  ordinary update silently reset a backoff someone else is honouring.
   - `PostDomain\Contracts\MappingRepository` with `by_host( string $ascii_host ): ?Mapping`, `by_id( int $id ): ?Mapping`, `all( array $args = array() ): array`, `save( Mapping $m ): Mapping`, `delete( int $id ): void`.
   - `PostDomain\Mapping\DbRepository` implementing it.
 
@@ -775,7 +780,9 @@ final class Mapping {
 		public readonly ?string $ssl_mutation_token = null,
 		public readonly ?MutationKind $ssl_mutation_kind = null,
 		public readonly ?MutationPhase $ssl_mutation_phase = null,
-		public readonly ?string $ssl_mutation_expires_at = null
+		public readonly ?string $ssl_mutation_expires_at = null,
+		public readonly ?string $ssl_next_attempt_at = null,
+		public readonly int $ssl_transient_count = 0
 	) {}
 
 	/**
@@ -802,7 +809,9 @@ final class Mapping {
 			$row['ssl_mutation_token'],
 			null === $row['ssl_mutation_kind'] ? null : MutationKind::from( (string) $row['ssl_mutation_kind'] ),
 			null === $row['ssl_mutation_phase'] ? null : MutationPhase::from( (string) $row['ssl_mutation_phase'] ),
-			$row['ssl_mutation_expires_at']
+			$row['ssl_mutation_expires_at'],
+			$row['ssl_next_attempt_at'],
+			(int) ( $row['ssl_transient_count'] ?? 0 )
 		);
 	}
 
@@ -1175,6 +1184,9 @@ Replace `DbRepository::save()` with:
 			'updated_at'                => $now,
 		);
 
+		// ssl_next_attempt_at and ssl_transient_count are deliberately absent:
+		// they are scheduling state written only by the CAS that owns them.
+
 		if ( 0 === $m->id ) {
 			$data['revision']   = 1;
 			$data['created_at'] = $now;
@@ -1308,18 +1320,30 @@ invariants live in PHP at the only code that touches the table."
 
 ---
 
-### Task 5: The audit event log
+### Task 5: The audit event log and atomic state transitions
 
 **Files:**
-- Create: `src/Mapping/EventLog.php`
-- Test: `tests/integration/Mapping/EventLogTest.php`
+- Create: `src/Mapping/EventLog.php`, `src/Support/AtomicTransition.php`
+- Test: `tests/integration/Mapping/EventLogTest.php`, `tests/integration/Support/AtomicTransitionTest.php`
 
 **Interfaces:**
 - Consumes: `Schema` (Task 2).
-- Produces: `PostDomain\Mapping\EventLog::record( int $domain_id, string $host, string $type, ?string $from, ?string $to, ?string $actor, array $detail = array() ): void` and `::for_domain( int $domain_id ): array`, plus `::prune( int $retention_days ): int`.
+- Produces:
+  - `PostDomain\Mapping\EventLog::record( int $domain_id, string $host, string $type, ?string $from, ?string $to, ?string $actor, array $detail = array() ): bool` — **true only when the row was inserted** — plus `::for_domain( int $domain_id ): array` and `::prune( int $retention_days ): int`.
+  - `PostDomain\Support\AtomicTransition::is_transactional(): bool` and `::commit( callable $transition, callable $event ): bool`, where `$transition` is the owner-pinned CAS returning `true` on exactly one affected row and `$event` is a `callable(): bool` recording the event.
 
 Events are a support artifact. Nothing in authorization, routing, or state
 transition reads this table, which is what makes pruning always safe (spec §12.3).
+
+**Atomicity (spec §12.3).** When `pd_schema_engine` is InnoDB, a state change and
+its event row are written in **one transaction**: the CAS runs first, the event
+is inserted second, and the pair commits or rolls back together. On any other
+engine the transaction is skipped and the event is best-effort — attempted only
+**after** the CAS has already succeeded, never before, so a failed or fenced
+transition can never leave a success event behind.
+
+`AtomicTransition::commit()` is the single mechanism every later plan uses for
+this. Nothing in Plans 07–10 may pair a CAS with an event any other way.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1351,6 +1375,10 @@ final class EventLogTest extends WP_UnitTestCase {
 		$this->assertSame( 'verification', $events[0]['type'] );
 		$this->assertSame( 'example.test', $events[0]['host'] );
 		$this->assertSame( 'match', json_decode( (string) $events[0]['detail'], true )['outcome'] );
+	}
+
+	public function test_recording_reports_whether_the_row_was_inserted(): void {
+		$this->assertTrue( EventLog::record( 7, 'example.test', 'ssl', null, 'active', 'cron' ) );
 	}
 
 	public function test_the_host_snapshot_survives_the_row_it_describes(): void {
@@ -1439,10 +1467,10 @@ final class EventLog {
 		?string $to = null,
 		?string $actor = null,
 		array $detail = array()
-	): void {
+	): bool {
 		global $wpdb;
 
-		$wpdb->insert( // phpcs:ignore WordPress.DB
+		$inserted = $wpdb->insert( // phpcs:ignore WordPress.DB
 			Schema::events_table(),
 			array(
 				'domain_id'  => $domain_id,
@@ -1455,6 +1483,8 @@ final class EventLog {
 				'created_at' => gmdate( 'Y-m-d H:i:s' ),
 			)
 		);
+
+		return false !== $inserted;
 	}
 
 	/**
@@ -1487,20 +1517,220 @@ final class EventLog {
 }
 ```
 
+Create `src/Support/AtomicTransition.php`:
+
+```php
+<?php
+declare( strict_types = 1 );
+
+namespace PostDomain\Support;
+
+/**
+ * Pairs one state-changing CAS with its event row.
+ *
+ * On InnoDB the pair is one transaction: the CAS runs first, the event second,
+ * and either both land or neither does. On any other engine there is no
+ * transaction and the event is best-effort — but it is still attempted only
+ * after the CAS has succeeded, so a zero-row CAS never produces a success event.
+ *
+ * This is the only sanctioned way to write a transition and its event.
+ */
+final class AtomicTransition {
+
+	public static function is_transactional(): bool {
+		return 0 === strcasecmp( Schema::engine(), 'InnoDB' );
+	}
+
+	/**
+	 * @param callable(): bool $transition The owner-pinned CAS. True ⇒ exactly one row changed.
+	 * @param callable(): bool $event      Records the event. True ⇒ the row was inserted.
+	 * @return bool True only when the transition was applied and (on InnoDB) its event committed with it.
+	 */
+	public static function commit( callable $transition, callable $event ): bool {
+		global $wpdb;
+
+		if ( ! self::is_transactional() ) {
+			if ( ! $transition() ) {
+				return false;
+			}
+
+			// Best-effort, and only ever after the fact.
+			$event();
+
+			return true;
+		}
+
+		$wpdb->query( 'START TRANSACTION' ); // phpcs:ignore WordPress.DB
+
+		try {
+			if ( ! $transition() ) {
+				$wpdb->query( 'ROLLBACK' ); // phpcs:ignore WordPress.DB
+
+				return false;
+			}
+
+			if ( ! $event() ) {
+				$wpdb->query( 'ROLLBACK' ); // phpcs:ignore WordPress.DB
+
+				return false;
+			}
+		} catch ( \Throwable $e ) {
+			$wpdb->query( 'ROLLBACK' ); // phpcs:ignore WordPress.DB
+
+			throw $e;
+		}
+
+		$wpdb->query( 'COMMIT' ); // phpcs:ignore WordPress.DB
+
+		return true;
+	}
+}
+```
+
 - [ ] **Step 4: Run the test to verify it passes**
 
 Run: `composer test:integration -- --filter EventLogTest`
-Expected: PASS — 4 tests
+Expected: PASS — 5 tests
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 5: Write the failing test for atomicity**
+
+Create `tests/integration/Support/AtomicTransitionTest.php`:
+
+```php
+<?php
+declare( strict_types = 1 );
+
+namespace PostDomain\Tests\Integration\Support;
+
+use PostDomain\Mapping\EventLog;
+use PostDomain\Support\AtomicTransition;
+use PostDomain\Support\Schema;
+use WP_UnitTestCase;
+
+final class AtomicTransitionTest extends WP_UnitTestCase {
+
+	public function set_up(): void {
+		parent::set_up();
+		Schema::install();
+	}
+
+	public function tear_down(): void {
+		// Re-probe and restore the real engine after the overrides below.
+		delete_option( 'pd_schema_engine' );
+		Schema::install();
+		parent::tear_down();
+	}
+
+	private function as_engine( string $engine ): void {
+		update_option( 'pd_schema_engine', $engine, false );
+	}
+
+	private function event( int $id ): callable {
+		return static fn(): bool => EventLog::record( $id, 'example.test', 'ssl', null, 'active', 'cron' );
+	}
+
+	public function test_innodb_is_detected_as_transactional(): void {
+		$this->as_engine( 'InnoDB' );
+
+		$this->assertTrue( AtomicTransition::is_transactional() );
+	}
+
+	public function test_myisam_is_not_transactional(): void {
+		$this->as_engine( 'MyISAM' );
+
+		$this->assertFalse( AtomicTransition::is_transactional() );
+	}
+
+	public function test_on_innodb_a_zero_row_cas_records_no_event(): void {
+		$this->as_engine( 'InnoDB' );
+
+		$this->assertFalse( AtomicTransition::commit( static fn(): bool => false, $this->event( 101 ) ) );
+		$this->assertCount( 0, EventLog::for_domain( 101 ) );
+	}
+
+	public function test_on_innodb_a_successful_pair_commits_together(): void {
+		$this->as_engine( 'InnoDB' );
+
+		$this->assertTrue( AtomicTransition::commit( static fn(): bool => true, $this->event( 102 ) ) );
+		$this->assertCount( 1, EventLog::for_domain( 102 ) );
+	}
+
+	public function test_on_innodb_a_failed_event_rolls_the_transition_back(): void {
+		global $wpdb;
+
+		$this->as_engine( 'InnoDB' );
+
+		$applied = AtomicTransition::commit(
+			static function () use ( $wpdb ): bool {
+				$wpdb->insert( // phpcs:ignore WordPress.DB
+					Schema::events_table(),
+					array(
+						'domain_id'  => 103,
+						'host'       => 'rolled-back.test',
+						'type'       => 'ssl',
+						'created_at' => gmdate( 'Y-m-d H:i:s' ),
+					)
+				);
+
+				return true;
+			},
+			static fn(): bool => false
+		);
+
+		$this->assertFalse( $applied );
+		$this->assertCount( 0, EventLog::for_domain( 103 ), 'the transition rolled back with its event' );
+	}
+
+	public function test_on_innodb_a_throwing_transition_rolls_back_and_rethrows(): void {
+		$this->as_engine( 'InnoDB' );
+
+		$this->expectException( \RuntimeException::class );
+
+		try {
+			AtomicTransition::commit(
+				static function (): bool {
+					throw new \RuntimeException( 'boom' );
+				},
+				$this->event( 104 )
+			);
+		} finally {
+			$this->assertCount( 0, EventLog::for_domain( 104 ) );
+		}
+	}
+
+	public function test_on_a_nontransactional_engine_a_zero_row_cas_still_records_no_event(): void {
+		$this->as_engine( 'MyISAM' );
+
+		$this->assertFalse( AtomicTransition::commit( static fn(): bool => false, $this->event( 105 ) ) );
+		$this->assertCount( 0, EventLog::for_domain( 105 ), 'the event is best-effort, never speculative' );
+	}
+
+	public function test_on_a_nontransactional_engine_a_failed_event_does_not_undo_the_transition(): void {
+		$this->as_engine( 'MyISAM' );
+
+		$this->assertTrue(
+			AtomicTransition::commit( static fn(): bool => true, static fn(): bool => false ),
+			'the log may lag or miss rows; the state change still stands'
+		);
+	}
+}
+```
+
+- [ ] **Step 6: Run it and verify it passes**
+
+Run: `composer test:integration -- --filter AtomicTransitionTest`
+Expected: PASS — 8 tests
+
+- [ ] **Step 7: Commit**
 
 ```bash
-git add src/Mapping/EventLog.php tests/integration/Mapping/EventLogTest.php
-git commit -m "Record an append-only audit log that nothing reads to decide
+git add src/Mapping/EventLog.php src/Support/AtomicTransition.php tests/integration/Mapping/EventLogTest.php tests/integration/Support/AtomicTransitionTest.php
+git commit -m "Write a state change and its event as one transaction on InnoDB
 
 The host snapshot exists because rows are eventually hard-deleted and the
-history has to stay readable afterwards. A test enforces that no other source
-file touches the table."
+history has to stay readable afterwards. On engines without transactions the
+event stays best-effort, but it is attempted only after the CAS succeeds, so a
+fenced worker can never leave a success event behind."
 ```
 
 ---
@@ -1713,13 +1943,15 @@ inherited."
 ### Task 7: Injected clock, scheduler, and HTTP client
 
 **Files:**
-- Create: `src/Contracts/Clock.php`, `src/Contracts/Scheduler.php`, `src/Contracts/HttpClient.php`, `src/Support/SystemClock.php`, `src/Support/WpCronScheduler.php`, `src/Support/WpHttpClient.php`, `src/Support/HttpResponse.php`
+- Create: `src/Contracts/Clock.php`, `src/Contracts/Scheduler.php`, `src/Contracts/HttpClient.php`, `src/Support/SystemClock.php`, `src/Support/WpCronScheduler.php`, `src/Support/WpHttpClient.php`, `src/Support/HttpResponse.php`, `tests/Fixtures/FrozenClock.php`
+- Modify: `composer.json` (`autoload-dev` PSR-4 entry for `PostDomain\Tests\Fixtures\`)
 - Test: `tests/unit/Support/SystemClockTest.php`, `tests/integration/Support/WpCronSchedulerTest.php`
 
 **Interfaces:**
 - Consumes: nothing.
 - Produces:
   - `PostDomain\Contracts\Clock::now(): \DateTimeImmutable` and `::mysql(): string` (UTC `Y-m-d H:i:s`).
+  - `PostDomain\Tests\Fixtures\FrozenClock` — a `Clock` the test moves deliberately, with `::set( \DateTimeImmutable $now ): void` and `::advance( int $seconds ): void`. Any plan that needs to make a backoff or a lease expiry come due uses this rather than sleeping.
   - `PostDomain\Contracts\Scheduler::schedule( string $hook, \DateTimeImmutable $at, array $args = array() ): void`, `::unschedule( string $hook, array $args = array() ): void`, `::next( string $hook, array $args = array() ): ?\DateTimeImmutable`.
   - `PostDomain\Contracts\HttpClient::request( string $method, string $url, array $opts = array() ): HttpResponse` where `HttpResponse` is readonly `int $status`, `array $headers`, `string $body`, `?string $error`.
 
@@ -1856,6 +2088,52 @@ final class SystemClock implements Clock {
 		return gmdate( 'Y-m-d H:i:s' );
 	}
 }
+```
+
+Create `tests/Fixtures/FrozenClock.php`, the shared test double every plan uses
+when it needs to move time deliberately:
+
+```php
+<?php
+declare( strict_types = 1 );
+
+namespace PostDomain\Tests\Fixtures;
+
+use PostDomain\Contracts\Clock;
+
+/** A clock the test moves on purpose. Never autoloaded into production code. */
+final class FrozenClock implements Clock {
+
+	private \DateTimeImmutable $now;
+
+	public function __construct( ?\DateTimeImmutable $now = null ) {
+		$this->now = $now ?? new \DateTimeImmutable( 'now', new \DateTimeZone( 'UTC' ) );
+	}
+
+	public function now(): \DateTimeImmutable {
+		return $this->now;
+	}
+
+	public function mysql(): string {
+		return $this->now->format( 'Y-m-d H:i:s' );
+	}
+
+	public function set( \DateTimeImmutable $now ): void {
+		$this->now = $now->setTimezone( new \DateTimeZone( 'UTC' ) );
+	}
+
+	public function advance( int $seconds ): void {
+		$this->set( $this->now->modify( "+{$seconds} seconds" ) );
+	}
+}
+```
+
+Register it in `composer.json`'s `autoload-dev`:
+
+```json
+		"psr-4": {
+			"PostDomain\\Tests\\Fixtures\\": "tests/Fixtures/"
+		}
 ```
 
 Create `src/Contracts/Scheduler.php`:

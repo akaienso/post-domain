@@ -48,21 +48,28 @@ without reading the next.
 Plans 03–05 and 06–09 are two independent tracks after 02. They may be executed
 in parallel by separate workers; 10 integrates both.
 
+**Two things cross every plan and are settled once, early.** `AtomicTransition`
+(Plan 02, Task 5) is the only sanctioned way to write a state change and its
+event; `DriverFactory` (Plan 07, Task 9) is the only production source of SSL
+drivers. Plan 09 adds Cloudflare to that factory's built-in list rather than
+constructing it anywhere of its own, so REST, cron, reconciliation, recovery,
+Admin, and CLI cannot end up with different registries.
+
 ## Specification coverage by plan
 
 | Plan | Spec sections |
 |---|---|
 | 01 | §1, §1.1, §1.2, §2, §2.1, §2.2, §3.1, §3.2, §3.3, §3.4, §3.5, §14.16 (host-level wildcard rejection), §18 (toolchain) |
-| 02 | §3.7, §12.1, §12.2 (columns), §12.3, §12.4, §12.5, §12.6 (columns + invariants only), §12.7, §18 (uninstall) |
+| 02 | §3.7, §12.1, §12.2 (columns), §12.3 (including the InnoDB transition-and-event transaction), §12.4, §12.5, §12.6 (columns + invariants only), §12.7, §18 (uninstall) |
 | 03 | §3.6, §4, §4.1, §4.2, §4.3, §4.4, §5.1, §5.2, §5.3, §5.4, §9 (redirect + REST registration), §11.1, §11.4, §11.8 (host and request rows), and the Phase C invocations of §11.2 and §11.3 |
 | 04 | §6, §6.1, §6.2, §6.3, §10, §11.2, §11.3 (the subtree filters themselves), §11.8 (subtree and scope rows), §20 |
 | 05 | §7, §7.1, §7.2, §7.3, §7.4, §7.5, §8, §8.1, §9 (CORS and ajax), §11.5, §11.8 (URL rows) |
-| 06 | §13.1, §13.2, §13.3, §13.4, §13.5, §13.6, §11.6 (verification rows), §11.8 (label row) |
-| 07 | §12.2 (behaviour), §12.6 (protocol), §14.1, §14.2, §14.3, §14.4, §14.5, §14.8, §14.9, §11.6 (driver, lease, ttl rows) |
+| 06 | §13.1, §13.2, §13.3, §13.4, §13.5, §13.6, §12.3 (verification transitions), §11.6 (verification rows), §11.8 (label row) |
+| 07 | §12.2 (behaviour), §12.6 (protocol, including the kind-and-phase-pinned recovery CAS and the bounded re-read), §14.1, §14.2, §14.3, §14.4, §14.5, §14.8, §14.9, §11.6 (`pd_ssl_drivers` default, driver, lease, ttl rows) |
 | 08 | §12.6 (fencing at finalization), §14.4 (the precondition set enforced per operation), §14.6, §14.7, §14.10, §14.15, §14.17 |
-| 09 | §14.11, §14.12, §14.13, §14.14, §14.16 (never requesting a wildcard), §14.18, §11.6 (method, apex rows), §11.8 (method and apex rows) |
+| 09 | §14.11, §14.12, §14.13, §14.14, §14.16 (never requesting a wildcard), §14.18, §11.6 (`pd_ssl_drivers` — where Cloudflare joins the default, method, apex rows), §11.8 (method and apex rows) |
 | 10 | §15, §15.1, §15.2, §15.3, §14.16 (rejecting a wildcard host), §11.6 (capability row) |
-| 11 | §16, §16.1, §16.2, §17 (acceptance), §19, §20 (gate reporting) |
+| 11 | §16, §16.1, §16.2 (including the certificate-provider selection and its diagnostics), §17 (acceptance), §19, §20 (gate reporting) |
 
 §11.7 (actions) is implemented incrementally: each plan fires the actions its own
 subsystem owns, listed in that plan's task that produces the state change.
@@ -77,15 +84,15 @@ its predecessor's gate is green.
 | After | Gate |
 |---|---|
 | 01 | `composer test`, `composer lint`, `composer analyse` all pass; plugin activates on wp-env single-site and refuses multisite activation |
-| 02 | Schema installs and upgrades idempotently; every row invariant rejected at the repository; `uninstall.php` leaves a seeded post untouched |
+| 02 | Schema installs and upgrades idempotently; every row invariant rejected at the repository; a transition and its event commit or roll back together on InnoDB and never precede the CAS on any engine; `uninstall.php` leaves a seeded post untouched |
 | 03 | The disposition matrix integration test passes for all five outcomes across every host kind |
 | 04 | The round-trip property test passes over a generated fixture tree; no unbounded scope executes |
 | 05 | The rendered-output compatibility matrix passes for every row in spec §7.2 |
 | 06 | A seeded mapping goes `unverified → pending → verified` against a stubbed resolver, and a transient result never deactivates it |
-| 07 | No provider mutation is reachable without a consumed permit; the four lease race tests pass |
-| 08 | Every ambiguous outcome test resolves by a provider read; every precondition failure proves zero mutating provider calls; a failed finalization writes and deletes nothing; force-local-delete cannot overwrite a lease |
-| 09 | The status map generates offline from the digested snapshot, all 16 hostname and 21 SSL values are classified, and CI fails on an unclassified value or a digest mismatch |
-| 10 | Management routes are absent from `/wp-json/` discovery on a mapped host, and every registered route is answered by a real handler introduced in the same task |
+| 07 | No provider mutation is reachable without a consumed permit; the lease race tests pass; a recovery claim pinned to the wrong kind or phase affects zero rows; lease TTL and recovery grace strictly exceed the provider timeout plus the margin; a mapping with no provider never resolves to `NullDriver` by default |
+| 08 | Every ambiguous outcome test resolves by a provider read; every precondition failure proves zero mutating provider calls; a failed finalization writes nothing, deletes nothing, logs nothing, and returns `FENCED`; reconciliation counts no zero-row update; force-local-delete cannot overwrite a lease |
+| 09 | The status map generates offline from the digested snapshot, all 16 hostname and 21 SSL values are classified, CI fails on an unclassified value or a digest mismatch, and a configured Cloudflare driver is reachable from a mapping whose stored provider is null |
+| 10 | Management routes are absent from `/wp-json/` discovery on a mapped host, every registered route is answered by a real handler introduced in the same task, and no fenced mutation is reported with a success status |
 | 11 | Full suite green; README covers every item in spec §19 |
 
 ## Deferred capability gate

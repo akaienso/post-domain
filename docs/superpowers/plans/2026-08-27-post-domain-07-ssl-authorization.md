@@ -59,7 +59,8 @@ Inherit Plans 01–06, and add:
 | `src/Ssl/GateResult.php`, `MutationGate.php` | The only caller of a mutating driver method |
 | `src/Ssl/RecoveryOutcome.php`, `RecoveryResolver.php`, `LeaseRecovery.php` | Phase-specific recovery, token-owned |
 | `src/Ssl/Environment.php` | Installation identity and clone detection |
-| `src/Ssl/SslDriverRegistry.php`, `Cooldown.php`, `AuthorizerSupport.php`, `DeletionAuthorizer.php` | Registry, cooldowns, shared preconditions, deletion |
+| `src/Ssl/SslDriverRegistry.php`, `DriverFactory.php`, `DriverUnavailable.php` | The one production source of drivers and the selection rule |
+| `src/Ssl/Cooldown.php`, `AuthorizerSupport.php`, `DeletionAuthorizer.php` | Cooldowns, shared preconditions, deletion |
 
 **Task order.** Every type exists before the first task that uses it:
 `TimingPolicy` (2) → `MutationLease` (3) → `ExecutionPermit` (4) → the driver
@@ -395,12 +396,20 @@ an absent one establishes nothing. Ownership authority reads columns only."
 
 **Interfaces:**
 - Consumes: nothing.
-- Produces: `PostDomain\Ssl\TimingPolicy::PROVIDER_TIMEOUT_SECONDS` (10), `::SAFETY_MARGIN_SECONDS` (30), `::DEFAULT_LEASE_TTL` (120), `::DEFAULT_RECOVERY_GRACE` (180), `::MAX_TTL` (600), `::MAX_BACKOFF`, `::floor(): int`, `::lease_ttl(): int`, `::recovery_grace(): int`, `::authorization_ttl( int $lease_ttl ): int`, `::recovery_backoff( int $attempt ): int`.
+- Produces: `PostDomain\Ssl\TimingPolicy::PROVIDER_TIMEOUT_SECONDS` (10), `::SAFETY_MARGIN_SECONDS` (30), `::DEFAULT_LEASE_TTL` (120), `::DEFAULT_RECOVERY_GRACE` (180), `::MAX_TTL` (600), `::MAX_BACKOFF`, `::MAX_RECOVERY_BACKOFF`, `::floor(): int`, `::minimum(): int`, `::lease_ttl(): int`, `::recovery_grace(): int`, `::authorization_ttl( int $lease_ttl ): int`, `::recovery_backoff( int $attempt ): int`, `::attempt_backoff( int $attempt ): int`.
 
 One source of truth. No service computes its own clamp: a lease shorter than the
 provider timeout plus the margin would let recovery fence a request that is still
 legitimately in flight (spec §12.6). This test is an integration test because it
 exercises WordPress filters.
+
+**The floor is exclusive.** The specification requires the lease TTL and the
+recovery grace to **exceed** the provider timeout plus the documented margin —
+not to equal it. `floor()` is therefore the largest forbidden value and
+`minimum()` is the smallest permitted one, and clamping raises to `minimum()`.
+Equality is a real failure mode: a lease expiring at exactly the moment the
+provider call may still be legitimately outstanding leaves the race the margin
+exists to prevent.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -431,25 +440,50 @@ final class TimingPolicyTest extends WP_UnitTestCase {
 		);
 	}
 
+	public function test_the_minimum_is_strictly_above_the_floor(): void {
+		$this->assertGreaterThan(
+			TimingPolicy::floor(),
+			TimingPolicy::minimum(),
+			'the specification says exceed, not equal'
+		);
+	}
+
 	public function test_the_defaults_exceed_the_floor(): void {
 		$this->assertGreaterThan( TimingPolicy::floor(), TimingPolicy::lease_ttl() );
 		$this->assertGreaterThan( TimingPolicy::floor(), TimingPolicy::recovery_grace() );
 	}
 
-	public function test_a_lease_filter_below_the_floor_is_raised_to_it(): void {
+	public function test_a_lease_filter_below_the_floor_is_raised_to_the_minimum(): void {
 		add_filter( 'pd_mutation_lease_ttl', static fn(): int => 5 );
 
 		$this->assertSame(
-			TimingPolicy::floor(),
+			TimingPolicy::minimum(),
 			TimingPolicy::lease_ttl(),
 			'recovery must never begin while the original request is still in flight'
 		);
+		$this->assertGreaterThan( TimingPolicy::floor(), TimingPolicy::lease_ttl() );
 	}
 
-	public function test_a_recovery_filter_below_the_floor_is_raised_to_it(): void {
+	public function test_a_lease_filter_exactly_at_the_floor_is_still_raised(): void {
+		add_filter( 'pd_mutation_lease_ttl', static fn(): int => TimingPolicy::floor() );
+
+		$this->assertGreaterThan(
+			TimingPolicy::floor(),
+			TimingPolicy::lease_ttl(),
+			'equality leaves exactly the race the margin exists to prevent'
+		);
+	}
+
+	public function test_a_recovery_filter_below_the_floor_is_raised_to_the_minimum(): void {
 		add_filter( 'pd_recovery_grace_seconds', static fn(): int => 1 );
 
-		$this->assertSame( TimingPolicy::floor(), TimingPolicy::recovery_grace() );
+		$this->assertSame( TimingPolicy::minimum(), TimingPolicy::recovery_grace() );
+	}
+
+	public function test_a_recovery_filter_exactly_at_the_floor_is_still_raised(): void {
+		add_filter( 'pd_recovery_grace_seconds', static fn(): int => TimingPolicy::floor() );
+
+		$this->assertGreaterThan( TimingPolicy::floor(), TimingPolicy::recovery_grace() );
 	}
 
 	public function test_a_filter_above_the_ceiling_is_clamped(): void {
@@ -473,7 +507,21 @@ final class TimingPolicyTest extends WP_UnitTestCase {
 
 	public function test_recovery_backoff_grows_and_is_capped(): void {
 		$this->assertLessThan( TimingPolicy::recovery_backoff( 5 ), TimingPolicy::recovery_backoff( 3 ) );
-		$this->assertSame( TimingPolicy::MAX_BACKOFF, TimingPolicy::recovery_backoff( 99 ) );
+		$this->assertSame( TimingPolicy::MAX_RECOVERY_BACKOFF, TimingPolicy::recovery_backoff( 99 ) );
+	}
+
+	public function test_recovery_backoff_never_outruns_the_recovery_window(): void {
+		// A scheduled re-read that fell outside the fencing window would hand the
+		// row to a takeover instead of to the worker that scheduled it.
+		$this->assertLessThan( TimingPolicy::MAX_TTL, TimingPolicy::MAX_RECOVERY_BACKOFF );
+	}
+
+	public function test_attempt_backoff_grows_and_is_capped_separately(): void {
+		// Durable retry schedules (deletion) are not held under a lease, so they
+		// may back off much further than an in-lease re-read.
+		$this->assertLessThan( TimingPolicy::attempt_backoff( 5 ), TimingPolicy::attempt_backoff( 3 ) );
+		$this->assertSame( TimingPolicy::MAX_BACKOFF, TimingPolicy::attempt_backoff( 99 ) );
+		$this->assertGreaterThan( TimingPolicy::MAX_RECOVERY_BACKOFF, TimingPolicy::MAX_BACKOFF );
 	}
 }
 ```
@@ -510,10 +558,24 @@ final class TimingPolicy {
 
 	public const MAX_TTL = 600;
 
+	/** The largest interval a durable retry schedule may reach. */
 	public const MAX_BACKOFF = 21600;
 
+	/**
+	 * The largest interval a *recovery* re-read may be pushed out by. It stays
+	 * below MAX_TTL so a scheduled re-read always falls inside the fencing
+	 * window the same worker holds.
+	 */
+	public const MAX_RECOVERY_BACKOFF = 300;
+
+	/** The largest FORBIDDEN duration: values must exceed this, not equal it. */
 	public static function floor(): int {
 		return self::PROVIDER_TIMEOUT_SECONDS + self::SAFETY_MARGIN_SECONDS;
+	}
+
+	/** The smallest permitted duration — strictly greater than the floor. */
+	public static function minimum(): int {
+		return self::floor() + 1;
 	}
 
 	public static function lease_ttl(): int {
@@ -537,17 +599,24 @@ final class TimingPolicy {
 		return max( 30, min( $lease_ttl, min( 300, $requested ) ) );
 	}
 
+	/** In-lease re-read spacing: bounded so the re-read stays inside the window. */
 	public static function recovery_backoff( int $attempt ): int {
-		return min( self::MAX_BACKOFF, 60 * ( 2 ** max( 0, $attempt ) ) );
+		return min( self::MAX_RECOVERY_BACKOFF, 30 * ( 2 ** max( 0, $attempt ) ) );
+	}
+
+	/** Durable retry spacing for work that holds no lease between attempts. */
+	public static function attempt_backoff( int $attempt ): int {
+		return min( self::MAX_BACKOFF, 300 * ( 2 ** max( 0, $attempt ) ) );
 	}
 
 	/** @param mixed $value */
 	private static function clamp( $value, int $default ): int {
 		$seconds = is_numeric( $value ) ? (int) $value : $default;
 
-		// Raised to the floor rather than rejected: a short lease is a
-		// misconfiguration, not a reason to stop working.
-		return max( self::floor(), min( self::MAX_TTL, $seconds ) );
+		// Raised to the minimum rather than rejected: a short lease is a
+		// misconfiguration, not a reason to stop working. The minimum is
+		// strictly above the floor because the specification says exceed.
+		return max( self::minimum(), min( self::MAX_TTL, $seconds ) );
 	}
 }
 ```
@@ -555,17 +624,17 @@ final class TimingPolicy {
 - [ ] **Step 4: Run the test to verify it passes**
 
 Run: `composer test:integration -- --filter TimingPolicyTest`
-Expected: PASS — 8 tests
+Expected: PASS — 13 tests
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add src/Ssl/TimingPolicy.php tests/integration/Ssl/TimingPolicyTest.php
-git commit -m "Centralize lease and recovery timing behind a floor
+git commit -m "Centralize lease and recovery timing above an exclusive floor
 
-A filter value below the provider timeout plus the margin is raised to the
-floor, so no configuration can let recovery fence a request that is still
-legitimately in flight."
+Durations must exceed the provider timeout plus the margin, not equal it, so a
+filter set to exactly that sum is still raised. Recovery backoff is capped below
+MAX_TTL so a scheduled re-read stays inside its own fencing window."
 ```
 
 ---
@@ -581,7 +650,7 @@ legitimately in flight."
 - Produces:
   - `PostDomain\Ssl\LeaseBinding` — readonly `int $mapping_id`, `int $revision`, `string $token`, `MutationKind $kind`, `string $host`, `?string $provider_id`, `?string $provider_ref`, `string $challenge`, `?string $requested_method`, `?OwnershipOrigin $ownership_origin`, `?string $owner_installation_id`.
   - `PostDomain\Ssl\LeaseOutcome` — typed, column-allowlisted; `::state()`, `::bound()`, `::adopted()`, `::method_confirmed()`, `::failure()`, `::checked()`, `::provider_state()`, `::attempted()`, `::raw()`, `::merge()`, `::columns()`.
-  - `PostDomain\Ssl\MutationLease::__construct( Clock $clock )` with `::acquire()`, `::consume()`, `::release_reserved()`, `::finalize()`, `::delete_row()`, `::clear_expired_reserved()`, `::claim_recovery()`, `::extend_recovery()`.
+  - `PostDomain\Ssl\MutationLease::__construct( Clock $clock )` with `::acquire()`, `::consume()`, `::release_reserved()`, `::finalize()`, `::delete_row()`, `::clear_expired_reserved()`, `::claim_recovery( int $mapping_id, string $old_token, MutationKind $kind, MutationPhase $from ): ?array`, `::extend_recovery( int $mapping_id, int $revision, string $token, MutationKind $kind, int $attempt ): bool`.
 
 The consumption CAS re-checks **every** value in `LeaseBinding`, including the two
 ownership columns, with null-safe comparisons (spec §12.6).
@@ -876,7 +945,7 @@ final class MutationLeaseTest extends WP_UnitTestCase {
 		$m   = $this->seed();
 		$old = $this->force_lease( $m->id, MutationPhase::IN_FLIGHT, -600 );
 
-		$claim = $this->lease->claim_recovery( $m->id, $old );
+		$claim = $this->lease->claim_recovery( $m->id, $old, MutationKind::REMOVE, MutationPhase::IN_FLIGHT );
 
 		$this->assertNotNull( $claim );
 		$this->assertNotSame( $old, $claim['token'] );
@@ -892,16 +961,110 @@ final class MutationLeaseTest extends WP_UnitTestCase {
 		$m     = $this->seed();
 		$token = $this->force_lease( $m->id, MutationPhase::IN_FLIGHT, 600 );
 
-		$this->assertNull( $this->lease->claim_recovery( $m->id, $token ) );
+		$this->assertNull(
+			$this->lease->claim_recovery( $m->id, $token, MutationKind::REMOVE, MutationPhase::IN_FLIGHT )
+		);
 	}
 
-	public function test_extending_recovery_requires_the_owning_token(): void {
+	public function test_claiming_recovery_refuses_a_kind_that_changed_under_the_selector(): void {
+		$m   = $this->seed();
+		$old = $this->force_lease( $m->id, MutationPhase::IN_FLIGHT, -600 );
+
+		$this->assertNull(
+			$this->lease->claim_recovery( $m->id, $old, MutationKind::CREATE, MutationPhase::IN_FLIGHT ),
+			'the selector snapshot said create; the row says remove'
+		);
+		$this->assertSame( $old, $this->repo->by_id( $m->id )?->ssl_mutation_token );
+	}
+
+	public function test_claiming_recovery_refuses_a_phase_that_changed_under_the_selector(): void {
+		$m   = $this->seed();
+		$old = $this->force_lease( $m->id, MutationPhase::RECOVERING, -600 );
+
+		$this->assertNull(
+			$this->lease->claim_recovery( $m->id, $old, MutationKind::REMOVE, MutationPhase::IN_FLIGHT ),
+			'an exact source phase, never a phase set'
+		);
+		$this->assertSame(
+			MutationPhase::RECOVERING,
+			$this->repo->by_id( $m->id )?->ssl_mutation_phase
+		);
+	}
+
+	public function test_claiming_recovery_from_recovering_takes_over_an_abandoned_worker(): void {
+		$m   = $this->seed();
+		$old = $this->force_lease( $m->id, MutationPhase::RECOVERING, -600 );
+
+		$claim = $this->lease->claim_recovery( $m->id, $old, MutationKind::REMOVE, MutationPhase::RECOVERING );
+
+		$this->assertNotNull( $claim );
+		$this->assertNotSame( $old, $claim['token'] );
+	}
+
+	public function test_claiming_recovery_from_reserved_is_a_programming_error(): void {
+		$m   = $this->seed();
+		$old = $this->force_lease( $m->id, MutationPhase::RESERVED, -600 );
+
+		$this->expectException( \LogicException::class );
+
+		$this->lease->claim_recovery( $m->id, $old, MutationKind::REMOVE, MutationPhase::RESERVED );
+	}
+
+	public function test_extending_recovery_requires_the_owning_token_and_kind(): void {
 		$m     = $this->seed();
 		$old   = $this->force_lease( $m->id, MutationPhase::IN_FLIGHT, -600 );
-		$claim = $this->lease->claim_recovery( $m->id, $old );
+		$claim = $this->lease->claim_recovery( $m->id, $old, MutationKind::REMOVE, MutationPhase::IN_FLIGHT );
 
-		$this->assertFalse( $this->lease->extend_recovery( $m->id, $claim['revision'], $old ) );
-		$this->assertTrue( $this->lease->extend_recovery( $m->id, $claim['revision'], $claim['token'] ) );
+		$this->assertFalse(
+			$this->lease->extend_recovery( $m->id, $claim['revision'], $old, MutationKind::REMOVE, 0 )
+		);
+		$this->assertFalse(
+			$this->lease->extend_recovery( $m->id, $claim['revision'], $claim['token'], MutationKind::CREATE, 0 )
+		);
+		$this->assertTrue(
+			$this->lease->extend_recovery( $m->id, $claim['revision'], $claim['token'], MutationKind::REMOVE, 0 )
+		);
+	}
+
+	public function test_extending_recovery_persists_a_growing_backoff_inside_its_window(): void {
+		$m     = $this->seed();
+		$old   = $this->force_lease( $m->id, MutationPhase::IN_FLIGHT, -600 );
+		$claim = $this->lease->claim_recovery( $m->id, $old, MutationKind::REMOVE, MutationPhase::IN_FLIGHT );
+
+		$this->lease->extend_recovery( $m->id, $claim['revision'], $claim['token'], MutationKind::REMOVE, 0 );
+		$first = $this->repo->by_id( $m->id );
+
+		$this->lease->extend_recovery( $m->id, $first->revision, $claim['token'], MutationKind::REMOVE, 3 );
+		$second = $this->repo->by_id( $m->id );
+
+		$this->assertSame( 0, $first?->ssl_transient_count );
+		$this->assertSame( 3, $second?->ssl_transient_count );
+		$this->assertGreaterThan(
+			strtotime( (string) $first?->ssl_next_attempt_at ),
+			strtotime( (string) $second?->ssl_next_attempt_at ),
+			'each inconclusive read is spaced further out than the last'
+		);
+
+		foreach ( array( $first, $second ) as $row ) {
+			$this->assertLessThan(
+				strtotime( (string) $row?->ssl_mutation_expires_at ),
+				strtotime( (string) $row?->ssl_next_attempt_at ),
+				'the scheduled re-read must fall inside the window its owner holds'
+			);
+		}
+	}
+
+	public function test_extending_recovery_on_a_stale_revision_affects_nothing(): void {
+		$m     = $this->seed();
+		$old   = $this->force_lease( $m->id, MutationPhase::IN_FLIGHT, -600 );
+		$claim = $this->lease->claim_recovery( $m->id, $old, MutationKind::REMOVE, MutationPhase::IN_FLIGHT );
+
+		$this->lease->extend_recovery( $m->id, $claim['revision'], $claim['token'], MutationKind::REMOVE, 0 );
+
+		$this->assertFalse(
+			$this->lease->extend_recovery( $m->id, $claim['revision'], $claim['token'], MutationKind::REMOVE, 1 ),
+			'the revision moved; this worker no longer speaks for the row'
+		);
 	}
 
 	public function test_delete_row_requires_the_exact_owner(): void {
@@ -1318,10 +1481,25 @@ final class MutationLease {
 	/**
 	 * Fences the original worker before any provider read.
 	 *
+	 * The CAS pins the preserved mutation kind and the EXACT source phase the
+	 * caller selected on. A selector result is a snapshot: by the time the claim
+	 * runs the row's kind or phase may already have moved, and a claim that
+	 * matched anyway would fence a mutation of a kind the caller cannot resolve
+	 * (spec §12.6).
+	 *
 	 * @return array{token: string, revision: int}|null
 	 */
-	public function claim_recovery( int $mapping_id, string $old_token ): ?array {
+	public function claim_recovery(
+		int $mapping_id,
+		string $old_token,
+		MutationKind $kind,
+		MutationPhase $from
+	): ?array {
 		global $wpdb;
+
+		if ( MutationPhase::IN_FLIGHT !== $from && MutationPhase::RECOVERING !== $from ) {
+			throw new \LogicException( 'Recovery is claimed only from IN_FLIGHT or RECOVERING.' );
+		}
 
 		$table   = Schema::domains_table();
 		$new     = bin2hex( random_bytes( 16 ) );
@@ -1333,15 +1511,16 @@ final class MutationLease {
 				    SET ssl_mutation_token = %s, ssl_mutation_phase = %s,
 				        ssl_mutation_expires_at = %s, revision = revision + 1, updated_at = %s
 				  WHERE id = %d AND ssl_mutation_token = %s
-				    AND ssl_mutation_phase IN (%s, %s) AND ssl_mutation_expires_at <= %s",
+				    AND ssl_mutation_kind = %s
+				    AND ssl_mutation_phase = %s AND ssl_mutation_expires_at <= %s",
 				$new,
 				MutationPhase::RECOVERING->value,
 				$expires,
 				$this->clock->mysql(),
 				$mapping_id,
 				$old_token,
-				MutationPhase::IN_FLIGHT->value,
-				MutationPhase::RECOVERING->value,
+				$kind->value,
+				$from->value,
 				$this->clock->mysql()
 			)
 		);
@@ -1357,23 +1536,46 @@ final class MutationLease {
 		return array( 'token' => $new, 'revision' => $revision );
 	}
 
-	/** Extends a held RECOVERING lease without changing its owner. */
-	public function extend_recovery( int $mapping_id, int $revision, string $token ): bool {
+	/**
+	 * Extends a held RECOVERING lease without changing its owner, and durably
+	 * schedules the next bounded re-read.
+	 *
+	 * The expiry is pushed past the scheduled re-read so the worker that
+	 * scheduled it is still the owner when it comes due; a re-read falling
+	 * outside the window would hand the row to a takeover instead.
+	 */
+	public function extend_recovery(
+		int $mapping_id,
+		int $revision,
+		string $token,
+		MutationKind $kind,
+		int $attempt
+	): bool {
 		global $wpdb;
 
-		$table   = Schema::domains_table();
-		$expires = gmdate( 'Y-m-d H:i:s', $this->clock->now()->getTimestamp() + TimingPolicy::recovery_grace() );
+		$table    = Schema::domains_table();
+		$backoff  = TimingPolicy::recovery_backoff( $attempt );
+		$now      = $this->clock->now()->getTimestamp();
+		$next     = gmdate( 'Y-m-d H:i:s', $now + $backoff );
+		$expires  = gmdate( 'Y-m-d H:i:s', $now + TimingPolicy::recovery_grace() + $backoff );
 
 		return 1 === $wpdb->query( // phpcs:ignore WordPress.DB
 			$wpdb->prepare(
 				"UPDATE {$table}
-				    SET ssl_mutation_expires_at = %s, revision = revision + 1, updated_at = %s
-				  WHERE id = %d AND revision = %d AND ssl_mutation_token = %s AND ssl_mutation_phase = %s",
+				    SET ssl_mutation_expires_at = %s, ssl_next_attempt_at = %s,
+				        ssl_transient_count = %d, ssl_checked_at = %s,
+				        revision = revision + 1, updated_at = %s
+				  WHERE id = %d AND revision = %d AND ssl_mutation_token = %s
+				    AND ssl_mutation_kind = %s AND ssl_mutation_phase = %s",
 				$expires,
+				$next,
+				$attempt,
+				$this->clock->mysql(),
 				$this->clock->mysql(),
 				$mapping_id,
 				$revision,
 				$token,
+				$kind->value,
 				MutationPhase::RECOVERING->value
 			)
 		);
@@ -1384,7 +1586,7 @@ final class MutationLease {
 - [ ] **Step 4: Run the test to verify it passes**
 
 Run: `composer test:integration -- --filter MutationLeaseTest`
-Expected: PASS — 30 tests (including the six phase-and-expiry cases and the nine
+Expected: PASS — 37 tests (including the six phase-and-expiry cases and the nine
 changed-column cases)
 
 - [ ] **Step 5: Commit**
@@ -1403,7 +1605,7 @@ a typed outcome whose column names come from an allowlist, never from a caller."
 ### Task 4: The execution permit and the authorization
 
 **Files:**
-- Create: `src/Ssl/MutationOperation.php`, `src/Ssl/ExecutionPermit.php`, `src/Ssl/MutationAuthorization.php`, `src/Ssl/MutationRefusal.php`
+- Create: `src/Ssl/MutationOperation.php`, `src/Ssl/ExecutionPermit.php`, `src/Ssl/MutationAuthorization.php`, `src/Ssl/MutationRefusal.php`, `src/Ssl/MutationDisposition.php`, `src/Ssl/MutationResult.php`
 - Test: `tests/unit/Ssl/ExecutionPermitTest.php`
 
 **Interfaces:**
@@ -1413,6 +1615,8 @@ a typed outcome whose column names come from an allowlist, never from a caller."
   - `PostDomain\Ssl\ExecutionPermit` — **private constructor**; created only by `::issue()`, which throws unless its immediate caller is `MutationGate`. Carries `MutationOperation $operation`, `int $mapping_id`, `int $in_flight_revision`, `string $lease_token`, `\DateTimeImmutable $expires_at`; plus `::assert_for( MutationOperation $op, SslResourceContext $ctx ): void`.
   - `PostDomain\Ssl\MutationAuthorization` — `MutationOperation $operation`, `LeaseBinding $binding`, `bool $override_foreign_marker`, `\DateTimeImmutable $expires_at`, `::is_expired()`.
   - `PostDomain\Ssl\MutationRefusal`.
+  - `PostDomain\Ssl\MutationDisposition` enum — `COMMITTED`, `REFUSED`, `AMBIGUOUS_RETAINED`, `FENCED`, `CONFIRMED_NOT_PERSISTED`.
+  - `PostDomain\Ssl\MutationResult` — the single return type of every SSL service operation, with named constructors `::committed()`, `::refused()`, `::ambiguous()`, `::fenced()`, `::not_persisted()`, `::lost( ?Mapping $row, string $expected_token ): self`, and `::succeeded(): bool`. It carries an `SslStatus` **only** for `COMMITTED`, so a discarded result cannot be reported as a successful one.
 
 A permit any service could construct would let that service call a driver without
 consuming an authorization, so the constructor is private and issuance is
@@ -1662,6 +1866,106 @@ final class MutationRefusal {
 }
 ```
 
+Create `src/Ssl/MutationDisposition.php`:
+
+```php
+<?php
+declare( strict_types = 1 );
+
+namespace PostDomain\Ssl;
+
+/**
+ * What actually became of a mutation attempt. These are five different facts and
+ * a caller must be able to tell them apart: three of them look like success from
+ * the provider's side and are not.
+ */
+enum MutationDisposition: string {
+
+	/** The provider acted and the result is committed locally. */
+	case COMMITTED = 'committed';
+
+	/** Refused before the provider was called. Nothing happened anywhere. */
+	case REFUSED = 'refused';
+
+	/** The provider outcome is unknown; the row is retained for recovery. */
+	case AMBIGUOUS_RETAINED = 'ambiguous_retained';
+
+	/** Recovery replaced our token mid-flight: our result was discarded. */
+	case FENCED = 'fenced';
+
+	/** The provider confirmed, but the local write did not land. */
+	case CONFIRMED_NOT_PERSISTED = 'confirmed_not_persisted';
+}
+```
+
+Create `src/Ssl/MutationResult.php`:
+
+```php
+<?php
+declare( strict_types = 1 );
+
+namespace PostDomain\Ssl;
+
+use PostDomain\Mapping\Mapping;
+
+/**
+ * The single return type of every SSL service operation.
+ *
+ * A provider call that succeeded is not the same fact as a mutation that took
+ * effect. Returning the provider's SslStatus after a lost finalization would let
+ * REST answer 200 for work that was discarded, so a fenced or unpersisted
+ * attempt carries no status at all.
+ */
+final class MutationResult {
+
+	private function __construct(
+		public readonly MutationDisposition $disposition,
+		public readonly ?SslStatus $status,
+		public readonly ?MutationRefusal $refusal,
+		public readonly string $note
+	) {}
+
+	public static function committed( SslStatus $status, string $note = '' ): self {
+		return new self( MutationDisposition::COMMITTED, $status, null, $note );
+	}
+
+	public static function refused( MutationRefusal $refusal ): self {
+		return new self( MutationDisposition::REFUSED, null, $refusal, $refusal->detail ?? $refusal->precondition );
+	}
+
+	public static function ambiguous( string $note ): self {
+		return new self( MutationDisposition::AMBIGUOUS_RETAINED, null, null, $note );
+	}
+
+	public static function fenced( string $note = 'recovery owns this row now' ): self {
+		return new self( MutationDisposition::FENCED, null, null, $note );
+	}
+
+	public static function not_persisted( string $note = 'the provider confirmed but the local write did not land' ): self {
+		return new self( MutationDisposition::CONFIRMED_NOT_PERSISTED, null, null, $note );
+	}
+
+	/**
+	 * Reads a zero-row finalization for what it was. Both cases discard the local
+	 * result; only one means somebody else is now responsible for the row, so the
+	 * row itself is what settles it.
+	 */
+	public static function lost( ?Mapping $row, string $expected_token ): self {
+		if ( null === $row
+			|| $row->ssl_mutation_token !== $expected_token
+			|| MutationPhase::RECOVERING === $row->ssl_mutation_phase ) {
+			return self::fenced();
+		}
+
+		return self::not_persisted();
+	}
+
+	public function succeeded(): bool {
+		return MutationDisposition::COMMITTED === $this->disposition;
+	}
+}
+```
+
 - [ ] **Step 4: Run the test to verify it passes**
 
 Run: `vendor/bin/phpunit --testsuite unit --filter ExecutionPermitTest`
@@ -1670,7 +1974,7 @@ Expected: PASS — 8 tests
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/Ssl/MutationOperation.php src/Ssl/ExecutionPermit.php src/Ssl/MutationAuthorization.php src/Ssl/MutationRefusal.php tests/unit/Ssl/ExecutionPermitTest.php
+git add src/Ssl/MutationOperation.php src/Ssl/ExecutionPermit.php src/Ssl/MutationAuthorization.php src/Ssl/MutationRefusal.php src/Ssl/MutationDisposition.php src/Ssl/MutationResult.php tests/unit/Ssl/ExecutionPermitTest.php
 git commit -m "Make execution permits issuable only by the gate
 
 A permit any service could construct would let that service call a driver
@@ -2688,12 +2992,26 @@ object."
 - Produces:
   - `PostDomain\Ssl\RecoveryOutcome` — readonly `bool $conclusive`, `?LeaseOutcome $apply`, `bool $delete_row`, `string $note`; named constructors `::inconclusive()`, `::apply()`, `::delete()`.
   - `PostDomain\Ssl\RecoveryResolver` interface — `resolve( Mapping $m, MutationKind $kind, string $recovery_token ): RecoveryOutcome`.
-  - `PostDomain\Ssl\LeaseRecovery::__construct( MutationLease $lease, MappingRepository $repo, Clock $clock )` with `::due( int $batch ): Mapping[]` and `::recover( Mapping $m, RecoveryResolver $resolver ): string` returning `cleared`, `resolved`, `deleted`, `still_recovering`, or `skipped`.
+  - `PostDomain\Ssl\LeaseRecovery::__construct( MutationLease $lease, MappingRepository $repo, Clock $clock )` with `::due( int $batch ): Mapping[]` and `::recover( Mapping $m, RecoveryResolver $resolver ): string` returning `cleared`, `resolved`, `deleted`, `still_recovering`, `fenced`, or `skipped`.
 
 `due()` is the **only** work selector in the plugin that finds rows by lease
-expiry. The per-kind resolution lives behind `RecoveryResolver`; Plan 08 supplies
-the driver-backed implementation that reads provider state and never re-issues a
-mutation.
+expiry or by a recovery re-read schedule. The per-kind resolution lives behind
+`RecoveryResolver`; Plan 08 supplies the driver-backed implementation that reads
+provider state and never re-issues a mutation.
+
+**Bounded re-reads are durable, not incidental.** An inconclusive read does not
+merely renew a fixed grace: it increments the persisted recovery attempt count in
+`ssl_transient_count`, computes the next read with `TimingPolicy::recovery_backoff()`,
+writes it to `ssl_next_attempt_at`, and pushes `ssl_mutation_expires_at` past that
+read so the same worker is still the owner when it comes due. The row stays in
+`RECOVERING` under the **same** token, and `due()` picks it up again on schedule.
+Only when that owner-pinned CAS wins does `recover()` report `still_recovering`;
+a lost CAS is reported as `fenced` and nothing is written.
+
+**No event precedes the CAS that establishes it.** Every outcome — cleared,
+recovering, recovered, recovered-and-deleted — goes through
+`AtomicTransition::commit()`, so a fenced worker leaves no false history behind
+(spec §12.3).
 
 - [ ] **Step 1: Write the failing test**
 
@@ -2707,6 +3025,7 @@ namespace PostDomain\Tests\Integration\Ssl;
 
 use PostDomain\Mapping\ActivationState;
 use PostDomain\Mapping\DbRepository;
+use PostDomain\Mapping\EventLog;
 use PostDomain\Mapping\Mapping;
 use PostDomain\Mapping\SslState;
 use PostDomain\Mapping\VerificationState;
@@ -2717,8 +3036,9 @@ use PostDomain\Ssl\MutationLease;
 use PostDomain\Ssl\MutationPhase;
 use PostDomain\Ssl\RecoveryOutcome;
 use PostDomain\Ssl\RecoveryResolver;
+use PostDomain\Ssl\TimingPolicy;
 use PostDomain\Support\Schema;
-use PostDomain\Support\SystemClock;
+use PostDomain\Tests\Fixtures\FrozenClock;
 use WP_UnitTestCase;
 
 final class LeaseRecoveryTest extends WP_UnitTestCase {
@@ -2729,12 +3049,15 @@ final class LeaseRecoveryTest extends WP_UnitTestCase {
 
 	private LeaseRecovery $recovery;
 
+	private FrozenClock $clock;
+
 	public function set_up(): void {
 		parent::set_up();
 		Schema::install();
 		$this->repo     = new DbRepository();
-		$this->lease    = new MutationLease( new SystemClock() );
-		$this->recovery = new LeaseRecovery( $this->lease, $this->repo, new SystemClock() );
+		$this->clock    = new FrozenClock();
+		$this->lease    = new MutationLease( $this->clock );
+		$this->recovery = new LeaseRecovery( $this->lease, $this->repo, $this->clock );
 	}
 
 	private function resolver( RecoveryOutcome $outcome, ?callable $spy = null ): RecoveryResolver {
@@ -2782,16 +3105,34 @@ final class LeaseRecoveryTest extends WP_UnitTestCase {
 		return $this->repo->by_id( $m->id );
 	}
 
-	public function test_only_expired_leases_are_selected(): void {
+	public function test_only_expired_leases_and_due_rereads_are_selected(): void {
+		global $wpdb;
+
 		$expired  = $this->seed( 'expired.test', MutationPhase::IN_FLIGHT, -600 );
 		$live     = $this->seed( 'live.test', MutationPhase::IN_FLIGHT, 600 );
 		$unleased = $this->seed( 'free.test', null, 0 );
 
+		$due_reread = $this->seed( 'reread.test', MutationPhase::RECOVERING, 600 );
+		$wpdb->update( // phpcs:ignore WordPress.DB
+			Schema::domains_table(),
+			array( 'ssl_next_attempt_at' => gmdate( 'Y-m-d H:i:s', time() - 60 ) ),
+			array( 'id' => $due_reread->id )
+		);
+
+		$later_reread = $this->seed( 'later.test', MutationPhase::RECOVERING, 600 );
+		$wpdb->update( // phpcs:ignore WordPress.DB
+			Schema::domains_table(),
+			array( 'ssl_next_attempt_at' => gmdate( 'Y-m-d H:i:s', time() + 600 ) ),
+			array( 'id' => $later_reread->id )
+		);
+
 		$ids = array_map( static fn( Mapping $m ): int => $m->id, $this->recovery->due( 50 ) );
 
 		$this->assertContains( $expired->id, $ids );
+		$this->assertContains( $due_reread->id, $ids, 'a scheduled re-read is due work' );
 		$this->assertNotContains( $live->id, $ids );
 		$this->assertNotContains( $unleased->id, $ids );
+		$this->assertNotContains( $later_reread->id, $ids, 'the backoff has not elapsed' );
 	}
 
 	public function test_an_expired_reserved_lease_clears_without_calling_the_resolver(): void {
@@ -2904,6 +3245,173 @@ final class LeaseRecoveryTest extends WP_UnitTestCase {
 		);
 	}
 
+	public function test_an_inconclusive_outcome_persists_a_growing_backoff(): void {
+		$m     = $this->seed( 'inflight.test', MutationPhase::IN_FLIGHT, -600 );
+		$quiet = $this->resolver( RecoveryOutcome::inconclusive( 'provider silent' ) );
+
+		$this->recovery->recover( $m, $quiet );
+		$first = $this->repo->by_id( $m->id );
+
+		$this->assertSame( 1, $first?->ssl_transient_count );
+		$this->assertNotNull( $first?->ssl_next_attempt_at );
+
+		// The scheduled re-read comes due; the same worker continues.
+		$this->at_time( strtotime( (string) $first?->ssl_next_attempt_at . ' UTC' ) + 1 );
+
+		$this->assertSame( 'still_recovering', $this->recovery->recover( $first, $quiet ) );
+
+		$second = $this->repo->by_id( $m->id );
+
+		$this->assertSame( 2, $second?->ssl_transient_count );
+		$this->assertSame(
+			$first?->ssl_mutation_token,
+			$second?->ssl_mutation_token,
+			'a continuation keeps its token; only a takeover replaces one'
+		);
+		$this->assertGreaterThan(
+			strtotime( (string) $first?->ssl_next_attempt_at . ' UTC' )
+				- strtotime( (string) $first?->ssl_checked_at . ' UTC' ),
+			strtotime( (string) $second?->ssl_next_attempt_at . ' UTC' )
+				- strtotime( (string) $second?->ssl_checked_at . ' UTC' ),
+			'each interval is longer than the last'
+		);
+	}
+
+	public function test_a_scheduled_reread_is_ignored_before_it_comes_due(): void {
+		$m = $this->seed( 'inflight.test', MutationPhase::IN_FLIGHT, -600 );
+		$this->recovery->recover( $m, $this->resolver( RecoveryOutcome::inconclusive( 'x' ) ) );
+
+		$after = $this->repo->by_id( $m->id );
+
+		$this->assertSame(
+			'skipped',
+			$this->recovery->recover( $after, $this->resolver( RecoveryOutcome::inconclusive( 'x' ) ) ),
+			'the backoff means nothing to do yet'
+		);
+		$this->assertSame( 1, $this->repo->by_id( $m->id )?->ssl_transient_count );
+	}
+
+	public function test_the_backoff_is_capped(): void {
+		global $wpdb;
+
+		$m = $this->seed( 'inflight.test', MutationPhase::RECOVERING, -600 );
+		$wpdb->update( // phpcs:ignore WordPress.DB
+			Schema::domains_table(),
+			array( 'ssl_transient_count' => 40 ),
+			array( 'id' => $m->id )
+		);
+
+		$this->recovery->recover(
+			$this->repo->by_id( $m->id ),
+			$this->resolver( RecoveryOutcome::inconclusive( 'x' ) )
+		);
+
+		$after = $this->repo->by_id( $m->id );
+
+		$this->assertLessThanOrEqual(
+			TimingPolicy::MAX_RECOVERY_BACKOFF + 5,
+			strtotime( (string) $after?->ssl_next_attempt_at . ' UTC' ) - time()
+		);
+	}
+
+	public function test_a_scheduled_reread_stays_inside_its_own_fencing_window(): void {
+		$m = $this->seed( 'inflight.test', MutationPhase::IN_FLIGHT, -600 );
+		$this->recovery->recover( $m, $this->resolver( RecoveryOutcome::inconclusive( 'x' ) ) );
+
+		$after = $this->repo->by_id( $m->id );
+
+		$this->assertLessThan(
+			strtotime( (string) $after?->ssl_mutation_expires_at . ' UTC' ),
+			strtotime( (string) $after?->ssl_next_attempt_at . ' UTC' ),
+			'otherwise the re-read hands the row to a takeover instead'
+		);
+	}
+
+	public function test_an_extension_that_loses_its_cas_is_reported_as_fenced(): void {
+		$m = $this->seed( 'inflight.test', MutationPhase::IN_FLIGHT, -600 );
+
+		$outcome = $this->recovery->recover(
+			$m,
+			$this->resolver(
+				RecoveryOutcome::inconclusive( 'provider silent' ),
+				function ( Mapping $mapping ): void {
+					// Another recovery worker takes the row while the read runs.
+					$this->steal( $mapping->id );
+				}
+			)
+		);
+
+		$this->assertSame( 'fenced', $outcome );
+		$this->assertSame(
+			array(),
+			array_filter(
+				EventLog::for_domain( $m->id ),
+				static fn( array $e ): bool => 'recovering' === $e['to_state']
+			),
+			'a fenced worker leaves no history'
+		);
+	}
+
+	public function test_a_conclusive_result_that_loses_its_cas_writes_no_event(): void {
+		$m = $this->seed( 'inflight.test', MutationPhase::IN_FLIGHT, -600 );
+
+		$outcome = $this->recovery->recover(
+			$m,
+			$this->resolver(
+				RecoveryOutcome::apply( LeaseOutcome::state( SslState::ACTIVE ), 'confirmed active' ),
+				function ( Mapping $mapping ): void {
+					$this->steal( $mapping->id );
+				}
+			)
+		);
+
+		$this->assertSame( 'fenced', $outcome );
+		$this->assertNotSame( SslState::ACTIVE, $this->repo->by_id( $m->id )?->ssl_state );
+		$this->assertSame(
+			array(),
+			array_filter(
+				EventLog::for_domain( $m->id ),
+				static fn( array $e ): bool => 'recovered' === $e['to_state']
+			)
+		);
+	}
+
+	public function test_a_recovered_deletion_that_loses_its_cas_deletes_nothing(): void {
+		$m = $this->seed( 'inflight.test', MutationPhase::IN_FLIGHT, -600, MutationKind::REMOVE );
+
+		$outcome = $this->recovery->recover(
+			$m,
+			$this->resolver(
+				RecoveryOutcome::delete( 'provider confirms absent' ),
+				function ( Mapping $mapping ): void {
+					$this->steal( $mapping->id );
+				}
+			)
+		);
+
+		$this->assertSame( 'fenced', $outcome );
+		$this->assertNotNull( $this->repo->by_id( $m->id ), 'the row belongs to the new owner now' );
+		$this->assertSame(
+			array(),
+			array_filter(
+				EventLog::for_domain( $m->id ),
+				static fn( array $e ): bool => 'recovered_deleted' === $e['to_state']
+			)
+		);
+	}
+
+	public function test_an_expired_reserved_lease_that_loses_its_cas_records_nothing(): void {
+		$m = $this->seed( 'reserved.test', MutationPhase::RESERVED, -600 );
+
+		$this->steal( $m->id );
+
+		$this->assertSame(
+			'skipped',
+			$this->recovery->recover( $m, $this->resolver( RecoveryOutcome::inconclusive( 'x' ) ) )
+		);
+		$this->assertSame( array(), EventLog::for_domain( $m->id ) );
+	}
+
 	public function test_an_expired_recovering_lease_can_be_taken_over(): void {
 		$m   = $this->seed( 'recovering.test', MutationPhase::RECOVERING, -600 );
 		$old = (string) $m->ssl_mutation_token;
@@ -2933,6 +3441,26 @@ final class LeaseRecoveryTest extends WP_UnitTestCase {
 		foreach ( array( 'MutationGate', 'MutationAuthorization', 'ExecutionPermit' ) as $needle ) {
 			$this->assertStringNotContainsString( $needle, $source );
 		}
+	}
+
+	/** Simulates another recovery worker claiming the row mid-read. */
+	private function steal( int $mapping_id ): void {
+		global $wpdb;
+
+		$wpdb->update( // phpcs:ignore WordPress.DB
+			Schema::domains_table(),
+			array(
+				'ssl_mutation_token' => bin2hex( random_bytes( 16 ) ),
+				'ssl_mutation_phase' => MutationPhase::RECOVERING->value,
+				'revision'           => 999,
+			),
+			array( 'id' => $mapping_id )
+		);
+	}
+
+	/** Moves the injected clock so a scheduled re-read comes due. */
+	private function at_time( int $timestamp ): void {
+		$this->clock->set( ( new \DateTimeImmutable( '@' . $timestamp ) )->setTimezone( new \DateTimeZone( 'UTC' ) ) );
 	}
 }
 ```
@@ -3007,11 +3535,14 @@ use PostDomain\Contracts\Clock;
 use PostDomain\Contracts\MappingRepository;
 use PostDomain\Mapping\EventLog;
 use PostDomain\Mapping\Mapping;
+use PostDomain\Support\AtomicTransition;
 use PostDomain\Support\Schema;
 
 /**
  * The only claimant of expired leases, and the only work selector in the plugin
- * that finds rows by lease expiry.
+ * that finds rows by lease expiry or by a recovery re-read schedule.
+ *
+ * No event is written here except as part of a CAS this worker won.
  */
 final class LeaseRecovery {
 
@@ -3021,7 +3552,19 @@ final class LeaseRecovery {
 		private readonly Clock $clock
 	) {}
 
-	/** @return Mapping[] */
+	/**
+	 * Two kinds of due work, and no other component may select either:
+	 *
+	 * 1. an expired lease of any phase — a takeover, which replaces the token;
+	 * 2. a still-owned RECOVERING lease whose scheduled bounded re-read has come
+	 *    due — a continuation, which keeps the existing token.
+	 *
+	 * Without (2) an inconclusive recovery would have no durable way back: it
+	 * would have to let its own lease expire and be taken over, which loses the
+	 * attempt count and defeats the backoff.
+	 *
+	 * @return Mapping[]
+	 */
 	public function due( int $batch ): array {
 		global $wpdb;
 
@@ -3032,9 +3575,16 @@ final class LeaseRecovery {
 			$wpdb->prepare(
 				"SELECT * FROM {$table}
 				  WHERE ssl_mutation_token IS NOT NULL
-				    AND ssl_mutation_expires_at <= %s
+				    AND (
+				          ssl_mutation_expires_at <= %s
+				          OR ( ssl_mutation_phase = %s
+				               AND ssl_next_attempt_at IS NOT NULL
+				               AND ssl_next_attempt_at <= %s )
+				        )
 				  ORDER BY ssl_mutation_expires_at ASC
 				  LIMIT %d",
+				$this->clock->mysql(),
+				MutationPhase::RECOVERING->value,
 				$this->clock->mysql(),
 				$batch
 			),
@@ -3044,6 +3594,11 @@ final class LeaseRecovery {
 		return array_map( static fn( array $row ): Mapping => Mapping::from_row( $row ), $rows );
 	}
 
+	/**
+	 * @return string One of: cleared, resolved, deleted, still_recovering,
+	 *                fenced, skipped. Every one of those but `skipped` follows a
+	 *                CAS this worker owned and won.
+	 */
 	public function recover( Mapping $mapping, RecoveryResolver $resolver ): string {
 		$token = $mapping->ssl_mutation_token;
 		$phase = $mapping->ssl_mutation_phase;
@@ -3053,62 +3608,144 @@ final class LeaseRecovery {
 			return 'skipped';
 		}
 
+		$expired = $this->is_expired( $mapping );
+
 		if ( MutationPhase::RESERVED === $phase ) {
-			// Nothing was sent: clear without contacting the provider.
-			return $this->lease->clear_expired_reserved( $mapping->id, $token ) ? 'cleared' : 'skipped';
+			if ( ! $expired ) {
+				return 'skipped';
+			}
+
+			// Nothing was sent: clear without contacting the provider, and record
+			// the clearance only if the phase-pinned CAS actually won.
+			return AtomicTransition::commit(
+				fn (): bool => $this->lease->clear_expired_reserved( $mapping->id, $token ),
+				fn (): bool => EventLog::record(
+					$mapping->id,
+					$mapping->host,
+					'ssl',
+					$phase->value,
+					'lease_cleared',
+					'cron',
+					array( 'kind' => $kind->value, 'note' => 'expired reservation; nothing was sent' )
+				)
+			) ? 'cleared' : 'skipped';
 		}
 
-		$claim = $this->lease->claim_recovery( $mapping->id, $token );
+		if ( $expired ) {
+			// Takeover: fence the previous owner before any provider read, pinning
+			// the kind and the exact phase this row was selected in.
+			$claim = $this->lease->claim_recovery( $mapping->id, $token, $kind, $phase );
 
-		if ( null === $claim ) {
+			if ( null === $claim ) {
+				return 'skipped';
+			}
+
+			$owner_token    = $claim['token'];
+			$owner_revision = $claim['revision'];
+			$attempt        = MutationPhase::RECOVERING === $phase ? $mapping->ssl_transient_count : 0;
+		} else {
+			// Continuation: this worker still owns the recovery lease and its
+			// scheduled re-read has come due. No token replacement, no fencing.
+			if ( MutationPhase::RECOVERING !== $phase || ! $this->reread_due( $mapping ) ) {
+				return 'skipped';
+			}
+
+			$owner_token    = $token;
+			$owner_revision = $mapping->revision;
+			$attempt        = $mapping->ssl_transient_count;
+		}
+
+		$current = $this->repo->by_id( $mapping->id );
+
+		if ( null === $current ) {
 			return 'skipped';
 		}
 
-		// Re-read under the recovery token so the resolver sees current state.
-		$fenced = $this->repo->by_id( $mapping->id );
-
-		if ( null === $fenced ) {
-			return 'skipped';
-		}
-
-		$outcome = $resolver->resolve( $fenced, $kind, $claim['token'] );
-
-		EventLog::record(
-			$mapping->id,
-			$mapping->host,
-			'ssl',
-			$phase->value,
-			$outcome->conclusive ? 'recovered' : 'recovering',
-			'cron',
-			array( 'kind' => $kind->value, 'note' => $outcome->note )
-		);
+		// Read only. The resolver never issues a provider mutation.
+		$outcome = $resolver->resolve( $current, $kind, $owner_token );
 
 		if ( ! $outcome->conclusive ) {
-			$this->lease->extend_recovery( $mapping->id, $claim['revision'], $claim['token'] );
+			$next = $attempt + 1;
 
-			return 'still_recovering';
+			$extended = AtomicTransition::commit(
+				fn (): bool => $this->lease->extend_recovery(
+					$mapping->id,
+					$owner_revision,
+					$owner_token,
+					$kind,
+					$next
+				),
+				fn (): bool => EventLog::record(
+					$mapping->id,
+					$mapping->host,
+					'ssl',
+					$phase->value,
+					'recovering',
+					'cron',
+					array(
+						'kind'            => $kind->value,
+						'note'            => $outcome->note,
+						'attempt'         => $next,
+						'next_read_after' => TimingPolicy::recovery_backoff( $next ),
+					)
+				)
+			);
+
+			// A lost extension means another worker owns the row now: say so,
+			// and leave its state entirely alone.
+			return $extended ? 'still_recovering' : 'fenced';
 		}
 
 		if ( $outcome->delete_row ) {
-			return $this->lease->delete_row(
-				$mapping->id,
-				$claim['revision'],
-				$claim['token'],
-				$kind,
-				MutationPhase::RECOVERING
-			) ? 'deleted' : 'skipped';
+			return AtomicTransition::commit(
+				fn (): bool => $this->lease->delete_row(
+					$mapping->id,
+					$owner_revision,
+					$owner_token,
+					$kind,
+					MutationPhase::RECOVERING
+				),
+				fn (): bool => EventLog::record(
+					$mapping->id,
+					$mapping->host,
+					'ssl',
+					$phase->value,
+					'recovered_deleted',
+					'cron',
+					array( 'kind' => $kind->value, 'note' => $outcome->note )
+				)
+			) ? 'deleted' : 'fenced';
 		}
 
-		$applied = $this->lease->finalize(
-			$mapping->id,
-			$claim['revision'],
-			$claim['token'],
-			$kind,
-			MutationPhase::RECOVERING,
-			$outcome->apply ?? LeaseOutcome::checked()
-		);
+		return AtomicTransition::commit(
+			fn (): bool => $this->lease->finalize(
+				$mapping->id,
+				$owner_revision,
+				$owner_token,
+				$kind,
+				MutationPhase::RECOVERING,
+				$outcome->apply ?? LeaseOutcome::checked()
+			),
+			fn (): bool => EventLog::record(
+				$mapping->id,
+				$mapping->host,
+				'ssl',
+				$phase->value,
+				'recovered',
+				'cron',
+				array( 'kind' => $kind->value, 'note' => $outcome->note )
+			)
+		) ? 'resolved' : 'fenced';
+	}
 
-		return $applied ? 'resolved' : 'skipped';
+	private function is_expired( Mapping $mapping ): bool {
+		return null !== $mapping->ssl_mutation_expires_at
+			&& strtotime( $mapping->ssl_mutation_expires_at . ' UTC' ) <= $this->clock->now()->getTimestamp();
+	}
+
+	private function reread_due( Mapping $mapping ): bool {
+		return null !== $mapping->ssl_next_attempt_at
+			&& strtotime( $mapping->ssl_next_attempt_at . ' UTC' ) <= $this->clock->now()->getTimestamp();
 	}
 }
 ```
@@ -3116,7 +3753,7 @@ final class LeaseRecovery {
 - [ ] **Step 4: Run the test to verify it passes**
 
 Run: `composer test:integration -- --filter LeaseRecoveryTest`
-Expected: PASS — 11 tests
+Expected: PASS — 22 tests
 
 - [ ] **Step 5: Commit**
 
@@ -3397,22 +4034,43 @@ needing a rule of its own."
 
 ---
 
-### Task 9: Registry, cooldowns, shared preconditions, and the deletion authorizer
+### Task 9: Registry, driver factory, cooldowns, shared preconditions, and the deletion authorizer
 
 **Files:**
-- Create: `src/Ssl/SslDriverRegistry.php`, `src/Ssl/Cooldown.php`, `src/Ssl/AuthorizerSupport.php`, `src/Ssl/DeletionAuthorizer.php`
-- Test: `tests/integration/Ssl/DeletionAuthorizerTest.php`
+- Create: `src/Ssl/SslDriverRegistry.php`, `src/Ssl/DriverFactory.php`, `src/Ssl/DriverUnavailable.php`, `src/Ssl/Cooldown.php`, `src/Ssl/AuthorizerSupport.php`, `src/Ssl/DeletionAuthorizer.php`
+- Test: `tests/integration/Ssl/DriverFactoryTest.php`, `tests/integration/Ssl/DeletionAuthorizerTest.php`
 
 **Interfaces:**
 - Consumes: everything above, `FreshProof` (Plan 06).
 - Produces:
-  - `SslDriverRegistry::register()`, `::get()`, `::default()`.
+  - `SslDriverRegistry::register()`, `::get()`, `::default()`, `::ids(): string[]`.
+  - `PostDomain\Ssl\DriverUnavailable` — readonly `string $reason`, `string $driver_id`.
+  - `PostDomain\Ssl\DriverFactory::registry(): SslDriverRegistry`, `::selected_driver_id(): string`, `::for_mapping( Mapping $m ): SslDriver|DriverUnavailable`, `::for_new_mapping(): SslDriver|DriverUnavailable`, `::reset(): void`.
   - `Cooldown::active_for()`, `::set()`.
-  - `PostDomain\Ssl\AuthorizerSupport::open_window( MappingRepository $repo, SslDriverRegistry $reg, MutationLease $lease, Mapping $m, MutationOperation $op ): array{driver: SslDriver, context: SslResourceContext, lease: array{token: string, revision: int}, mapping: Mapping}|MutationRefusal`, `::check_identity( SslDriver $d, SslResourceContext $c, bool $require_bound_match ): ?MutationRefusal`, and `::refuse( MutationLease $l, Mapping $m, ?array $held, MutationKind $k, string $precondition, bool $transient ): MutationRefusal` — which **releases the reservation**.
-  - `DeletionAuthorizer::authorize( Mapping $m ): array{auth: MutationAuthorization, context: SslResourceContext, driver: SslDriver}|MutationRefusal`.
+  - `PostDomain\Ssl\AuthorizerSupport::open_window( MappingRepository $repo, MutationLease $lease, Mapping $m, MutationOperation $op ): array{driver: SslDriver, context: SslResourceContext, lease: array{token: string, revision: int}, mapping: Mapping}|MutationRefusal` — resolves its driver through `DriverFactory`, so no caller can supply a different registry, `::check_identity( SslDriver $d, SslResourceContext $c, bool $require_bound_match ): ?MutationRefusal`, and `::refuse( MutationLease $l, Mapping $m, ?array $held, MutationKind $k, string $precondition, bool $transient ): MutationRefusal` — which **releases the reservation**.
+  - `DeletionAuthorizer::__construct( MappingRepository $repo, FreshProof $proof, MutationLease $lease, Clock $clock )` with `::authorize( Mapping $m ): array{auth: MutationAuthorization, context: SslResourceContext, driver: SslDriver, lease: array{token: string, revision: int}, mapping: Mapping}|MutationRefusal`. No authorizer takes a registry: they all resolve through `DriverFactory`.
 
 Plan 08's create, adopt, and method-change authorizers reuse `AuthorizerSupport`
 so all four share one precondition core and one release rule.
+
+**One registry, built one way.** `DriverFactory` is the single place production
+code obtains drivers — REST, cron, reconciliation, recovery, Admin, and CLI all
+call it, and none of them builds a registry of its own. It always registers
+`NullDriver`, adds each built-in driver whose configuration is complete, then
+applies `pd_ssl_drivers` over that array so integrators can extend or replace the
+set (spec §11.6). Plan 09 adds `CloudflareSaasDriver` to the built-in list; the
+factory's shape does not change when it does.
+
+Resolution is deliberately asymmetric, because the two questions are different:
+
+| Question | Answer |
+|---|---|
+| Which driver owns this existing resource? | the mapping's stored `ssl_provider`, always — a row bound to a provider is never reinterpreted |
+| Which driver should provision a mapping that has none? | the **explicitly configured** selection, never a fallback |
+
+A request to provision managed SSL is never silently answered by `NullDriver`,
+and a selection naming a driver that is absent or misconfigured returns a named
+`DriverUnavailable` rather than a working-looking no-op.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -3438,9 +4096,8 @@ use PostDomain\Ssl\IdentityVerdict;
 use PostDomain\Ssl\MutationAuthorization;
 use PostDomain\Ssl\MutationKind;
 use PostDomain\Ssl\MutationLease;
+use PostDomain\Ssl\DriverFactory;
 use PostDomain\Ssl\MutationRefusal;
-use PostDomain\Ssl\NullDriver;
-use PostDomain\Ssl\SslDriverRegistry;
 use PostDomain\Support\Schema;
 use PostDomain\Support\SystemClock;
 use PostDomain\Tests\Integration\Ssl\Fixtures\RecordingDriver;
@@ -3458,8 +4115,17 @@ final class DeletionAuthorizerTest extends WP_UnitTestCase {
 		Schema::install();
 		delete_option( 'pd_environment_mismatch' );
 		delete_option( 'pd_provider_cooldowns' );
+		delete_option( 'pd_settings' );
+		DriverFactory::reset();
 		$this->repo = new DbRepository();
 		Environment::remember_primary_host();
+	}
+
+	public function tear_down(): void {
+		remove_all_filters( 'pd_ssl_drivers' );
+		delete_option( 'pd_settings' );
+		DriverFactory::reset();
+		parent::tear_down();
 	}
 
 	private function proof( DnsOutcome $outcome ): FreshProof {
@@ -3475,12 +4141,21 @@ final class DeletionAuthorizerTest extends WP_UnitTestCase {
 	}
 
 	private function authorizer( RecordingDriver $driver, FreshProof $proof ): DeletionAuthorizer {
-		$registry = new SslDriverRegistry( new NullDriver() );
-		$registry->register( $driver );
+		// Drivers reach production through one factory, so tests supply them the
+		// same way a site would rather than injecting a private registry.
+		add_filter(
+			'pd_ssl_drivers',
+			static function ( array $drivers ) use ( $driver ): array {
+				$drivers[] = $driver;
+
+				return $drivers;
+			}
+		);
+		update_option( 'pd_settings', array( 'ssl_driver' => $driver->id() ), false );
+		DriverFactory::reset();
 
 		return new DeletionAuthorizer(
 			$this->repo,
-			$registry,
 			$proof,
 			new MutationLease( new SystemClock() ),
 			new SystemClock()
@@ -3528,6 +4203,7 @@ final class DeletionAuthorizerTest extends WP_UnitTestCase {
 	public function test_driver_not_registered(): void {
 		global $wpdb;
 
+		// A row bound to a provider nobody registers: unreadable, so unmutable.
 		$m = $this->deletable();
 		$wpdb->update( // phpcs:ignore WordPress.DB
 			Schema::domains_table(),
@@ -3540,6 +4216,35 @@ final class DeletionAuthorizerTest extends WP_UnitTestCase {
 
 		$this->assertInstanceOf( MutationRefusal::class, $result );
 		$this->assertSame( 'driver_not_registered', $result->precondition );
+	}
+
+	public function test_no_configured_driver_refuses_by_name(): void {
+		global $wpdb;
+
+		$m = $this->deletable();
+		$this->authorizer( RecordingDriver::succeeding( 'ref-1' ), $this->proof( DnsOutcome::MATCH ) );
+
+		$wpdb->update( // phpcs:ignore WordPress.DB
+			Schema::domains_table(),
+			array( 'ssl_provider' => null ),
+			array( 'id' => $m->id )
+		);
+		delete_option( 'pd_settings' );
+		DriverFactory::reset();
+
+		$result = ( new DeletionAuthorizer(
+			$this->repo,
+			$this->proof( DnsOutcome::MATCH ),
+			new MutationLease( new SystemClock() ),
+			new SystemClock()
+		) )->authorize( $this->repo->by_id( $m->id ) );
+
+		$this->assertInstanceOf( MutationRefusal::class, $result );
+		$this->assertSame(
+			'ssl_not_configured',
+			$result->precondition,
+			'never a silent NullDriver no-op'
+		);
 	}
 
 	public function test_provider_cooldown(): void {
@@ -3681,7 +4386,7 @@ final class DeletionAuthorizerTest extends WP_UnitTestCase {
 - [ ] **Step 2: Run the test to verify it fails**
 
 Run: `composer test:integration -- --filter DeletionAuthorizerTest`
-Expected: FAIL — `Error: Class "PostDomain\Ssl\SslDriverRegistry" not found`
+Expected: FAIL — `Error: Class "PostDomain\Ssl\DeletionAuthorizer" not found`
 
 - [ ] **Step 3: Write minimal implementation**
 
@@ -3714,6 +4419,137 @@ final class SslDriverRegistry {
 
 	public function default(): SslDriver {
 		return $this->fallback;
+	}
+
+	/** @return string[] */
+	public function ids(): array {
+		return array_keys( $this->drivers );
+	}
+}
+```
+
+Create `src/Ssl/DriverUnavailable.php`:
+
+```php
+<?php
+declare( strict_types = 1 );
+
+namespace PostDomain\Ssl;
+
+/**
+ * A named refusal. Returned instead of a driver so a misconfiguration is
+ * reported as one, rather than silently becoming a no-op provisioning run.
+ */
+final class DriverUnavailable {
+
+	public function __construct(
+		public readonly string $reason,
+		public readonly string $driver_id
+	) {}
+}
+```
+
+Create `src/Ssl/DriverFactory.php`:
+
+```php
+<?php
+declare( strict_types = 1 );
+
+namespace PostDomain\Ssl;
+
+use PostDomain\Contracts\SslDriver;
+use PostDomain\Mapping\Mapping;
+
+/**
+ * The single production source of SSL drivers. REST, cron, reconciliation,
+ * recovery, Admin, and CLI all resolve through here, so they cannot disagree
+ * about which drivers exist or which one is selected.
+ */
+final class DriverFactory {
+
+	public const NULL_DRIVER = 'null';
+
+	private static ?SslDriverRegistry $registry = null;
+
+	public static function registry(): SslDriverRegistry {
+		if ( null !== self::$registry ) {
+			return self::$registry;
+		}
+
+		$null     = new NullDriver();
+		$registry = new SslDriverRegistry( $null );
+
+		/**
+		 * The documented default is every built-in driver whose configuration is
+		 * complete, with NullDriver always present (spec §11.6).
+		 *
+		 * @var SslDriver[] $drivers
+		 */
+		$drivers = (array) apply_filters( 'pd_ssl_drivers', array_merge( array( $null ), self::built_in_drivers() ) );
+
+		foreach ( $drivers as $driver ) {
+			if ( $driver instanceof SslDriver ) {
+				$registry->register( $driver );
+			}
+		}
+
+		self::$registry = $registry;
+
+		return $registry;
+	}
+
+	/**
+	 * Built-in drivers that are configured well enough to construct. Plan 09 adds
+	 * Cloudflare here; nothing else about this class changes when it does.
+	 *
+	 * @return SslDriver[]
+	 */
+	private static function built_in_drivers(): array {
+		return array();
+	}
+
+	/** The operator's explicit choice. There is no implicit one. */
+	public static function selected_driver_id(): string {
+		if ( defined( 'PD_SSL_DRIVER' ) ) {
+			return (string) constant( 'PD_SSL_DRIVER' );
+		}
+
+		$settings = get_option( 'pd_settings', array() );
+
+		return is_array( $settings ) && isset( $settings['ssl_driver'] )
+			? (string) $settings['ssl_driver']
+			: self::NULL_DRIVER;
+	}
+
+	/** @return SslDriver|DriverUnavailable */
+	public static function for_mapping( Mapping $mapping ) {
+		if ( null === $mapping->ssl_provider ) {
+			return self::for_new_mapping();
+		}
+
+		$driver = self::registry()->get( $mapping->ssl_provider );
+
+		// A bound row is never reinterpreted: without its own driver the resource
+		// cannot be read, let alone changed.
+		return $driver ?? new DriverUnavailable( 'driver_not_registered', $mapping->ssl_provider );
+	}
+
+	/** @return SslDriver|DriverUnavailable */
+	public static function for_new_mapping() {
+		$selected = self::selected_driver_id();
+
+		if ( self::NULL_DRIVER === $selected ) {
+			return new DriverUnavailable( 'ssl_not_configured', $selected );
+		}
+
+		$driver = self::registry()->get( $selected );
+
+		return $driver ?? new DriverUnavailable( 'driver_not_registered', $selected );
+	}
+
+	/** Tests and the settings screen invalidate the memoized registry. */
+	public static function reset(): void {
+		self::$registry = null;
 	}
 }
 ```
@@ -3765,11 +4601,13 @@ use PostDomain\Contracts\MappingRepository;
 use PostDomain\Contracts\SslDriver;
 use PostDomain\Mapping\EventLog;
 use PostDomain\Mapping\Mapping;
+use PostDomain\Support\AtomicTransition;
 use PostDomain\Verification\Challenge;
 
 /**
  * The precondition core every authorizer shares, including the rule that a
- * refusal after acquisition releases the reservation.
+ * refusal after acquisition releases the reservation — and records that refusal
+ * only if the release actually won.
  */
 final class AuthorizerSupport {
 
@@ -3778,7 +4616,6 @@ final class AuthorizerSupport {
 	 */
 	public static function open_window(
 		MappingRepository $repo,
-		SslDriverRegistry $registry,
 		MutationLease $lease,
 		Mapping $mapping,
 		MutationOperation $operation
@@ -3787,12 +4624,12 @@ final class AuthorizerSupport {
 			return new MutationRefusal( 'environment_unresolved', false );
 		}
 
-		$driver = null === $mapping->ssl_provider
-			? $registry->default()
-			: $registry->get( $mapping->ssl_provider );
+		// One factory, never a locally-built registry, and never a silent
+		// fallback to NullDriver for a mapping that has no provider yet.
+		$driver = DriverFactory::for_mapping( $mapping );
 
-		if ( null === $driver ) {
-			return new MutationRefusal( 'driver_not_registered', false );
+		if ( $driver instanceof DriverUnavailable ) {
+			return new MutationRefusal( $driver->reason, false, $driver->driver_id );
 		}
 
 		if ( Cooldown::active_for( $driver->id() ) ) {
@@ -3843,18 +4680,34 @@ final class AuthorizerSupport {
 		string $precondition,
 		bool $transient
 	): MutationRefusal {
-		if ( null !== $held ) {
-			$lease->release_reserved( $mapping->id, $held['revision'], $held['token'], $kind );
-		}
-
-		EventLog::record(
+		$event = static fn(): bool => EventLog::record(
 			$mapping->id,
 			$mapping->host,
 			'ssl',
 			null,
-			null,
+			'refused',
 			'cron',
 			array( 'refused' => $precondition, 'transient' => $transient )
+		);
+
+		if ( null === $held ) {
+			// Nothing was reserved, so there is no CAS to pair the event with.
+			$event();
+
+			return new MutationRefusal( $precondition, $transient );
+		}
+
+		// The release is the transition; the refusal event belongs to it. If the
+		// release loses — someone else already owns the row — no event is written,
+		// because this worker's refusal is no longer part of that row's history.
+		AtomicTransition::commit(
+			static fn(): bool => $lease->release_reserved(
+				$mapping->id,
+				$held['revision'],
+				$held['token'],
+				$kind
+			),
+			$event
 		);
 
 		return new MutationRefusal( $precondition, $transient );
@@ -3918,7 +4771,6 @@ final class DeletionAuthorizer {
 
 	public function __construct(
 		private readonly MappingRepository $repo,
-		private readonly SslDriverRegistry $registry,
 		private readonly FreshProof $proof,
 		private readonly MutationLease $lease,
 		private readonly Clock $clock
@@ -3930,7 +4782,6 @@ final class DeletionAuthorizer {
 	public function authorize( Mapping $mapping ) {
 		$window = AuthorizerSupport::open_window(
 			$this->repo,
-			$this->registry,
 			$this->lease,
 			$mapping,
 			MutationOperation::REMOVE
@@ -3993,20 +4844,184 @@ final class DeletionAuthorizer {
 - [ ] **Step 4: Run the test to verify it passes**
 
 Run: `composer test:integration -- --filter DeletionAuthorizerTest`
-Expected: PASS — 14 tests
+Expected: PASS — 15 tests
 
-- [ ] **Step 5: Run the full suite**
+- [ ] **Step 5: Write the failing test for the driver factory**
+
+Create `tests/integration/Ssl/DriverFactoryTest.php`:
+
+```php
+<?php
+declare( strict_types = 1 );
+
+namespace PostDomain\Tests\Integration\Ssl;
+
+use PostDomain\Mapping\ActivationState;
+use PostDomain\Mapping\DbRepository;
+use PostDomain\Mapping\Mapping;
+use PostDomain\Mapping\SslState;
+use PostDomain\Mapping\VerificationState;
+use PostDomain\Ssl\DriverFactory;
+use PostDomain\Ssl\DriverUnavailable;
+use PostDomain\Ssl\NullDriver;
+use PostDomain\Support\Schema;
+use PostDomain\Tests\Integration\Ssl\Fixtures\RecordingDriver;
+use WP_UnitTestCase;
+
+final class DriverFactoryTest extends WP_UnitTestCase {
+
+	private DbRepository $repo;
+
+	public function set_up(): void {
+		parent::set_up();
+		Schema::install();
+		delete_option( 'pd_settings' );
+		DriverFactory::reset();
+		$this->repo = new DbRepository();
+	}
+
+	public function tear_down(): void {
+		remove_all_filters( 'pd_ssl_drivers' );
+		DriverFactory::reset();
+		parent::tear_down();
+	}
+
+	private function select( string $id ): void {
+		update_option( 'pd_settings', array( 'ssl_driver' => $id ), false );
+		DriverFactory::reset();
+	}
+
+	private function add_recording_driver(): void {
+		add_filter(
+			'pd_ssl_drivers',
+			static function ( array $drivers ): array {
+				$drivers[] = RecordingDriver::succeeding( 'ref-1' );
+
+				return $drivers;
+			}
+		);
+		DriverFactory::reset();
+	}
+
+	private function mapping( ?string $provider ): Mapping {
+		return $this->repo->save(
+			new Mapping(
+				0, 'mapped.test', null, self::factory()->post->create(), 1,
+				VerificationState::VERIFIED, ActivationState::ACTIVE, SslState::NONE,
+				null, str_repeat( 'a', 32 ), '_post-domain-challenge',
+				null, null, $provider, null === $provider ? null : 'ref-1'
+			)
+		);
+	}
+
+	public function test_the_null_driver_is_always_registered(): void {
+		$this->assertInstanceOf( NullDriver::class, DriverFactory::registry()->default() );
+		$this->assertContains( DriverFactory::NULL_DRIVER, DriverFactory::registry()->ids() );
+	}
+
+	public function test_the_registry_is_the_same_object_for_every_caller(): void {
+		$this->assertSame(
+			DriverFactory::registry(),
+			DriverFactory::registry(),
+			'REST and cron must not be able to build different registries'
+		);
+	}
+
+	public function test_no_selection_means_ssl_is_not_configured(): void {
+		$result = DriverFactory::for_new_mapping();
+
+		$this->assertInstanceOf( DriverUnavailable::class, $result );
+		$this->assertSame( 'ssl_not_configured', $result->reason );
+	}
+
+	public function test_an_unknown_selected_driver_is_a_named_refusal(): void {
+		$this->select( 'not-a-driver' );
+
+		$result = DriverFactory::for_new_mapping();
+
+		$this->assertInstanceOf( DriverUnavailable::class, $result );
+		$this->assertSame( 'driver_not_registered', $result->reason );
+		$this->assertSame( 'not-a-driver', $result->driver_id );
+	}
+
+	public function test_a_filter_added_driver_becomes_selectable(): void {
+		$this->add_recording_driver();
+		$this->select( 'recording' );
+
+		$this->assertInstanceOf( RecordingDriver::class, DriverFactory::for_new_mapping() );
+	}
+
+	public function test_a_mapping_with_no_provider_resolves_through_the_selection(): void {
+		$this->add_recording_driver();
+		$this->select( 'recording' );
+
+		$this->assertInstanceOf( RecordingDriver::class, DriverFactory::for_mapping( $this->mapping( null ) ) );
+	}
+
+	public function test_a_mapping_with_no_provider_is_never_silently_answered_by_the_null_driver(): void {
+		$result = DriverFactory::for_mapping( $this->mapping( null ) );
+
+		$this->assertInstanceOf( DriverUnavailable::class, $result );
+		$this->assertSame( 'ssl_not_configured', $result->reason );
+	}
+
+	public function test_an_existing_mapping_keeps_its_stored_provider(): void {
+		$this->add_recording_driver();
+		$this->select( DriverFactory::NULL_DRIVER );
+
+		$this->assertInstanceOf(
+			RecordingDriver::class,
+			DriverFactory::for_mapping( $this->mapping( 'recording' ) ),
+			'a bound row is never reinterpreted by the current selection'
+		);
+	}
+
+	public function test_a_stored_provider_with_no_registered_driver_is_a_named_refusal(): void {
+		$result = DriverFactory::for_mapping( $this->mapping( 'retired-driver' ) );
+
+		$this->assertInstanceOf( DriverUnavailable::class, $result );
+		$this->assertSame( 'driver_not_registered', $result->reason );
+	}
+
+	public function test_a_deliberate_null_selection_still_reads_existing_null_rows(): void {
+		$this->select( DriverFactory::NULL_DRIVER );
+
+		$this->assertInstanceOf(
+			NullDriver::class,
+			DriverFactory::for_mapping( $this->mapping( DriverFactory::NULL_DRIVER ) )
+		);
+	}
+
+	public function test_a_filter_returning_junk_is_ignored_rather_than_fatal(): void {
+		add_filter( 'pd_ssl_drivers', static fn(): array => array( 'not a driver', 42 ) );
+		DriverFactory::reset();
+
+		$this->assertInstanceOf( NullDriver::class, DriverFactory::registry()->default() );
+	}
+}
+```
+
+- [ ] **Step 6: Run it and verify it passes**
+
+Run: `composer test:integration -- --filter DriverFactoryTest`
+Expected: PASS — 11 tests
+
+- [ ] **Step 7: Run the full suite**
 
 Run: `composer lint && composer analyse && composer test && composer test:integration`
 Expected: PASS
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 8: Commit**
 
 ```bash
-git add src/Ssl/SslDriverRegistry.php src/Ssl/Cooldown.php src/Ssl/AuthorizerSupport.php src/Ssl/DeletionAuthorizer.php tests/integration/Ssl/DeletionAuthorizerTest.php
-git commit -m "Require every precondition before a deletion, and release on refusal
+git add src/Ssl/SslDriverRegistry.php src/Ssl/DriverFactory.php src/Ssl/DriverUnavailable.php src/Ssl/Cooldown.php src/Ssl/AuthorizerSupport.php src/Ssl/DeletionAuthorizer.php tests/integration/Ssl/DriverFactoryTest.php tests/integration/Ssl/DeletionAuthorizerTest.php
+git commit -m "Resolve every SSL driver through one factory, and refuse by name
 
-Cached verification is explicitly insufficient. Each refusal after acquisition
+An existing mapping resolves through its stored provider; a new one resolves
+through the explicit selection and nothing else. A missing or misconfigured
+driver is a named refusal, never a no-op that looks like it worked.
+
+Deletion requires every precondition first, and each refusal after acquisition
 releases the reservation, so a rejected attempt never leaves the row leased and
 waiting for a recovery pass that has nothing to recover."
 ```
@@ -4027,4 +5042,7 @@ expired and unexpired, and that each of the nine bound values invalidates
 consumption when changed; `LeaseRecoveryTest` proves the fence precedes the read
 and that recovery reaches a conclusive token-owned result; `DeletionAuthorizerTest`
 proves every precondition individually and that each refusal releases the
-reservation.
+reservation; `DriverFactoryTest` proves a mapping with no provider is never
+silently answered by `NullDriver` and that REST and cron cannot obtain different
+registries; `TimingPolicyTest` proves both durations strictly exceed the provider
+timeout plus the margin.

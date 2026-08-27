@@ -33,7 +33,7 @@ Inherit Plans 01–10, and add:
 
 | File | Responsibility |
 |---|---|
-| `src/Admin/SettingsPage.php` | Menu registration and the settings screen |
+| `src/Admin/SettingsPage.php` | Menu registration, the settings screen, and the SSL driver selection |
 | `src/Admin/MappingListTable.php` | The domains list |
 | `src/Admin/DomainDetail.php` | Plan rendering, event log, deletion checklist |
 | `src/Admin/Diagnostics.php` | Every check that turns a silent failure visible |
@@ -54,7 +54,12 @@ Inherit Plans 01–10, and add:
 
 **Interfaces:**
 - Consumes: `MappingRepository` (Plan 02), `MappingSerializer` (Plan 10), `Environment` (Plan 07).
-- Produces: `SettingsPage::register(): void`, `MappingListTable::rows(): array`, `EnvironmentNotice::render(): string`.
+- Produces: `SettingsPage::register(): void`, `SettingsPage::render_driver_selection(): string`, `SettingsPage::save_driver_selection(): void`, `MappingListTable::rows(): array`, `EnvironmentNotice::render(): string`.
+
+The SSL driver selection lives here because it is the one setting that decides
+whether managed certificates happen at all. It offers exactly what
+`DriverFactory::registry()` holds — never a free-text field — and resets the
+memoized registry after saving, so the next request does not serve a stale set.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -287,8 +292,81 @@ final class SettingsPage {
 		EnvironmentNotice::register();
 	}
 
+	/**
+	 * The selection is a closed list drawn from the registry, so an operator
+	 * cannot name a driver that does not exist and then wonder why nothing
+	 * provisions.
+	 */
+	public static function render_driver_selection(): string {
+		$selected = \PostDomain\Ssl\DriverFactory::selected_driver_id();
+		$html     = '<h2>' . esc_html__( 'Certificate provider', 'post-domain' ) . '</h2>';
+		$html    .= '<select name="pd_ssl_driver">';
+
+		foreach ( \PostDomain\Ssl\DriverFactory::registry()->ids() as $id ) {
+			$label = \PostDomain\Ssl\DriverFactory::NULL_DRIVER === $id
+				? __( 'None — certificates are managed outside this plugin', 'post-domain' )
+				: $id;
+
+			$html .= sprintf(
+				'<option value="%s"%s>%s</option>',
+				esc_attr( $id ),
+				selected( $selected, $id, false ),
+				esc_html( $label )
+			);
+		}
+
+		$html .= '</select>';
+
+		if ( ! in_array( $selected, \PostDomain\Ssl\DriverFactory::registry()->ids(), true ) ) {
+			// Named plainly rather than silently corrected: the stored value is
+			// still what the site asked for, and the operator should see that.
+			$html .= '<p class="notice notice-error">' . sprintf(
+				/* translators: %s: the configured driver identifier. */
+				esc_html__( 'The configured provider "%s" is not registered. Certificates will not be requested until this is resolved.', 'post-domain' ),
+				esc_html( $selected )
+			) . '</p>';
+		}
+
+		return $html;
+	}
+
+	public static function save_driver_selection(): void {
+		if ( ! isset( $_POST['pd_ssl_driver'] ) || ! check_admin_referer( 'pd_settings' ) ) {
+			return;
+		}
+
+		$capability = (string) apply_filters( 'pd_rest_capability', 'manage_options', 'admin' );
+
+		if ( ! current_user_can( '' === $capability ? 'manage_options' : $capability ) ) {
+			return;
+		}
+
+		$requested = sanitize_text_field( wp_unslash( (string) $_POST['pd_ssl_driver'] ) );
+
+		if ( ! in_array( $requested, \PostDomain\Ssl\DriverFactory::registry()->ids(), true ) ) {
+			return;
+		}
+
+		$settings = get_option( 'pd_settings', array() );
+		$settings = is_array( $settings ) ? $settings : array();
+
+		$settings['ssl_driver'] = $requested;
+
+		update_option( 'pd_settings', $settings, false );
+
+		// The registry is memoized per request; the next one must see this.
+		\PostDomain\Ssl\DriverFactory::reset();
+	}
+
 	public static function render(): void {
+		self::save_driver_selection();
+
 		echo '<div class="wrap"><h1>' . esc_html__( 'Domain mappings', 'post-domain' ) . '</h1>';
+		echo '<form method="post">';
+		wp_nonce_field( 'pd_settings' );
+		echo wp_kses_post( self::render_driver_selection() );
+		submit_button( __( 'Save', 'post-domain' ) );
+		echo '</form>';
 		echo '<table class="widefat"><thead><tr>';
 
 		foreach (
@@ -335,7 +413,95 @@ Add to `src/Plugin.php`, inside `boot()`:
 Run: `composer test:integration -- --filter AdminScreensTest`
 Expected: PASS — 6 tests
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 5: Write the failing test for the driver selection**
+
+Append to `tests/integration/Admin/AdminScreensTest.php`:
+
+```php
+	public function test_the_selection_offers_only_registered_drivers(): void {
+		\PostDomain\Ssl\DriverFactory::reset();
+
+		$html = SettingsPage::render_driver_selection();
+
+		foreach ( \PostDomain\Ssl\DriverFactory::registry()->ids() as $id ) {
+			$this->assertStringContainsString( 'value="' . $id . '"', $html );
+		}
+
+		$this->assertStringNotContainsString( 'type="text"', $html, 'a free-text driver name is a trap' );
+	}
+
+	public function test_an_unregistered_configured_driver_is_reported_not_corrected(): void {
+		update_option( 'pd_settings', array( 'ssl_driver' => 'gone-away' ), false );
+		\PostDomain\Ssl\DriverFactory::reset();
+
+		$html = SettingsPage::render_driver_selection();
+
+		$this->assertStringContainsString( 'gone-away', $html );
+		$this->assertStringContainsString( 'notice-error', $html );
+		$this->assertSame( 'gone-away', \PostDomain\Ssl\DriverFactory::selected_driver_id() );
+
+		delete_option( 'pd_settings' );
+		\PostDomain\Ssl\DriverFactory::reset();
+	}
+
+	public function test_saving_an_unregistered_driver_is_ignored(): void {
+		wp_set_current_user( self::factory()->user->create( array( 'role' => 'administrator' ) ) );
+
+		$_POST['pd_ssl_driver'] = 'not-a-driver';
+		$_POST['_wpnonce']      = wp_create_nonce( 'pd_settings' );
+
+		SettingsPage::save_driver_selection();
+
+		$this->assertSame(
+			\PostDomain\Ssl\DriverFactory::NULL_DRIVER,
+			\PostDomain\Ssl\DriverFactory::selected_driver_id()
+		);
+
+		unset( $_POST['pd_ssl_driver'], $_POST['_wpnonce'] );
+	}
+
+	public function test_saving_resets_the_memoized_registry(): void {
+		wp_set_current_user( self::factory()->user->create( array( 'role' => 'administrator' ) ) );
+
+		\PostDomain\Ssl\DriverFactory::registry();
+
+		$_POST['pd_ssl_driver'] = \PostDomain\Ssl\DriverFactory::NULL_DRIVER;
+		$_POST['_wpnonce']      = wp_create_nonce( 'pd_settings' );
+
+		SettingsPage::save_driver_selection();
+
+		$this->assertSame(
+			\PostDomain\Ssl\DriverFactory::NULL_DRIVER,
+			\PostDomain\Ssl\DriverFactory::selected_driver_id()
+		);
+
+		unset( $_POST['pd_ssl_driver'], $_POST['_wpnonce'] );
+	}
+
+	public function test_a_subscriber_cannot_change_the_selection(): void {
+		wp_set_current_user( self::factory()->user->create( array( 'role' => 'subscriber' ) ) );
+
+		$_POST['pd_ssl_driver'] = \PostDomain\Ssl\DriverFactory::NULL_DRIVER;
+		$_POST['_wpnonce']      = wp_create_nonce( 'pd_settings' );
+
+		update_option( 'pd_settings', array( 'ssl_driver' => 'preexisting' ), false );
+
+		SettingsPage::save_driver_selection();
+
+		$this->assertSame( 'preexisting', \PostDomain\Ssl\DriverFactory::selected_driver_id() );
+
+		unset( $_POST['pd_ssl_driver'], $_POST['_wpnonce'] );
+		delete_option( 'pd_settings' );
+		\PostDomain\Ssl\DriverFactory::reset();
+	}
+```
+
+- [ ] **Step 6: Run it and verify it passes**
+
+Run: `composer test:integration -- --filter AdminScreensTest`
+Expected: PASS — 11 tests
+
+- [ ] **Step 7: Commit**
 
 ```bash
 git add src/Admin/SettingsPage.php src/Admin/MappingListTable.php src/Admin/EnvironmentNotice.php src/Plugin.php tests/integration/Admin/AdminScreensTest.php
@@ -776,10 +942,66 @@ final class DiagnosticsTest extends WP_UnitTestCase {
 				'apex_configuration',
 				'marker_support',
 				'environment',
+				'ssl_driver',
+				'long_recoveries',
 			) as $key
 		) {
 			$this->assertArrayHasKey( $key, $checks, "missing diagnostic {$key}" );
 		}
+	}
+
+	public function test_no_selected_driver_is_reported_as_a_warning(): void {
+		delete_option( 'pd_settings' );
+		\PostDomain\Ssl\DriverFactory::reset();
+
+		$check = Diagnostics::checks()['ssl_driver'];
+
+		$this->assertSame( 'warning', $check['status'] );
+		$this->assertStringContainsString( 'never', $check['detail'] );
+	}
+
+	public function test_an_unregistered_selected_driver_is_reported_as_an_error(): void {
+		update_option( 'pd_settings', array( 'ssl_driver' => 'gone-away' ), false );
+		\PostDomain\Ssl\DriverFactory::reset();
+
+		$check = Diagnostics::checks()['ssl_driver'];
+
+		$this->assertSame( 'error', $check['status'] );
+		$this->assertStringContainsString( 'gone-away', $check['detail'] );
+
+		delete_option( 'pd_settings' );
+		\PostDomain\Ssl\DriverFactory::reset();
+	}
+
+	public function test_a_long_running_recovery_is_surfaced(): void {
+		global $wpdb;
+
+		$mapping = ( new DbRepository() )->save(
+			new Mapping(
+				0, 'stuck.test', null, self::factory()->post->create(), 1,
+				VerificationState::VERIFIED, ActivationState::ACTIVE, SslState::REQUESTED,
+				null, str_repeat( 'b', 32 ), '_post-domain-challenge'
+			)
+		);
+
+		$wpdb->update( // phpcs:ignore WordPress.DB
+			Schema::domains_table(),
+			array(
+				'ssl_mutation_token'      => str_repeat( '3', 32 ),
+				'ssl_mutation_kind'       => MutationKind::CREATE->value,
+				'ssl_mutation_phase'      => 'recovering',
+				'ssl_mutation_expires_at' => gmdate( 'Y-m-d H:i:s', time() + 600 ),
+				'ssl_next_attempt_at'     => gmdate( 'Y-m-d H:i:s', time() + 300 ),
+				'ssl_transient_count'     => 9,
+			),
+			array( 'id' => $mapping->id )
+		);
+
+		$check = Diagnostics::checks()['long_recoveries'];
+
+		$this->assertSame( 'warning', $check['status'] );
+		$this->assertStringContainsString( 'stuck.test', $check['detail'] );
+		$this->assertStringContainsString( '9 reads', $check['detail'] );
 	}
 
 	public function test_a_stale_lease_is_reported_with_its_phase(): void {
@@ -1061,7 +1283,90 @@ final class Diagnostics {
 			'apex_configuration'   => self::apex(),
 			'marker_support'       => self::markers(),
 			'environment'          => self::environment(),
+			'ssl_driver'           => self::ssl_driver(),
+			'long_recoveries'      => self::long_recoveries(),
 		);
+	}
+
+	/**
+	 * Silence is the failure mode this catches: with no provider selected the
+	 * plugin works perfectly and never requests a certificate.
+	 *
+	 * @return array{status: string, detail: string}
+	 */
+	private static function ssl_driver(): array {
+		$selected   = \PostDomain\Ssl\DriverFactory::selected_driver_id();
+		$registered = \PostDomain\Ssl\DriverFactory::registry()->ids();
+
+		if ( \PostDomain\Ssl\DriverFactory::NULL_DRIVER === $selected ) {
+			return array(
+				'status' => 'warning',
+				'detail' => __( 'No certificate provider is selected, so no certificate will ever be requested.', 'post-domain' ),
+			);
+		}
+
+		if ( ! in_array( $selected, $registered, true ) ) {
+			return array(
+				'status' => 'error',
+				'detail' => sprintf(
+					/* translators: 1: configured driver id, 2: comma-separated registered ids. */
+					__( 'The configured provider "%1$s" is not registered. Registered: %2$s.', 'post-domain' ),
+					$selected,
+					implode( ', ', $registered )
+				),
+			);
+		}
+
+		return array(
+			'status' => 'ok',
+			'detail' => sprintf(
+				/* translators: %s: the selected driver id. */
+				__( 'Certificates are provisioned through "%s".', 'post-domain' ),
+				$selected
+			),
+		);
+	}
+
+	/**
+	 * A recovery that keeps reading without reaching a conclusion is bounded by
+	 * backoff, not by a give-up rule, so it has to be visible.
+	 *
+	 * @return array{status: string, detail: string}
+	 */
+	private static function long_recoveries(): array {
+		global $wpdb;
+
+		/** @var array<int, array<string, string|null>> $rows */
+		$rows = $wpdb->get_results( // phpcs:ignore WordPress.DB
+			$wpdb->prepare(
+				'SELECT host, ssl_mutation_kind, ssl_transient_count, ssl_next_attempt_at
+				   FROM ' . Schema::domains_table() . '
+				  WHERE ssl_mutation_phase = %s AND ssl_transient_count >= %d
+				  ORDER BY ssl_transient_count DESC
+				  LIMIT 20',
+				'recovering',
+				5
+			),
+			ARRAY_A
+		);
+
+		if ( array() === $rows ) {
+			return array( 'status' => 'ok', 'detail' => __( 'No long-running recoveries.', 'post-domain' ) );
+		}
+
+		$lines = array();
+
+		foreach ( $rows as $row ) {
+			$lines[] = sprintf(
+				'%s (%s): %d reads, next %s',
+				(string) $row['host'],
+				(string) $row['ssl_mutation_kind'],
+				(int) $row['ssl_transient_count'],
+				(string) $row['ssl_next_attempt_at']
+			);
+		}
+
+		return array( 'status' => 'warning', 'detail' => implode( '; ', $lines ) );
 	}
 
 	/** The iframe that runs the CORS probe on the mapped origin. */
@@ -1226,7 +1531,7 @@ final class Diagnostics {
 - [ ] **Step 4: Run the test to verify it passes**
 
 Run: `composer test:integration -- --filter DiagnosticsTest`
-Expected: PASS — 8 tests
+Expected: PASS — 11 tests
 
 - [ ] **Step 5: Commit**
 
@@ -1291,6 +1596,9 @@ final class ReadmeTest extends TestCase {
 			'create ambiguity'    => array( 'adopt' ),
 			'clone detection'     => array( 'clone' ),
 			'resolver trust'      => array( 'pd_dns_resolver' ),
+			'driver selection'    => array( 'Certificate provider' ),
+			'no silent no-op'     => array( 'pd_ssl_not_configured' ),
+			'event atomicity'     => array( 'pd_schema_engine' ),
 			'dcv default'         => array( 'txt' ),
 			'apex entitlement'    => array( 'BYOIP' ),
 			'dns neutrality'      => array( 'authoritative DNS' ),
@@ -1382,11 +1690,23 @@ below is required; the test above pins the phrases that must appear.
     promises.
 19. **Uninstall** — delete mappings **before uninstalling** so the durable removal
     workflow runs; uninstalling drops the ownership provenance along with the rows.
+20. **Choosing a certificate provider** — the **Certificate provider** setting is
+    what turns managed SSL on; with nothing selected the plugin runs correctly and
+    simply never requests a certificate, and a provisioning request answers
+    **`pd_ssl_not_configured`** rather than pretending to have done something.
+    Incomplete provider credentials leave that provider unregistered, which reads
+    as a configuration problem instead of a transport failure.
+21. **Why an SSL request can answer 409** — `pd_mutation_fenced` means recovery
+    took the mutation over and the local result was discarded; nothing was written
+    and nothing was retried, so re-read the mapping before trying again.
+22. **Event log fidelity** — on InnoDB (`pd_schema_engine`) a state change and its
+    event row commit together; on any other engine the log is best-effort and may
+    lag or miss rows. Nothing reads it to make a decision either way.
 
 - [ ] **Step 4: Run the test to verify it passes**
 
 Run: `vendor/bin/phpunit --testsuite unit --filter ReadmeTest`
-Expected: PASS — 23 tests
+Expected: PASS — 26 tests
 
 - [ ] **Step 5: Commit**
 
@@ -1631,6 +1951,9 @@ composer lint && composer analyse && composer test && composer test:integration
 ```
 
 Plus: `ReadmeTest` passes for every required topic, `DiagnosticsTest` proves no
-server-side probe exists, and `AcceptanceTest` passes end to end.
+server-side probe exists and that both an unselected and an unregistered SSL
+driver are surfaced, `AdminScreensTest` proves the driver selection offers only
+registered drivers and resets the memoized registry on save, and `AcceptanceTest`
+passes end to end.
 
 This is the final plan. When its gate is green the specification is implemented.

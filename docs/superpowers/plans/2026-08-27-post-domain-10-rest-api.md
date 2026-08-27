@@ -341,6 +341,10 @@ final class Errors {
 	public const METHOD_UNSUPPORTED       = 'pd_method_unsupported';
 	public const CONFIRMATION_REQUIRED    = 'pd_confirmation_required';
 	public const NO_DRIVER                = 'pd_no_driver';
+	public const SSL_NOT_CONFIGURED       = 'pd_ssl_not_configured';
+	public const FENCED                   = 'pd_mutation_fenced';
+	public const FINALIZATION_FAILED      = 'pd_finalization_failed';
+	public const OUTCOME_AMBIGUOUS        = 'pd_provider_outcome_ambiguous';
 	public const FORBIDDEN                = 'pd_forbidden';
 }
 ```
@@ -598,7 +602,7 @@ post lookup per row."
 - Consumes: `HostContext` (Plan 03), `MappingRepository` (Plan 02), `AuthorityParser`, `HostNormalizer` (Plan 01), `Challenge` (Plan 06), the Plan 07–09 SSL services.
 - Produces:
   - `PostDomain\Verification\ResolverFactory::from_filters(): DnsResolver` — the `pd_doh_endpoints` and `pd_dns_resolver` construction lifted out of `Plugin::dns_resolver()`, which now delegates to it.
-  - `PostDomain\Rest\SslServices::__construct( SslDriverRegistry $registry, CreateService $create, AdoptionService $adopt, MethodChangeService $method, DeletionService $delete )` with `::from_filters(): self` and `::driver_for( Mapping $m ): ?SslDriver`.
+  - `PostDomain\Rest\SslServices::__construct( CreateService $create, AdoptionService $adopt, MethodChangeService $method, DeletionService $delete )` with `::production(): self` and `::driver_for( Mapping $m ): SslDriver|DriverUnavailable`. It builds no registry: every service and the `/plan` route resolve through `DriverFactory`.
   - `PostDomain\Rest\ManagementController::__construct( MappingRepository $repo, SslServices $ssl )` with `::register(): void`, `::index()`, `::create()`.
 
 `register()` registers exactly the routes whose handlers exist. Later tasks each
@@ -642,7 +646,7 @@ final class CollectionTest extends WP_UnitTestCase {
 	}
 
 	private function register(): void {
-		( new ManagementController( $this->repo, SslServices::from_filters() ) )->register();
+		( new ManagementController( $this->repo, SslServices::production() ) )->register();
 	}
 
 	private function admin(): void {
@@ -829,12 +833,12 @@ use PostDomain\Ssl\CreateAuthorizer;
 use PostDomain\Ssl\CreateService;
 use PostDomain\Ssl\DeletionAuthorizer;
 use PostDomain\Ssl\DeletionService;
+use PostDomain\Ssl\DriverFactory;
+use PostDomain\Ssl\DriverUnavailable;
 use PostDomain\Ssl\MethodChangeAuthorizer;
 use PostDomain\Ssl\MethodChangeService;
 use PostDomain\Ssl\MutationGate;
 use PostDomain\Ssl\MutationLease;
-use PostDomain\Ssl\NullDriver;
-use PostDomain\Ssl\SslDriverRegistry;
 use PostDomain\Support\SystemClock;
 use PostDomain\Verification\FreshProof;
 use PostDomain\Verification\ResolverFactory;
@@ -846,43 +850,32 @@ use PostDomain\Verification\ResolverFactory;
 final class SslServices {
 
 	public function __construct(
-		public readonly SslDriverRegistry $registry,
 		public readonly CreateService $create,
 		public readonly AdoptionService $adopt,
 		public readonly MethodChangeService $method,
 		public readonly DeletionService $delete
 	) {}
 
-	public static function from_filters(): self {
-		$clock    = new SystemClock();
-		$lease    = new MutationLease( $clock );
-		$gate     = new MutationGate( $lease, $clock );
-		$repo     = new DbRepository();
-		$proof    = new FreshProof( ResolverFactory::from_filters() );
-		$registry = new SslDriverRegistry( new NullDriver() );
+	public static function production(): self {
+		$clock = new SystemClock();
+		$lease = new MutationLease( $clock );
+		$gate  = new MutationGate( $lease, $clock );
+		$repo  = new DbRepository();
+		$proof = new FreshProof( ResolverFactory::from_filters() );
 
-		/** @var SslDriver[] $drivers */
-		$drivers = (array) apply_filters( 'pd_ssl_drivers', array() );
-
-		foreach ( $drivers as $driver ) {
-			if ( $driver instanceof SslDriver ) {
-				$registry->register( $driver );
-			}
-		}
-
+		// No registry is built here. Every service resolves its driver through
+		// DriverFactory, which is also what cron uses, so the two cannot differ.
 		return new self(
-			$registry,
-			new CreateService( $repo, new CreateAuthorizer( $repo, $registry, $proof, $lease, $clock ), $lease, $gate, $clock ),
-			new AdoptionService( new AdoptionAuthorizer( $repo, $registry, $proof, $lease, $clock ), $lease, $gate, $clock ),
-			new MethodChangeService( new MethodChangeAuthorizer( $repo, $registry, $proof, $lease, $clock ), $lease, $gate, $clock ),
-			new DeletionService( $repo, new DeletionAuthorizer( $repo, $registry, $proof, $lease, $clock ), $lease, $gate, $clock )
+			new CreateService( $repo, new CreateAuthorizer( $repo, $proof, $lease, $clock ), $lease, $gate, $clock ),
+			new AdoptionService( $repo, new AdoptionAuthorizer( $repo, $proof, $lease, $clock ), $lease, $gate, $clock ),
+			new MethodChangeService( $repo, new MethodChangeAuthorizer( $repo, $proof, $lease, $clock ), $lease, $gate, $clock ),
+			new DeletionService( $repo, new DeletionAuthorizer( $repo, $proof, $lease, $clock ), $lease, $gate, $clock )
 		);
 	}
 
-	public function driver_for( Mapping $mapping ): ?SslDriver {
-		return null === $mapping->ssl_provider
-			? $this->registry->default()
-			: $this->registry->get( $mapping->ssl_provider );
+	/** @return SslDriver|DriverUnavailable */
+	public function driver_for( Mapping $mapping ) {
+		return DriverFactory::for_mapping( $mapping );
 	}
 }
 ```
@@ -1102,7 +1095,7 @@ and:
 
 		( new \PostDomain\Rest\ManagementController(
 			$this->repository,
-			\PostDomain\Rest\SslServices::from_filters()
+			\PostDomain\Rest\SslServices::production()
 		) )->register();
 	}
 ```
@@ -1175,7 +1168,7 @@ final class ResourceTest extends WP_UnitTestCase {
 
 		wp_set_current_user( self::factory()->user->create( array( 'role' => 'administrator' ) ) );
 		do_action( 'rest_api_init' );
-		( new ManagementController( $this->repo, SslServices::from_filters() ) )->register();
+		( new ManagementController( $this->repo, SslServices::production() ) )->register();
 	}
 
 	/** @param array<string, mixed> $body */
@@ -1493,7 +1486,7 @@ final class VerificationRoutesTest extends WP_UnitTestCase {
 
 		wp_set_current_user( self::factory()->user->create( array( 'role' => 'administrator' ) ) );
 		do_action( 'rest_api_init' );
-		( new ManagementController( $this->repo, SslServices::from_filters() ) )->register();
+		( new ManagementController( $this->repo, SslServices::production() ) )->register();
 
 		$request = new WP_REST_Request( 'POST', '/post-domain/v1/domains' );
 		$request->set_body_params(
@@ -1725,13 +1718,12 @@ use PostDomain\Ssl\CreateAuthorizer;
 use PostDomain\Ssl\CreateService;
 use PostDomain\Ssl\DeletionAuthorizer;
 use PostDomain\Ssl\DeletionService;
+use PostDomain\Ssl\DriverFactory;
 use PostDomain\Ssl\Environment;
 use PostDomain\Ssl\MethodChangeAuthorizer;
 use PostDomain\Ssl\MethodChangeService;
 use PostDomain\Ssl\MutationGate;
 use PostDomain\Ssl\MutationLease;
-use PostDomain\Ssl\NullDriver;
-use PostDomain\Ssl\SslDriverRegistry;
 use PostDomain\Support\Schema;
 use PostDomain\Support\SystemClock;
 use PostDomain\Tests\Integration\Ssl\Fixtures\RecordingDriver;
@@ -1756,16 +1748,36 @@ final class SslRoutesTest extends WP_UnitTestCase {
 
 		wp_set_current_user( self::factory()->user->create( array( 'role' => 'administrator' ) ) );
 		do_action( 'rest_api_init' );
+		delete_option( 'pd_settings' );
+		DriverFactory::reset();
+	}
+
+	public function tear_down(): void {
+		remove_all_filters( 'pd_ssl_drivers' );
+		remove_all_actions( 'pd_test_after_provider_call' );
+		delete_option( 'pd_settings' );
+		DriverFactory::reset();
+		parent::tear_down();
 	}
 
 	private function boot( RecordingDriver $driver, DnsOutcome $outcome = DnsOutcome::MATCH ): void {
 		$this->driver = $driver;
 
-		$clock    = new SystemClock();
-		$lease    = new MutationLease( $clock );
-		$gate     = new MutationGate( $lease, $clock );
-		$registry = new SslDriverRegistry( new NullDriver() );
-		$registry->register( $driver );
+		$clock = new SystemClock();
+		$lease = new MutationLease( $clock );
+		$gate  = new MutationGate( $lease, $clock );
+
+		// Installed the way a site would install it, through the one factory.
+		add_filter(
+			'pd_ssl_drivers',
+			static function ( array $drivers ) use ( $driver ): array {
+				$drivers[] = $driver;
+
+				return $drivers;
+			}
+		);
+		update_option( 'pd_settings', array( 'ssl_driver' => $driver->id() ), false );
+		DriverFactory::reset();
 
 		$proof = new FreshProof(
 			new class( $outcome ) implements DnsResolver {
@@ -1778,11 +1790,10 @@ final class SslRoutesTest extends WP_UnitTestCase {
 		);
 
 		$services = new SslServices(
-			$registry,
-			new CreateService( $this->repo, new CreateAuthorizer( $this->repo, $registry, $proof, $lease, $clock ), $lease, $gate, $clock ),
-			new AdoptionService( new AdoptionAuthorizer( $this->repo, $registry, $proof, $lease, $clock ), $lease, $gate, $clock ),
-			new MethodChangeService( new MethodChangeAuthorizer( $this->repo, $registry, $proof, $lease, $clock ), $lease, $gate, $clock ),
-			new DeletionService( $this->repo, new DeletionAuthorizer( $this->repo, $registry, $proof, $lease, $clock ), $lease, $gate, $clock )
+			new CreateService( $this->repo, new CreateAuthorizer( $this->repo, $proof, $lease, $clock ), $lease, $gate, $clock ),
+			new AdoptionService( $this->repo, new AdoptionAuthorizer( $this->repo, $proof, $lease, $clock ), $lease, $gate, $clock ),
+			new MethodChangeService( $this->repo, new MethodChangeAuthorizer( $this->repo, $proof, $lease, $clock ), $lease, $gate, $clock ),
+			new DeletionService( $this->repo, new DeletionAuthorizer( $this->repo, $proof, $lease, $clock ), $lease, $gate, $clock )
 		);
 
 		( new ManagementController( $this->repo, $services ) )->register();
@@ -1797,7 +1808,9 @@ final class SslRoutesTest extends WP_UnitTestCase {
 				null, str_repeat( 'a', 32 ), '_post-domain-challenge',
 				$owned ? OwnershipOrigin::CREATED : null,
 				$owned ? Environment::installation_id() : null,
-				'recording',
+				// A mapping that has never provisioned has no provider at all,
+				// which is exactly the case the selection has to answer.
+				$owned ? 'recording' : null,
 				$owned ? 'ref-1' : null,
 				$owned ? 'txt' : null
 			)
@@ -1911,6 +1924,93 @@ final class SslRoutesTest extends WP_UnitTestCase {
 		$this->assertNotNull( $this->repo->by_id( $m->id ), 'the mapping outlives its certificate' );
 	}
 
+	public function test_a_fenced_provision_is_never_reported_as_success(): void {
+		$this->boot( RecordingDriver::succeeding( 'ref-1' ) );
+		$m = $this->mapping();
+
+		add_action(
+			'pd_test_after_provider_call',
+			static function () use ( $m ): void {
+				global $wpdb;
+
+				$wpdb->update( // phpcs:ignore WordPress.DB
+					Schema::domains_table(),
+					array(
+						'ssl_mutation_token' => str_repeat( '7', 32 ),
+						'ssl_mutation_phase' => 'recovering',
+					),
+					array( 'id' => $m->id )
+				);
+			}
+		);
+
+		$response = $this->request( 'POST', '/ssl', $m );
+
+		$this->assertSame( 409, $response->get_status() );
+		$this->assertSame( Errors::FENCED, $response->get_data()['code'] );
+		$this->assertNull( $this->repo->by_id( $m->id )?->ssl_ref );
+	}
+
+	public function test_a_fenced_adoption_is_never_reported_as_success(): void {
+		$this->boot( RecordingDriver::ambiguous_then_unmarked( 'ref-9' ) );
+		$m = $this->mapping();
+
+		add_action(
+			'pd_test_after_provider_call',
+			static function () use ( $m ): void {
+				global $wpdb;
+
+				$wpdb->update( // phpcs:ignore WordPress.DB
+					Schema::domains_table(),
+					array(
+						'ssl_mutation_token' => str_repeat( '7', 32 ),
+						'ssl_mutation_phase' => 'recovering',
+					),
+					array( 'id' => $m->id )
+				);
+			}
+		);
+
+		$response = $this->request( 'POST', '/ssl/adopt', $m, array( 'confirm' => true ) );
+
+		$this->assertSame( 409, $response->get_status() );
+		$this->assertSame( Errors::FENCED, $response->get_data()['code'] );
+		$this->assertNull( $this->repo->by_id( $m->id )?->ssl_ownership_origin );
+	}
+
+	public function test_an_ambiguous_create_answers_202_rather_than_200(): void {
+		$this->boot( RecordingDriver::ambiguous_then_absent() );
+		$m = $this->mapping();
+
+		$response = $this->request( 'POST', '/ssl', $m );
+
+		$this->assertSame( 202, $response->get_status(), 'the truth is still with the provider' );
+	}
+
+	public function test_provisioning_without_a_configured_driver_says_so(): void {
+		$this->boot( RecordingDriver::succeeding( 'ref-1' ) );
+		delete_option( 'pd_settings' );
+		DriverFactory::reset();
+
+		$response = $this->request( 'POST', '/ssl', $this->mapping() );
+
+		$this->assertSame( 409, $response->get_status() );
+		$this->assertSame( Errors::SSL_NOT_CONFIGURED, $response->get_data()['code'] );
+		$this->assertSame( 0, $this->driver->create_calls, 'a NullDriver no-op would have looked like success' );
+	}
+
+	public function test_the_plan_reports_a_missing_driver_as_configuration(): void {
+		$this->boot( RecordingDriver::succeeding( 'ref-1' ) );
+		$m = $this->mapping();
+		delete_option( 'pd_settings' );
+		DriverFactory::reset();
+
+		$response = rest_do_request( new WP_REST_Request( 'GET', '/post-domain/v1/domains/' . $m->id . '/plan' ) );
+
+		$this->assertSame( 409, $response->get_status() );
+		$this->assertSame( Errors::SSL_NOT_CONFIGURED, $response->get_data()['code'] );
+	}
+
 	public function test_no_response_carries_a_lease_token_or_a_credential(): void {
 		$this->boot( RecordingDriver::succeeding( 'ref-1' ) );
 		$m = $this->mapping();
@@ -1993,8 +2093,12 @@ and:
 
 		$driver = $this->ssl->driver_for( $mapping );
 
-		if ( null === $driver ) {
-			return self::error( Errors::NO_DRIVER, 'No SSL driver is registered for this mapping.', 409 );
+		if ( $driver instanceof \PostDomain\Ssl\DriverUnavailable ) {
+			return self::error(
+				'ssl_not_configured' === $driver->reason ? Errors::SSL_NOT_CONFIGURED : Errors::NO_DRIVER,
+				sprintf( 'No SSL driver is available for this mapping (%s).', $driver->reason ),
+				409
+			);
 		}
 
 		$name = Challenge::record_name( $mapping->challenge_label, $mapping->host );
@@ -2072,7 +2176,7 @@ and:
 			return self::from_wp_error( $precondition );
 		}
 
-		$result = $this->ssl->adopt->adopt(
+		$result = $this->ssl->adopt->take_ownership(
 			$mapping,
 			array(
 				'confirm'                 => true === $request->get_param( 'confirm' ),
@@ -2096,23 +2200,48 @@ and:
 			return self::from_wp_error( $precondition );
 		}
 
-		return self::ssl_outcome( $this->ssl->delete->process( $mapping ), $mapping->id, 202 );
+		// Deletion reports its own vocabulary because a removal can legitimately
+		// remain pending at the provider for a long time.
+		$outcome = $this->ssl->delete->process( $mapping );
+
+		if ( 'fenced' === $outcome ) {
+			return self::error(
+				Errors::FENCED,
+				'Another worker took over this removal; re-read the mapping before retrying.',
+				409
+			);
+		}
+
+		if ( 'refused' === $outcome ) {
+			return self::error( Errors::MUTATION_UNAUTHORIZED, 'The removal was refused before any provider call.', 409 );
+		}
+
+		$after = $this->repo->by_id( $mapping->id );
+
+		return null === $after
+			? new \WP_REST_Response( null, 204 )
+			: new \WP_REST_Response( MappingSerializer::resource( $after ) + array( 'removal' => $outcome ), 202 );
 	}
 
 	/**
-	 * One translation for every SSL operation: a refusal names its precondition
-	 * and nothing else, and success re-reads the row rather than reporting what
-	 * the caller hoped for.
-	 *
-	 * @param mixed $result
+	 * One translation for every SSL operation. The five dispositions are five
+	 * different answers, and collapsing them would let a discarded mutation be
+	 * reported as a successful one.
 	 */
-	private function ssl_outcome( $result, int $mapping_id, int $success_status ): \WP_REST_Response {
-		if ( $result instanceof \PostDomain\Ssl\MutationRefusal ) {
-			$code = match ( $result->precondition ) {
+	private function ssl_outcome(
+		\PostDomain\Ssl\MutationResult $result,
+		int $mapping_id,
+		int $success_status
+	): \WP_REST_Response {
+		if ( \PostDomain\Ssl\MutationDisposition::REFUSED === $result->disposition ) {
+			$refusal = $result->refusal;
+			$code    = match ( $refusal?->precondition ) {
 				'confirmation_required'            => Errors::CONFIRMATION_REQUIRED,
 				'method_unsupported'               => Errors::METHOD_UNSUPPORTED,
 				'environment_unresolved'           => Errors::ENVIRONMENT_UNRESOLVED,
 				'lease_unavailable'                => Errors::MUTATION_IN_PROGRESS,
+				'ssl_not_configured'               => Errors::SSL_NOT_CONFIGURED,
+				'driver_not_registered'            => Errors::NO_DRIVER,
 				'unowned_resource',
 				'foreign_marker_override_required' => Errors::UNOWNED_RESOURCE,
 				default                            => Errors::MUTATION_UNAUTHORIZED,
@@ -2121,12 +2250,43 @@ and:
 			$response = self::error(
 				$code,
 				'The operation was refused before any provider call.',
-				$result->transient ? 503 : 409
+				true === $refusal?->transient ? 503 : 409
 			);
 			$data     = $response->get_data();
 
-			$data['data']['precondition'] = $result->precondition;
+			$data['data']['precondition'] = $refusal?->precondition;
 			$response->set_data( $data );
+
+			return $response;
+		}
+
+		// Recovery took the row while the provider call was outstanding. Nothing
+		// was written and nothing will be retried here, so this is not a success.
+		if ( \PostDomain\Ssl\MutationDisposition::FENCED === $result->disposition ) {
+			return self::error(
+				Errors::FENCED,
+				'Another worker took over this mutation; re-read the mapping before retrying.',
+				409
+			);
+		}
+
+		if ( \PostDomain\Ssl\MutationDisposition::CONFIRMED_NOT_PERSISTED === $result->disposition ) {
+			return self::error(
+				Errors::FINALIZATION_FAILED,
+				'The provider confirmed the change but it could not be recorded locally; reconciliation will settle it.',
+				409
+			);
+		}
+
+		if ( \PostDomain\Ssl\MutationDisposition::AMBIGUOUS_RETAINED === $result->disposition ) {
+			$mapping = $this->repo->by_id( $mapping_id );
+
+			$response = new \WP_REST_Response(
+				null === $mapping
+					? array( 'code' => Errors::OUTCOME_AMBIGUOUS, 'message' => $result->note )
+					: MappingSerializer::resource( $mapping ) + array( 'note' => $result->note ),
+				202
+			);
 
 			return $response;
 		}
@@ -2147,7 +2307,7 @@ and:
 - [ ] **Step 4: Run the test to verify it passes**
 
 Run: `composer test:integration -- --filter Rest\\SslRoutesTest`
-Expected: PASS — 11 tests
+Expected: PASS — 17 tests
 
 - [ ] **Step 5: Commit**
 
@@ -2200,7 +2360,7 @@ final class EnvironmentRoutesTest extends WP_UnitTestCase {
 
 		wp_set_current_user( self::factory()->user->create( array( 'role' => 'administrator' ) ) );
 		do_action( 'rest_api_init' );
-		( new ManagementController( new DbRepository(), SslServices::from_filters() ) )->register();
+		( new ManagementController( new DbRepository(), SslServices::production() ) )->register();
 	}
 
 	private function mismatch(): void {

@@ -1080,7 +1080,7 @@ nameserver blip cannot deactivate a live domain."
 - Test: `tests/integration/Verification/VerifierTest.php`
 
 **Interfaces:**
-- Consumes: `DnsResolver` (Task 2), `GracePolicy` (Task 4), `MappingRepository`, `EventLog` (Plan 02), `Clock` (Plan 02).
+- Consumes: `DnsResolver` (Task 2), `GracePolicy` (Task 4), `MappingRepository`, `EventLog`, `AtomicTransition` (Plan 02), `Clock` (Plan 02).
 - Produces: `PostDomain\Verification\Verifier::__construct( MappingRepository $repo, DnsResolver $resolver, Clock $clock )` and `::verify( Mapping $m ): DnsOutcome`.
 
 A DNS result whose CAS fails is **discarded, never replayed** (spec §13.5).
@@ -1278,6 +1278,7 @@ use PostDomain\Contracts\MappingRepository;
 use PostDomain\Mapping\EventLog;
 use PostDomain\Mapping\Mapping;
 use PostDomain\Mapping\VerificationState;
+use PostDomain\Support\AtomicTransition;
 use PostDomain\Support\Schema;
 
 final class Verifier {
@@ -1384,42 +1385,44 @@ final class Verifier {
 		               updated_at = %s
 		         WHERE id = %d AND verify_lease_token = %s AND challenge = %s";
 
-		$affected = $wpdb->query( // phpcs:ignore WordPress.DB
-			$wpdb->prepare(
-				$sql,
-				$this->resolved_state( $mapping, $result, $limit )->value,
-				$result->outcome->value,
-				$result->outcome->value,
-				$result->outcome->value,
-				$result->outcome->value,
-				$now,
-				$result->outcome->value,
-				$now,
-				gmdate( 'Y-m-d H:i:s', $next ),
-				$this->resolver::class,
-				$now,
+		$resolved = $this->resolved_state( $mapping, $result, $limit )->value;
+
+		// The transition and its event are one write on InnoDB, and on any other
+		// engine the event is attempted only after the CAS has already won: a row
+		// that changed underneath this attempt is discarded, never replayed and
+		// never logged.
+		AtomicTransition::commit(
+			fn (): bool => 1 === $wpdb->query( // phpcs:ignore WordPress.DB
+				$wpdb->prepare(
+					$sql,
+					$resolved,
+					$result->outcome->value,
+					$result->outcome->value,
+					$result->outcome->value,
+					$result->outcome->value,
+					$now,
+					$result->outcome->value,
+					$now,
+					gmdate( 'Y-m-d H:i:s', $next ),
+					$this->resolver::class,
+					$now,
+					$mapping->id,
+					$token,
+					$mapping->challenge
+				)
+			),
+			fn (): bool => EventLog::record(
 				$mapping->id,
-				$token,
-				$mapping->challenge
-			)
-		);
-
-		if ( 1 !== $affected ) {
-			// The row changed underneath the attempt. Discard, never replay.
-			return;
-		}
-
-		EventLog::record(
-			$mapping->id,
-			$mapping->host,
-			'verification',
-			$mapping->verification_state->value,
-			$this->resolved_state( $mapping, $result, $limit )->value,
-			'cron',
-			array(
-				'outcome'        => $result->outcome->value,
-				'resolver_class' => $this->resolver::class,
-				'attempt_id'     => $token,
+				$mapping->host,
+				'verification',
+				$mapping->verification_state->value,
+				$resolved,
+				'cron',
+				array(
+					'outcome'        => $result->outcome->value,
+					'resolver_class' => $this->resolver::class,
+					'attempt_id'     => $token,
+				)
 			)
 		);
 	}
@@ -1447,13 +1450,23 @@ final class Verifier {
 	private function mark_corrupt( Mapping $mapping, string $reason ): void {
 		global $wpdb;
 
-		$wpdb->update( // phpcs:ignore WordPress.DB
-			Schema::domains_table(),
-			array( 'integrity_error' => $reason, 'updated_at' => $this->clock->mysql() ),
-			array( 'id' => $mapping->id )
+		// The event follows the write, and only if the write happened.
+		AtomicTransition::commit(
+			static fn (): bool => 1 === $wpdb->update( // phpcs:ignore WordPress.DB
+				Schema::domains_table(),
+				array( 'integrity_error' => $reason, 'updated_at' => gmdate( 'Y-m-d H:i:s' ) ),
+				array( 'id' => $mapping->id, 'integrity_error' => null )
+			),
+			static fn (): bool => EventLog::record(
+				$mapping->id,
+				$mapping->host,
+				'verification',
+				null,
+				'integrity_error',
+				'cron',
+				array( 'integrity' => $reason )
+			)
 		);
-
-		EventLog::record( $mapping->id, $mapping->host, 'verification', null, null, 'cron', array( 'integrity' => $reason ) );
 	}
 }
 ```
