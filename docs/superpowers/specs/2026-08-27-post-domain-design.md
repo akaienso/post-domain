@@ -102,8 +102,9 @@ post-domain/
       SslDriverRegistry.php  DriverCapabilities.php  SslResourceContext.php
       SslStatus.php  IdentityResult.php  IdentityVerdict.php  ProviderMarker.php
       MarkerSupport.php  RemovalResult.php  RemovalOutcome.php  ReconcileReport.php
-      MutationLease.php  MutationGate.php  MutationKind.php
-      MutationAuthorization.php  MutationRefusal.php
+      MutationLease.php  MutationKind.php  MutationPhase.php
+      MutationGate.php  MutationAuthorization.php  ExecutionPermit.php
+      MutationRefusal.php  LeaseRecovery.php
       DeletionAuthorizer.php  AdoptionAuthorizer.php  MethodChangeAuthorizer.php
       CreateRecovery.php
       ApexCapability.php  ApexRouting.php
@@ -896,7 +897,7 @@ are ignored and logged, never honoured.
 | `pd_txt_record_label` | Matches `/^_?[a-z0-9]([a-z0-9-]*[a-z0-9])?$/i`, 1–63 bytes, no dot, lowercased; else the default. Validated at create/rotate only. |
 | `pd_ssl_validation_method` | Must be one of `{http, txt, email}` **and** present in the driver's `DriverCapabilities::$validation_methods`; else the configured default. |
 | `pd_apex_capability` | Must return an `ApexCapability`. `APEX_PROXY` additionally requires a non-empty `targets` array of valid IP literals, a `target_provenance` in `{static_ip_prefix, byoip}`, and `operator_attested === true`; anything short of that is downgraded to `UNSUPPORTED` and a `DnsBlocker` is emitted. Entitlement is never inferred from the mere presence of address strings. |
-| `pd_mutation_lease_ttl` | Clamped `30..600` seconds. |
+| `pd_mutation_lease_ttl` | Clamped `30..600` seconds, and additionally floored at the driver's provider HTTP timeout plus the documented safety margin, so recovery can never begin while the original request is still legitimately in flight. |
 | `pd_authorization_ttl` | Clamped `30..300` seconds, and further clamped to the remaining lease lifetime. |
 | `pd_unknown_host_policy`, `pd_unmatched_policy` | Must be a declared enum member; else the default. |
 | `pd_rest_capability` | Non-empty string; else `manage_options`. |
@@ -951,6 +952,7 @@ ssl_error                TEXT              NULL          -- JSON {code,message,a
 
 ssl_mutation_token       CHAR(32)          NULL          -- provider-mutation lease
 ssl_mutation_kind        VARCHAR(20)       NULL          -- create|adopt|method|remove
+ssl_mutation_phase       VARCHAR(20)       NULL          -- reserved|in_flight|recovering
 ssl_mutation_expires_at  DATETIME          NULL
 
 deletion_requested_at    DATETIME          NULL
@@ -1004,9 +1006,16 @@ ssl_ownership_origin IS NOT NULL
    <=> ssl_ref IS NOT NULL
 ssl_ownership_origin = 'adopted'  =>  ssl_adopted_at IS NOT NULL
 ssl_ownership_origin = 'created'  =>  ssl_adopted_at IS NULL
+ssl_mutation_token IS NULL
+   =>  ssl_mutation_kind IS NULL
+   AND ssl_mutation_phase IS NULL
+   AND ssl_mutation_expires_at IS NULL
 ssl_mutation_token IS NOT NULL
-   <=> ssl_mutation_kind IS NOT NULL
-   <=> ssl_mutation_expires_at IS NOT NULL
+   =>  ssl_mutation_kind IS NOT NULL
+   AND ssl_mutation_phase IS NOT NULL
+   AND ssl_mutation_expires_at IS NOT NULL
+ssl_mutation_kind  IN ('create','adopt','method','remove')
+ssl_mutation_phase IN ('reserved','in_flight','recovering')
 ```
 
 `alias_of` is a self-reference with no FK (`dbDelta` cannot express one portably);
@@ -1101,71 +1110,135 @@ gap is closed by the lease.
 
 ### 12.6 The provider-mutation lease
 
-A persisted, token-owned, per-mapping lease. It is the concrete owner of single-use
-enforcement: an authorization is consumed by a CAS that names the lease token, and the
-lease is then cleared, so the same authorization cannot be applied twice.
+A persisted, token-owned, per-mapping lease with **explicit phases**. The phase
+transition into `IN_FLIGHT` happens in the database **before** any provider mutation is
+sent, and that transition — not the later result write — is the point at which an
+authorization is consumed.
 
 ```php
-enum MutationKind { case CREATE; case ADOPT; case METHOD_CHANGE; case REMOVE; }
+enum MutationKind  { case CREATE; case ADOPT; case METHOD_CHANGE; case REMOVE; }
+enum MutationPhase { case RESERVED; case IN_FLIGHT; case RECOVERING; }
 
 final class MutationLease {
     public readonly int    $mapping_id;
-    public readonly int    $revision;      // the revision AFTER acquisition
+    public readonly int    $revision;      // the revision AFTER the transition that produced it
     public readonly string $token;         // 32 random hex
-    public readonly MutationKind $kind;
+    public readonly MutationKind  $kind;
+    public readonly MutationPhase $phase;
     public readonly DateTimeImmutable $expires_at;
 }
 ```
 
-**Acquire** — atomic CAS against the expected revision, refusing while another lease is
-live:
+Every lease column moves together. When `ssl_mutation_token` is `NULL`, `kind`, `phase`,
+and `expires_at` are all `NULL`; when it is set, all three are present, and only declared
+`MutationKind` and `MutationPhase` values are accepted by the repository.
+
+#### RESERVED — the window is owned, nothing has been sent
+
+A newly acquired lease begins in `RESERVED`. It means exactly: one worker owns this
+mapping's mutation window; authorization checks may run; provider **reads** and the fresh
+DNS proof may run; **no provider mutation has begun and no mutating driver method has been
+invoked.**
+
+**Acquire** — atomic CAS against the expected revision, refusing while any lease is live:
 
 ```sql
 UPDATE {prefix}pd_domains
    SET ssl_mutation_token = :tok, ssl_mutation_kind = :kind,
-       ssl_mutation_expires_at = :exp, revision = revision + 1, updated_at = :now
+       ssl_mutation_phase = 'reserved', ssl_mutation_expires_at = :exp,
+       revision = revision + 1, updated_at = :now
  WHERE id = :id AND revision = :rev
    AND ( ssl_mutation_expires_at IS NULL OR ssl_mutation_expires_at <= :now )
 ```
 
-**Release** — compare-and-clear on the owning token, so an expired worker can never
-clear a newer worker's lease:
+`Ssl\MutationGate` is the only component that performs this transition, and the
+authorizers produce a `MutationAuthorization` only while the matching lease is still
+`RESERVED` and unexpired.
+
+#### RESERVED → IN_FLIGHT — the consumption point
+
+Immediately before invoking `create()`, `adopt()`, `change_validation_method()`, or
+`remove()`, `MutationGate` performs one atomic transition:
 
 ```sql
 UPDATE {prefix}pd_domains
-   SET ssl_mutation_token = NULL, ssl_mutation_kind = NULL, ssl_mutation_expires_at = NULL,
-       revision = revision + 1, updated_at = :now
- WHERE id = :id AND ssl_mutation_token = :tok
+   SET ssl_mutation_phase = 'in_flight', revision = revision + 1, updated_at = :now
+ WHERE id = :id AND revision = :rev
+   AND ssl_mutation_token = :tok AND ssl_mutation_kind = :kind
+   AND ssl_mutation_phase = 'reserved' AND ssl_mutation_expires_at > :now
+   AND host = :host AND ssl_provider = :provider
+   AND ( ssl_ref <=> :ref ) AND challenge = :challenge
+   AND ( ssl_method <=> :method )
+   AND ( ssl_ownership_origin <=> :origin )
+   AND ( ssl_owner_installation_id <=> :owner )
 ```
 
-TTL is `pd_mutation_lease_ttl` (default 120 s, clamped 30–600).
+Every value bound into the authorization appears in the `WHERE` clause, so any concurrent
+change to the mapping makes the transition fail. On success the gate returns a typed
+permit:
 
-**What the lease blocks.** While a lease is held by another token, every path — REST,
-Admin, cron, reconciliation, CLI — refuses or defers any write that changes a field
-bound into an authorization: `host`, `challenge` (rotation), `ssl_provider`, `ssl_ref`,
-`ssl_method`, the ownership columns, adoption, removal, force-local-delete, and any
-further provider mutation. The refusal is `pd_mutation_in_progress` (409) and it
-**never touches the provider**.
+```php
+final class ExecutionPermit {
+    public readonly MutationKind $kind;
+    public readonly int    $mapping_id;
+    public readonly int    $in_flight_revision;   // the revision AFTER consumption
+    public readonly string $lease_token;
+    public readonly DateTimeImmutable $expires_at;
+}
+```
+
+**If the CAS affects zero rows: the provider is not called, a `MutationRefusal` or
+`pd_conflict` is returned, and the authorization is not reused.** Once the transition
+succeeds, that authorization can never begin another mutation execution.
+
+**All mutating driver methods are invoked only through `MutationGate`, only after this
+transition, and they receive the `ExecutionPermit` rather than the unconsumed
+authorization.** No service, REST controller, cron worker, Admin action, or reconciler
+calls a mutating driver method directly.
+
+What this guarantees, stated precisely: **one local mutation execution may be initiated
+per authorization.** Inherently ambiguous external outcomes are still resolved by reading
+provider state. Exactly-once behaviour from an external API is not promised, because no
+client can promise it.
+
+One bounded exception lives inside a single execution: a definitive, non-mutating
+rejection may be retried once within that execution. Cloudflare error 1413 (§14.11) is
+such a case — it reports that the request was *rejected*, so retrying once without
+`custom_metadata` is still one mutation execution. This never extends to a timeout,
+connection reset, 5xx, or any other ambiguous result.
+
+#### Finalize — result and release in one transition
+
+When the provider returns a known result, the local result is applied and the lease
+cleared in **one** atomic CAS, not two independent steps:
+
+```sql
+UPDATE {prefix}pd_domains
+   SET <confirmed state, ssl_ref, ownership provenance, ssl_method, ssl_error,
+        removal outcome, ssl_provider_state, ssl_checked_at …>,
+       ssl_mutation_token = NULL, ssl_mutation_kind = NULL,
+       ssl_mutation_phase = NULL, ssl_mutation_expires_at = NULL,
+       revision = revision + 1, updated_at = :now
+ WHERE id = :id AND revision = :in_flight_rev
+   AND ssl_mutation_token = :tok AND ssl_mutation_kind = :kind
+   AND ssl_mutation_phase = 'in_flight'
+```
+
+If this CAS fails because a recovery worker has fenced the original worker (below), the
+original worker **discards its local result, does not retry the provider mutation**, and
+leaves reconciliation to the recovery owner.
+
+#### What the lease blocks
+
+While a lease is held by another token — in any phase — every path (REST, Admin, cron,
+reconciliation, CLI) refuses or defers any write that changes a field bound into an
+authorization: `host`, `challenge` (rotation), `ssl_provider`, `ssl_ref`, `ssl_method`,
+the ownership columns, adoption, removal, force-local-delete, and any further provider
+mutation. The refusal is `pd_mutation_in_progress` (409) and it **never touches the
+provider**.
 
 Writes that are not bound into an authorization — `activation_state`, `title`,
 `favicon_attachment_id` — and all read-only diagnostics remain permitted.
-
-**The complete provider-mutation window**, used identically by create, adopt, method
-change, and remove:
-
-1. Read the mapping and its revision.
-2. Acquire the lease by CAS (this bumps the revision).
-3. Build the `SslResourceContext` from the **leased** row.
-4. Perform fresh provider identity and fresh DNS checks.
-5. Produce the bound `MutationAuthorization`.
-6. Perform the provider mutation **while the lease is still valid**.
-7. Apply the result by CAS on `(id, leased revision, ssl_mutation_token)`.
-8. Release the lease by token-owned compare-and-clear.
-
-If the lease expires **before** step 6 begins, authorization is refused and the whole
-window is recomputed from step 1. If it expires **during** step 6, ambiguous-mutation
-reconciliation applies (§14.9): a second worker must read provider state before doing
-anything, and must never blindly repeat the mutation.
 
 **Queue selection** excludes leased rows:
 
@@ -1173,12 +1246,92 @@ anything, and must never blindly repeat the mutation.
 … AND ( ssl_mutation_expires_at IS NULL OR ssl_mutation_expires_at <= :utc_now )
 ```
 
-**Expired-lease recovery** is a separate pass in `pd_ssl_sweep`: rows whose
-`ssl_mutation_expires_at` has passed while `ssl_mutation_kind` is still set are
-reconciled according to that kind — a provider read first, then the appropriate
-outcome — and only then is the stale lease cleared under CAS. A lease is never cleared
-blindly, because a set `ssl_mutation_kind` is the only record that an outbound mutation
-may have been in flight.
+#### Recovering an expired RESERVED lease — nothing was sent
+
+An expired `RESERVED` lease is proof that the provider mutation **never began**. It may
+therefore be cleared **without any provider read**, but only through a CAS that pins the
+phase:
+
+```sql
+UPDATE {prefix}pd_domains
+   SET ssl_mutation_token = NULL, ssl_mutation_kind = NULL,
+       ssl_mutation_phase = NULL, ssl_mutation_expires_at = NULL,
+       revision = revision + 1, updated_at = :now
+ WHERE id = :id AND ssl_mutation_token = :tok
+   AND ssl_mutation_phase = 'reserved' AND ssl_mutation_expires_at <= :now
+```
+
+This races safely with the begin-mutation transition: if the owning worker reaches
+`IN_FLIGHT` first, the cleanup CAS matches nothing; if cleanup clears the `RESERVED`
+lease first, the begin-mutation CAS matches nothing and **no provider call occurs**.
+Exactly one side wins. An expired `RESERVED` lease is never treated as evidence that a
+provider mutation may have happened.
+
+#### Recovering an expired IN_FLIGHT lease — fence first, then read
+
+An expired `IN_FLIGHT` lease means a provider mutation may have been sent and its outcome
+is unknown. **Before reading provider state**, the recovery worker atomically claims
+recovery, replacing the token so the original worker is fenced:
+
+```sql
+UPDATE {prefix}pd_domains
+   SET ssl_mutation_token = :new_recovery_tok, ssl_mutation_phase = 'recovering',
+       ssl_mutation_expires_at = :recovery_exp,
+       revision = revision + 1, updated_at = :now
+ WHERE id = :id AND ssl_mutation_token = :old_tok
+   AND ssl_mutation_kind = :kind          -- preserved unchanged
+   AND ssl_mutation_phase = 'in_flight' AND ssl_mutation_expires_at <= :now
+```
+
+After the claim succeeds: the original worker's finalize CAS (which names the old token
+and `in_flight`) fails; it discards its local result; it does not retry the provider
+mutation; and **only the recovery-token owner may apply reconciliation results.**
+
+The recovery owner then performs the read-first reconciliation appropriate to the
+preserved `ssl_mutation_kind`:
+
+| Kind | Recovery reads and decides |
+|---|---|
+| `CREATE` | the §14.6 ambiguous-create cases — marker-matched recovery, conclusive absence, marker-free ambiguity, foreign marker |
+| `ADOPT` | identity and marker state, before deciding whether adoption succeeded |
+| `METHOD_CHANGE` | the provider's confirmed method (§14.10) |
+| `REMOVE` | whether the provider resource still exists |
+
+**Recovery never repeats an ambiguous mutation blindly.** If provider state is still
+incomplete, transient, or eventually inconsistent, the row **stays** in `RECOVERING`
+under the recovery token, another bounded read is scheduled with backoff against a
+recovery TTL, **no further provider mutation is issued**, and the condition is surfaced
+in Diagnostics.
+
+A later worker may take over an expired `RECOVERING` lease only through another
+token-replacing CAS of the same shape (`phase = 'recovering'`, expiry past), which fences
+the previous recovery worker identically.
+
+#### Timing
+
+`pd_mutation_lease_ttl` (default 120 s, clamped 30–600) and the recovery grace must both
+exceed the driver's configured provider HTTP timeout plus a documented safety margin, so
+ordinary recovery can never begin while the original request could still legitimately be
+within its timeout. The default 120 s lease against the 10 s Cloudflare timeout (§14.11)
+leaves that margin comfortably; the relationship is asserted in the test suite rather
+than left to configuration discipline.
+
+#### The complete provider-mutation sequence
+
+Used identically by create, adopt, method change, and remove:
+
+1. Read the mapping and its expected revision.
+2. Acquire a **`RESERVED`** lease by CAS.
+3. Build the `SslResourceContext` from the reserved row.
+4. Perform identity, ownership, method, and fresh DNS checks.
+5. Produce the bound `MutationAuthorization`.
+6. **Consume it** by CAS from `RESERVED` to `IN_FLIGHT`, obtaining an `ExecutionPermit`.
+7. Invoke exactly one local mutation execution through `MutationGate`.
+8. Resolve the provider result, using read-first handling for any ambiguity.
+9. Apply the confirmed result and clear the lease **atomically** under the in-flight
+   token and revision.
+10. If the worker dies or the lease expires, a recovery worker fences it by claiming
+    `RECOVERING` **before** reading provider state.
 
 ### 12.7 State machines
 
@@ -1485,11 +1638,14 @@ interface SslDriver {
     public function status(   SslResourceContext $ctx ): SslStatus;
     public function identify( SslResourceContext $ctx ): IdentityResult;
 
-    public function create( SslResourceContext $ctx, MutationAuthorization $auth ): SslStatus;
-    public function adopt(  SslResourceContext $ctx, MutationAuthorization $auth ): SslStatus;
+    // Mutating methods receive an ExecutionPermit — proof that the authorization was
+    // already consumed by the RESERVED -> IN_FLIGHT transition (§12.6). They are
+    // invoked only by MutationGate, never directly.
+    public function create( SslResourceContext $ctx, ExecutionPermit $permit ): SslStatus;
+    public function adopt(  SslResourceContext $ctx, ExecutionPermit $permit ): SslStatus;
     public function change_validation_method(
-        SslResourceContext $ctx, string $method, MutationAuthorization $auth ): SslStatus;
-    public function remove( SslResourceContext $ctx, MutationAuthorization $auth ): RemovalResult;
+        SslResourceContext $ctx, string $method, ExecutionPermit $permit ): SslStatus;
+    public function remove( SslResourceContext $ctx, ExecutionPermit $permit ): RemovalResult;
 
     /** @param SslResourceContext[] $contexts */
     public function reconcile( array $contexts ): ReconcileReport;
@@ -1521,9 +1677,11 @@ final class ReconcileReport {
 }
 ```
 
-Every mutating method asserts that the supplied authorization's `kind` matches the
-operation and that its bindings match the context it was handed; a mismatch is refused
-before any network activity.
+Every mutating method asserts that the supplied permit's `kind` matches the operation and
+that its bindings match the context it was handed; a mismatch is refused before any
+network activity. A driver that is handed anything other than a permit issued by
+`MutationGate` for this exact call refuses outright — the permit is the driver's proof
+that consumption already happened.
 
 `status()` and `identify()` are read-only and need no lease.
 
@@ -1550,8 +1708,10 @@ final class MutationAuthorization {   // in-process only: never persisted, seria
     public readonly ?string $provider_ref;     // null only for CREATE
     public readonly string $challenge_hash;    // hash of persisted challenge name + value
     public readonly ?string $requested_method; // METHOD_CHANGE only
-    public readonly bool   $override_foreign_marker;  // ADOPT only
-    public readonly DateTimeImmutable $expires_at;    // never beyond the lease
+    public readonly ?OwnershipOrigin $ownership_origin;      // METHOD_CHANGE, REMOVE
+    public readonly ?string $owner_installation_id;         // METHOD_CHANGE, REMOVE
+    public readonly bool   $override_foreign_marker;        // ADOPT only
+    public readonly DateTimeImmutable $expires_at;          // never beyond the lease
 }
 final class MutationRefusal {
     public readonly string  $precondition;   // which one failed
@@ -1560,11 +1720,18 @@ final class MutationRefusal {
 }
 ```
 
-**Single-use has a concrete owner.** `Ssl\MutationGate` consumes an authorization by
-performing step 7's CAS on `(id, leased revision, ssl_mutation_token)` and then releasing
-the lease. Because that CAS bumps the revision and the release clears the token, the same
-authorization can never be applied twice — enforcement lives in the database, not in a
-flag on a readonly object.
+**Single-use has a concrete owner, and it acts before the provider does.**
+`Ssl\MutationGate` consumes an authorization with the `RESERVED → IN_FLIGHT` CAS of
+§12.6 — which names the mapping, the leased revision, the lease token, the kind, the
+phase, the expiry, and every mapping value bound into the authorization — and only then
+invokes the driver with the resulting `ExecutionPermit`. Because that CAS bumps the
+revision and moves the phase, the same authorization can never begin a second mutation
+execution, and a zero-row result means the provider is never called at all. Enforcement
+lives in the database, before the outbound request, not in a flag on a readonly object
+written afterwards.
+
+An authorization is produced only while the matching lease is `RESERVED` and unexpired;
+a lease already in `IN_FLIGHT` or `RECOVERING` yields no new authorization.
 
 Three authorizers produce these, sharing a common precondition core:
 
@@ -1572,7 +1739,7 @@ Three authorizers produce these, sharing a common precondition core:
 |---|:--:|:--:|:--:|:--:|
 | Environment / clone check resolved | ✔ | ✔ | ✔ | ✔ |
 | Stored `ssl_provider` matches the selected, registered driver | ✔ (on set) | ✔ | ✔ | ✔ |
-| Provider-mutation lease held for this `kind` | ✔ | ✔ | ✔ | ✔ |
+| Provider-mutation lease held for this `kind`, phase `RESERVED`, unexpired | ✔ | ✔ | ✔ | ✔ |
 | Fresh `identify()`, `read_complete = true` | ✔ | ✔ | ✔ | ✔ |
 | Verdict `MATCH` against the stored reference and exact hostname | — | — | ✔ | ✔ |
 | No conflicting provider marker | ✔ | ✔ (unless overridden) | ✔ | ✔ |
@@ -1580,7 +1747,7 @@ Three authorizers produce these, sharing a common precondition core:
 | Ownership authority per §12.2 (`origin` set, installation matches) | — | — | ✔ | ✔ |
 | Explicit operator confirmation | — | ✔ | — | — |
 | Requested method validated against `DriverCapabilities` | — | — | ✔ | — |
-| CAS confirmation of the leased revision and bound values | ✔ | ✔ | ✔ | ✔ |
+| `RESERVED → IN_FLIGHT` CAS confirming the leased revision and every bound value | ✔ | ✔ | ✔ | ✔ |
 
 Any failure returns a `MutationRefusal` naming the precondition; nothing at the provider
 is touched. A transient DNS result, resolver disagreement, provider ambiguity, an
@@ -1608,21 +1775,27 @@ effect on deletability.
 
 **Forced local deletion** (`DELETE …?force=true`) removes the **local row only**, writes
 an event recording that a provider resource may have been left behind, and **never**
-bypasses this gate or issues a provider deletion. It still requires the mutation lease,
-so it cannot race an in-flight provider call.
+bypasses this gate or issues a provider deletion. It issues no provider mutation, but it
+must still atomically prove that none is in flight: it acquires a `RESERVED` lease and
+deletes the row under a CAS that requires that lease's token, kind, and phase. A row in
+`IN_FLIGHT` or `RECOVERING` cannot be force-deleted — the acquire refuses with
+`pd_mutation_in_progress`, so a local delete can never orphan a request that is still
+outstanding at the provider.
 
 ### 14.6 Creation and ambiguous-create recovery
 
-`create()` is called under a `CREATE` lease, which is what prevents two simultaneous
-first-create calls for the same mapping: the second request refuses with
-`pd_mutation_in_progress` and **never sends a second POST**.
+`create()` is reached only through the §12.6 sequence, and the `RESERVED → IN_FLIGHT`
+transition is what prevents two simultaneous first-create calls for the same mapping:
+the second worker cannot acquire a lease at all, or — if it somehow holds a stale
+authorization — its consumption CAS matches nothing. Either way it refuses with
+`pd_mutation_in_progress` or `pd_conflict` and **never sends a second POST**.
 
 | Case | Behaviour |
 |---|---|
-| **A. POST succeeds, complete resource returned** | verify the returned hostname equals `$ctx->host`; persist `ssl_ref`, `ssl_provider`, `ssl_ownership_origin = created`, `ssl_owner_installation_id`, `ssl_method`, and the resulting state — all under CAS on the leased revision and token |
-| **B. POST outcome ambiguous** (timeout, reset, 5xx) | issue a **complete provider read** before considering any retry; never blindly repeat the POST |
-| **C. Read finds no resource conclusively** | a later attempt may retry under a **newly acquired** lease |
-| **D. Read finds a resource whose marker names exactly this installation and mapping** | `RECOVERABLE_CREATE`: verify the exact hostname, bind `observed_ref` under CAS, persist `origin = created`, record that an ambiguous create was recovered. **This is not adoption.** |
+| **A. POST succeeds, complete resource returned** | verify the returned hostname equals `$ctx->host`; persist `ssl_ref`, `ssl_provider`, `ssl_ownership_origin = created`, `ssl_owner_installation_id`, `ssl_method`, and the resulting state — applied together with the lease clear in the single finalize CAS on the in-flight revision and token |
+| **B. POST outcome ambiguous** (timeout, reset, 5xx) | issue a **complete provider read** before considering any retry; never blindly repeat the POST. If the lease expired meanwhile, a recovery worker fences this one first (§12.6) and owns the resolution. |
+| **C. Read finds no resource conclusively** | a later attempt may retry under a **newly acquired** lease and a fresh authorization |
+| **D. Read finds a resource whose marker names exactly this installation and mapping** | `RECOVERABLE_CREATE`: verify the exact hostname, bind `observed_ref`, persist `origin = created`, record that an ambiguous create was recovered — under the finalize CAS held by whichever token currently owns the window. **This is not adoption.** |
 | **E. Read finds a resource, but markers are unavailable or absent, and no reference was previously persisted** | do **not** auto-bind. Set `ssl_state = failed`, `code = provider_create_ambiguous`, and require the explicit adoption workflow (§14.7) with confirmation and a fresh DNS proof |
 | **F. Read finds a foreign or conflicting marker** | `unowned_resource`; nothing mutated, nothing bound |
 
@@ -1644,11 +1817,15 @@ the observed marker names a **different** installation, adoption additionally re
 `override_foreign_marker: true` — a deliberate second key for taking over another
 installation's resource.
 
-`adopt()` writes the marker where the provider supports one. The plugin then persists
-`ssl_ref = observed_ref`, `ssl_ownership_origin = adopted`,
+`adopt()` runs through the §12.6 sequence like every other mutation: authorization under
+a `RESERVED` lease, consumption by the `RESERVED → IN_FLIGHT` CAS, then the driver call
+with the permit. It writes the marker where the provider supports one. The plugin then
+persists `ssl_ref = observed_ref`, `ssl_ownership_origin = adopted`,
 `ssl_owner_installation_id = pd_installation_id`, `ssl_adopted_at`, and `ssl_adopted_by`
-under CAS, and records an event naming any prior marker. Where markers are unavailable,
-adoption records the binding locally only and the event says so.
+in the single finalize CAS, and records an event naming any prior marker. Where markers
+are unavailable, adoption records the binding locally only and the event says so. An
+adoption whose lease expires mid-flight is resolved by recovery reading identity and
+marker state — never by re-issuing the adoption.
 
 **Adoption is never automatic and never implicit**: finding a duplicate resource does not
 adopt it, ambiguous-create recovery does not adopt, and reconciliation adopts nothing.
@@ -1691,9 +1868,11 @@ or HTTP-date), converted to UTC, and written to the relevant next-attempt column
 outcome is `TRANSIENT`, with no state change, no attempt increment, and no further calls
 to that provider in the same sweep.
 
-If a lease expired while a mutation was in flight, expired-lease recovery (§12.6) runs
-the same read-first reconciliation for the recorded `ssl_mutation_kind` before clearing
-the lease.
+If a lease expired while a mutation was in flight, expired-lease recovery (§12.6)
+**fences the original worker first** — claiming `RECOVERING` with a fresh token — and
+only then performs the read-first reconciliation for the preserved `ssl_mutation_kind`.
+The fenced worker cannot finalize and must not retry. An expired `RESERVED` lease is a
+different case entirely: nothing was sent, so it is cleared without a provider read.
 
 ### 14.10 Changing the validation method
 
@@ -1705,18 +1884,20 @@ against the stored reference and exact hostname, no conflicting marker, a fresh
 two-resolver proof of the permanent challenge, a requested method validated against
 `DriverCapabilities`, ownership authority, and CAS confirmation of the leased revision.
 
-The flow is: authorize → provider `PATCH` → **provider re-read** → persist locally
-**only after the provider's resulting method is confirmed** (`SslStatus::$confirmed_method`)
-→ CAS → release lease.
+The flow follows the §12.6 sequence exactly: authorize under a `RESERVED` lease →
+consume by the `RESERVED → IN_FLIGHT` CAS → provider `PATCH` → **provider re-read** →
+persist locally **only after the provider's resulting method is confirmed**
+(`SslStatus::$confirmed_method`) → apply the result and clear the lease in one atomic
+CAS under the in-flight token.
 
 On timeout, connection reset, or 5xx, the `PATCH` is **not** retried blindly. The driver
 re-reads provider state:
 
 | Re-read says | Outcome |
 |---|---|
-| the requested method | treat the mutation as successful; persist under CAS |
+| the requested method | treat the mutation as successful; finalize atomically |
 | the prior method | retryable under a **newly acquired** lease and authorization |
-| incomplete or ambiguous | leave local method state unchanged; report a transient ambiguous outcome |
+| incomplete or ambiguous | leave local method state unchanged; report a transient ambiguous outcome and remain in `RECOVERING` for a bounded re-read |
 
 Reconciliation compares stored `ssl_method` with the provider's `ssl.method` and
 **reports** divergence as an event and in Diagnostics; it never auto-patches.
@@ -1762,9 +1943,14 @@ must work without it:
 - nothing in the plugin may assume a marker is present
 
 **API error 1413 means the optional feature is unavailable, not a transient failure.**
-On seeing it the driver sets `marker_support = UNAVAILABLE`, persists that in
-`ssl_marker_support`, retries the same call once **without** `custom_metadata`, and never
-treats 1413 as retryable thereafter. A single admin notice explains that marker-based
+It is a definitive, non-mutating rejection: the request was refused, so nothing was
+created. On seeing it the driver sets `marker_support = UNAVAILABLE`, persists that in
+`ssl_marker_support`, and retries the same call once **without** `custom_metadata`
+**inside the same mutation execution** — permitted precisely because the first request
+is known to have been rejected. This is the only bounded retry inside an execution, and
+it never extends to a timeout, connection reset, 5xx, or any other ambiguous result,
+which are always resolved by reading provider state. 1413 is never retried as transient
+thereafter. A single admin notice explains that marker-based
 defence in depth is off for this account and that identity rests on the
 reference-plus-hostname binding, the persisted ownership provenance, and the plugin's
 fresh DNS proof.
@@ -2000,18 +2186,22 @@ remain.
    holds a resource, sets `ssl_state = pending_removal`. Returns **`202 Accepted`**.
    Refused `409` while aliases point at it, and `409 pd_mutation_in_progress` while
    another provider mutation holds the lease.
-2. `pd_ssl_sweep` opens a `REMOVE` window (§12.6) and asks `DeletionAuthorizer` for an
-   authorization. A refusal is recorded with its failing precondition; transient refusals
-   do not increment `deletion_attempts`.
-3. With an authorization, `remove()` is called inside the lease. `REMOVED` ⇒ `revoked` ⇒
-   hard delete, with a final event carrying the `host` snapshot.
+2. `pd_ssl_sweep` acquires a `RESERVED` `REMOVE` lease (§12.6) and asks
+   `DeletionAuthorizer` for an authorization. A refusal is recorded with its failing
+   precondition, the lease is released, and transient refusals do not increment
+   `deletion_attempts`.
+3. `MutationGate` consumes the authorization with the `RESERVED → IN_FLIGHT` CAS and only
+   then invokes `remove()` with the resulting permit. `REMOVED` ⇒ `revoked` ⇒ hard
+   delete, applied together with the lease clear in the single finalize CAS, with a final
+   event carrying the `host` snapshot.
 4. `NullDriver`, or `ssl_state = none`, means nothing external exists ⇒ hard delete
-   immediately, `200 OK`. No provider authorization is required because no provider
-   mutation occurs.
+   immediately, `200 OK`. No authorization is required because no provider mutation
+   occurs, but a `RESERVED` lease is still taken so the delete cannot race one.
 5. After 12 attempts / 24 h the row remains, an admin notice names the probable orphan,
-   and an operator may `DELETE …?force=true` — which acquires the lease, removes the
-   local row, records that a provider resource may remain, and issues **no** provider
-   deletion.
+   and an operator may `DELETE …?force=true` — which takes a `RESERVED` lease, removes
+   the local row under a CAS naming that lease, records that a provider resource may
+   remain, and issues **no** provider deletion. It is refused outright while the row is
+   `IN_FLIGHT` or `RECOVERING`.
 
 A row awaiting removal never serves and never re-verifies.
 
@@ -2033,7 +2223,9 @@ The daily `Reconciler` calls `reconcile()` with `SslResourceContext` objects, in
 and adopts provider truth for **state**, with four hard rules: a local/provider mismatch
 never triggers a delete at the provider; a transient response changes nothing;
 reconciliation **never adopts ownership** of anything; and it never auto-patches a
-divergent validation method. It skips rows under a live mutation lease. Divergences —
+divergent validation method. It skips rows under a live mutation lease in any phase, and
+it never claims recovery of an expired one — that is `LeaseRecovery`'s job in
+`pd_ssl_sweep`, which fences before reading. Divergences —
 state, method, marker support, unbound-but-present resources — are written as events and
 surfaced in Diagnostics, so an operator sees "we think active, Cloudflare says pending"
 rather than discovering it from a browser warning.
@@ -2164,7 +2356,8 @@ discovery everywhere else. Capability `manage_options` per route via
 **is** exposed — it is a value the domain owner must publish in public DNS, not a
 credential. SSL credentials, raw marker account data, lease tokens, and mutation
 authorizations appear in no response, ever. `mutation_in_progress` reports only the
-mutation *kind* and its expiry, never the token.
+mutation *kind*, its *phase*, and its expiry — for example
+`{"kind":"remove","phase":"in_flight","expires_at":"…Z"}` — never the token.
 
 `owned_by_this_installation` is computed from `ssl_ownership_origin` and
 `ssl_owner_installation_id` per §12.2; the raw installation id is not exposed on the
@@ -2269,7 +2462,9 @@ Alternatives inside a purpose are rendered as "create any one of these"; every r
 inside a chosen set is marked required. HTTP tokens are shown as a URL and body to serve,
 never as a DNS record. Also on this screen: ownership provenance (created / adopted / no
 authority, and whether this installation is the owner); a live "last checked / next
-attempt / last outcome" block; any lease currently held, with its kind and expiry; the
+attempt / last outcome" block; any lease currently held, with its kind, **phase**, and
+expiry — `RESERVED` reads as "preparing, nothing sent", `IN_FLIGHT` as "sent, awaiting
+result", `RECOVERING` as "outcome unknown, reading provider state"; the
 event log, labelled as history rather than as the source of any decision; raw
 `ssl_provider_state`; SSL actions.
 
@@ -2286,9 +2481,10 @@ CORS.
 **Diagnostics** — sweep backlog depth and oldest due timestamp; WP-Cron health;
 round-trip failures; path collisions; absolute primary-host URLs found in a rendered
 mapped page; the browser-side CORS probe; SSL resources that are unowned, missing,
-divergent in method, or ambiguous after a create; marker support; stale or expired
-mutation leases awaiting recovery; apex configuration status; the environment-mismatch
-banner.
+divergent in method, or ambiguous after a create; marker support; mutation leases by
+phase, including expired `RESERVED` leases awaiting a no-read clear and rows stuck in
+`RECOVERING` because provider state is still incomplete or transient; apex configuration
+status; the environment-mismatch banner.
 
 ### 16.2 Operator flows
 
@@ -2351,12 +2547,33 @@ leaving posts untouched.
 **Lease and authorization (integration, against a fake driver and a recorded-fixture
 Cloudflare client):**
 
-- lease acquisition refused while another lease is live, with no provider call
+- lease acquisition refused while another lease is live in any phase, with no provider
+  call
+- **no provider mutation occurs while the lease is only `RESERVED`** — the driver's
+  mutating methods are never entered
+- the `RESERVED → IN_FLIGHT` CAS consumes the authorization **before** the driver is
+  invoked, asserted by ordering, not by inspection after the fact
+- the same authorization cannot begin a second mutation execution
+- a failed begin-mutation CAS — stale revision, wrong token, wrong kind, wrong phase,
+  expired lease, or any changed bound value — results in **zero provider calls**
 - challenge rotation, provider change, method change, adoption, removal, and
   force-delete all refused under a foreign lease; activation and branding permitted
-- expired lease cleared only after read-first reconciliation, never blindly
+- an expired `RESERVED` lease cleared **without any provider read**
+- cleanup of an expired `RESERVED` lease racing begin-mutation: exactly one side wins,
+  and no provider call occurs when cleanup wins
+- expired `IN_FLIGHT` recovery replaces the token and enters `RECOVERING` **before**
+  reading provider state
+- the fenced original worker cannot apply its result, and does not retry the provider
+  mutation
+- only the recovery-token owner can finalize
+- an expired `RECOVERING` lease can be taken over by another worker without the previous
+  recovery worker being able to clear or finalize the new one
+- a known provider result and the lease clear applied in **one** atomic transition
+- transient recovery results cause another bounded read, never another provider mutation
+- the lease TTL and recovery grace exceed the driver's provider HTTP timeout by the
+  documented margin
 - an expired worker unable to clear a newer worker's lease
-- queue selection skipping leased rows
+- queue selection skipping leased rows in every phase
 - each of the deletion preconditions failing individually, producing a refusal with no
   provider mutation
 - authorization rejected after a concurrent revision bump, and when host, provider, ref,
@@ -2375,19 +2592,23 @@ Cloudflare client):**
   recorded as recovery and **not** as adoption
 - create succeeds but the response is lost, markers unavailable ⇒
   `provider_create_ambiguous`, nothing bound, adoption required
-- conclusive absence ⇒ safe retry under a new lease
+- conclusive absence ⇒ safe retry under a new lease and a fresh authorization
 - conflicting marker ⇒ `unowned_resource`, nothing mutated
-- CAS failure while persisting the returned reference
-- mutation lease expiring during ambiguous-create reconciliation
+- finalize CAS failure while persisting the returned reference, with the result discarded
+  and the POST not repeated
+- mutation lease expiring during ambiguous-create reconciliation, with recovery fencing
+  first and the ambiguous `CREATE`, `ADOPT`, `METHOD_CHANGE`, and `REMOVE` outcomes each
+  resolved by their documented read-first path
 
 **Method change (integration):** lease conflict; stale authorization; provider ambiguity
 leaving local state unchanged; success persisted only after the provider re-read confirms
 the method; reconciliation reporting divergence without auto-patching.
 
-**Provider behaviour:** error 1413 setting `marker_support = UNAVAILABLE`, retrying once
-without `custom_metadata`, and never being retried as transient; the driver operating end
-to end with markers unavailable; reconciliation with `snapshot_complete = false` never
-inferring a missing resource.
+**Provider behaviour:** error 1413 setting `marker_support = UNAVAILABLE` and permitting
+**only** the documented single retry without `custom_metadata` inside the same execution,
+asserted alongside a companion case proving that a timeout, connection reset, or 5xx
+grants **no** such retry; the driver operating end to end with markers unavailable;
+reconciliation with `snapshot_complete = false` never inferring a missing resource.
 
 ---
 
@@ -2433,8 +2654,11 @@ A README covering:
   a driver expresses its own ownership-proof mechanism
 - ownership provenance: what `created`, `adopted`, and "no authority" mean, that it lives
   in columns rather than in the event log, and that events are history only
-- the provider-mutation lease: what it blocks, why challenge rotation and method changes
-  are refused while one is held, and how expired leases are recovered
+- the provider-mutation lease and its phases: what `RESERVED`, `IN_FLIGHT`, and
+  `RECOVERING` mean, what the lease blocks, why challenge rotation and method changes are
+  refused while one is held, why an expired `RESERVED` lease is safe to clear without
+  contacting the provider while an expired `IN_FLIGHT` one is not, and what a row stuck
+  in `RECOVERING` is telling an operator
 - the authorization model: what a provider mutation requires, why cached verification is
   not enough, and what each refusal means
 - creation ambiguity: why a marker-free create-then-timeout may require explicit adoption
