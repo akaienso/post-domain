@@ -191,3 +191,12 @@ concurrently on the same branch, with disjoint file ownership:
 Both were told the harness facts already discovered (temporary tables,
 `autocommit = 0` and `OwnedSessionTestCase`, the `wpdb::prepare()` null cast) so
 they would not rediscover them.
+| — | integration | completed | (this commit) | `src/Plugin.php` + `tests/integration/CronWiringTest.php` | `--filter CronWiringTest` → 1 OK | integration → 427 OK | **Deviation 16** | — |
+
+**Deviation 16 — subsystem cron wiring lives in `CronWiring` classes.**
+Plans 06 and 08 place their cron registrations and sweep methods inside
+`Plugin::boot()`. Two agents were writing those plans concurrently and
+`src/Plugin.php` is a single file, so each subsystem's wiring went into its own
+`CronWiring` class (`PostDomain\Verification\CronWiring`, and the SSL equivalent)
+and `Plugin::boot()` calls `::register()`. `CronWiringTest` asserts the hooks
+still land, which is the only thing the decomposition could have broken.
