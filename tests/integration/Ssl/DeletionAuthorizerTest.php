@@ -25,15 +25,14 @@ use PostDomain\Tests\Integration\Ssl\Fixtures\RecordingDriver;
 use PostDomain\Verification\DnsOutcome;
 use PostDomain\Verification\DnsResult;
 use PostDomain\Verification\FreshProof;
-use WP_UnitTestCase;
+use PostDomain\Tests\Integration\OwnedSessionTestCase;
 
-final class DeletionAuthorizerTest extends WP_UnitTestCase {
+final class DeletionAuthorizerTest extends OwnedSessionTestCase {
 
 	private DbRepository $repo;
 
 	public function set_up(): void {
 		parent::set_up();
-		Schema::install();
 		delete_option( 'pd_environment_mismatch' );
 		delete_option( 'pd_provider_cooldowns' );
 		delete_option( 'pd_settings' );

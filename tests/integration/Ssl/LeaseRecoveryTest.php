@@ -23,9 +23,9 @@ use PostDomain\Ssl\TimingPolicy;
 use PostDomain\Support\Schema;
 use PostDomain\Tests\Fixtures\FrozenClock;
 use PostDomain\Tests\Integration\Ssl\Fixtures\RecordingDriver;
-use WP_UnitTestCase;
+use PostDomain\Tests\Integration\OwnedSessionTestCase;
 
-final class LeaseRecoveryTest extends WP_UnitTestCase {
+final class LeaseRecoveryTest extends OwnedSessionTestCase {
 
 	private DbRepository $repo;
 
@@ -39,7 +39,6 @@ final class LeaseRecoveryTest extends WP_UnitTestCase {
 
 	public function set_up(): void {
 		parent::set_up();
-		Schema::install();
 		delete_option( 'pd_settings' );
 		DriverFactory::reset();
 		$this->repo     = new DbRepository();
