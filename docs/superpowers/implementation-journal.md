@@ -151,3 +151,4 @@ set that, but a hosting environment could. See "Known limitations" in the handof
 state (PHPStan level 8); named it explicitly rather than adding an unreachable
 default. `WpHttpClient` called `->getAll()` on the result of
 `wp_remote_retrieve_headers()`, which is not always an object; guarded it.
+| 02 | 8 | completed | (this commit) | `uninstall.php` | `UninstallTest` → 1 OK, 8 assertions | integration → 97 OK | — | — |
