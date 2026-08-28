@@ -80,20 +80,32 @@ final class UrlPolicy {
 		return HostValue::validated( $host, $context ) ?? $default;
 	}
 
+	/**
+	 * `pd_rebase_url` hands a filter complete control of a link's absolute form,
+	 * so what comes back is untrusted input to the mapped-host contract rather
+	 * than a result. It goes through the same strict validator the canonical
+	 * filter uses — control characters, userinfo, and a scheme downgrade are all
+	 * refused there — with HTTPS required unconditionally, because a mapped host
+	 * is only ever addressed over HTTPS (spec §11.8).
+	 */
 	private function validated( string $url, ServingContext $context ): ?string {
-		$parts = wp_parse_url( $url );
+		$validated = AbsoluteUrl::validated(
+			$url,
+			array( $context->requested_host, $context->canonical_host ),
+			true
+		);
 
-		if ( false === $parts || ! isset( $parts['scheme'], $parts['host'] ) ) {
+		if ( null === $validated ) {
 			return null;
 		}
 
-		if ( ! in_array( $parts['scheme'], array( 'http', 'https' ), true ) ) {
-			return null;
-		}
+		// The mapped-host contract has no port to offer: the plugin never emits
+		// one, and an authority the contract would not itself produce is not one
+		// it will hand to a browser. An explicit :443 says nothing the scheme has
+		// not already said, so it is the one port that survives.
+		$port = wp_parse_url( $validated, PHP_URL_PORT );
 
-		$permitted = array( $context->requested_host, $context->canonical_host );
-
-		return in_array( $parts['host'], $permitted, true ) ? $url : null;
+		return null === $port || 443 === $port ? $validated : null;
 	}
 
 	private function is_protected( string $path ): bool {
