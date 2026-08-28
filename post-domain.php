@@ -50,3 +50,16 @@ if ( null !== $pd_blocker ) {
 
 // 4. The composition root: hooks are registered only past every refusal above.
 \PostDomain\Plugin::boot();
+
+if ( ! function_exists( 'pd_with_mapping' ) ) {
+	/**
+	 * Runs a callback with a mapping's serving context in scope.
+	 *
+	 * @param int      $mapping_id The mapping to borrow.
+	 * @param callable $callback         The callback.
+	 * @return mixed The callback's return value.
+	 */
+	function pd_with_mapping( int $mapping_id, callable $callback ) {
+		return \PostDomain\Support\BackgroundContext::run( $mapping_id, $callback );
+	}
+}
