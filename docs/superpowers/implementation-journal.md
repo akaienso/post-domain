@@ -391,3 +391,29 @@ anywhere else, and the hook is half of what is under test.
   `DELETE ?force=true`, and several §15.1 resource members (`verification`
   detail, `deletion`, `branding`, `provider_state`, `validation_plan`,
   timestamps). `_compute=serving` is implemented.
+
+## 2026-08-28 (later) — session close
+
+All 82 tasks across the eleven plans are implemented. Final verification, every
+command executed and its output observed:
+
+- `composer lint` — exit 0, no errors, no warnings
+- `composer analyse` — `[OK] No errors`, PHPStan level 8, 170 files
+- `composer test` — OK, 316 tests, 576 assertions
+- `composer test:integration` — OK, 695 tests, 1464 assertions, identical on a
+  second consecutive run
+- `composer lint:plans` — exit 0
+- `composer generate:status-map` then `git diff --exit-code` — byte-identical
+- `git status --short` — empty
+
+The nine binding corrections all hold at HEAD. Nothing was deployed, pushed,
+merged, or opened as a pull request; no Cloudflare token was requested or used;
+no provider resource, DNS record, certificate, or client account was read or
+mutated. Branch `implementation/initial-build` sits locally at `5ca784a`.
+
+Two decisions were deliberately left open rather than guessed, both recorded in
+`docs/superpowers/implementation-handoff.md`: whether `GET /environment` returns
+the installation id, and whether `DELETE /domains/{id}/ssl` should delete the
+whole mapping row.
+
+IMPLEMENTATION SESSION COMPLETE
