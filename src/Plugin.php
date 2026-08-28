@@ -37,6 +37,8 @@ use PostDomain\Url\Adapters\EmbedLinks;
 use PostDomain\Url\Adapters\FeedLinks;
 use PostDomain\Url\Adapters\OptionHome;
 use PostDomain\Url\Adapters\SitemapLinks;
+use PostDomain\Url\Canonical\Adapters\RedirectCanonicalGuard;
+use PostDomain\Url\Canonical\Adapters\RelCanonical;
 use PostDomain\Url\UrlPolicy;
 
 final class Plugin {
@@ -93,6 +95,10 @@ final class Plugin {
 		if ( is_admin() || wp_doing_cron() || ( defined( 'WP_CLI' ) && constant( 'WP_CLI' ) ) ) {
 			Schema::maybe_upgrade();
 		}
+
+		// Subsystem cron topologies register themselves. Each is one line here
+		// rather than a subsystem absorbed into this class.
+		\PostDomain\Verification\CronWiring::register();
 	}
 
 	public function context(): ContextHolder {
@@ -232,6 +238,8 @@ final class Plugin {
 		( new EmbedLinks( $this->context, $policy ) )->register();
 		( new SitemapLinks( $this->context, $policy ) )->register();
 		( new OptionHome( $this->context ) )->register();
+		( new RelCanonical( $this->context ) )->register();
+		( new RedirectCanonicalGuard( $this->context ) )->register();
 	}
 
 	public function resolve_request( \WP $wp ): void {
