@@ -56,6 +56,10 @@ final class GracePolicy {
 			);
 		}
 
-		return array( 'state' => $state, 'hard' => $hard, 'transient' => 0 );
+		return array(
+			'state'     => $state,
+			'hard'      => $hard,
+			'transient' => 0,
+		);
 	}
 }

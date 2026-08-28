@@ -14,9 +14,17 @@ final class ChallengeTest extends WP_UnitTestCase {
 
 	private function mapping( string $host = 'example.test' ): Mapping {
 		return new Mapping(
-			1, $host, null, 42, 1,
-			VerificationState::UNVERIFIED, ActivationState::INACTIVE, SslState::NONE,
-			null, str_repeat( 'a', 32 ), '_post-domain-challenge'
+			1,
+			$host,
+			null,
+			42,
+			1,
+			VerificationState::UNVERIFIED,
+			ActivationState::INACTIVE,
+			SslState::NONE,
+			null,
+			str_repeat( 'a', 32 ),
+			'_post-domain-challenge'
 		);
 	}
 
@@ -69,12 +77,12 @@ final class ChallengeTest extends WP_UnitTestCase {
 	/** @return array<string, array{0: string}> */
 	public static function invalid_labels(): array {
 		return array(
-			'contains a dot'   => array( 'a.b' ),
-			'empty'            => array( '' ),
-			'too long'         => array( str_repeat( 'a', 64 ) ),
-			'leading hyphen'   => array( '-bad' ),
-			'trailing hyphen'  => array( 'bad-' ),
-			'illegal char'     => array( 'bad_label!' ),
+			'contains a dot'  => array( 'a.b' ),
+			'empty'           => array( '' ),
+			'too long'        => array( str_repeat( 'a', 64 ) ),
+			'leading hyphen'  => array( '-bad' ),
+			'trailing hyphen' => array( 'bad-' ),
+			'illegal char'    => array( 'bad_label!' ),
 		);
 	}
 

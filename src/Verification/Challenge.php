@@ -25,11 +25,20 @@ final class Challenge {
 		$label = (string) apply_filters( 'pd_txt_record_label', self::DEFAULT_LABEL, $mapping );
 		$label = strtolower( $label );
 
-		if ( 1 !== preg_match( '/^_?[a-z0-9]([a-z0-9-]*[a-z0-9])?$/', $label ) || strlen( $label ) > 63 ) {
-			return self::DEFAULT_LABEL;
-		}
+		return self::is_valid_label( $label ) ? $label : self::DEFAULT_LABEL;
+	}
 
-		return $label;
+	/**
+	 * Validates a label's own shape, which is what makes a persisted label
+	 * trustworthy at read time. A label carrying a dot is not one label.
+	 */
+	public static function is_valid_label( string $label ): bool {
+		return 1 === preg_match( '/^_?[a-z0-9]([a-z0-9-]*[a-z0-9])?$/', $label ) && strlen( $label ) <= 63;
+	}
+
+	/** A challenge token is exactly 32 lowercase hex characters, always. */
+	public static function is_valid_token( string $token ): bool {
+		return 1 === preg_match( '/^[0-9a-f]{32}$/', $token );
 	}
 
 	public static function record_name( string $label, string $host ): ?string {
