@@ -18,8 +18,19 @@ final class NullDriverTest extends TestCase {
 
 	private function context( string $token = self::TOKEN ): SslResourceContext {
 		return new SslResourceContext(
-			12, 'mapped.test', 'install-a', 'null', null, null, null, null,
-			'_post-domain-challenge.mapped.test', 'post-domain-verify=abc', 'abc', 4, $token
+			12,
+			'mapped.test',
+			'install-a',
+			'null',
+			null,
+			null,
+			null,
+			null,
+			'_post-domain-challenge.mapped.test',
+			'post-domain-verify=abc',
+			'abc',
+			4,
+			$token
 		);
 	}
 

@@ -20,22 +20,37 @@ final class CloudflareStatusMap {
 		if ( null === $hostname || null === $ssl ) {
 			// Non-destructive and alerting: a schema addition can never tear down
 			// a working certificate.
-			return array( 'state' => SslState::PENDING_VALIDATION, 'unknown' => true );
+			return array(
+				'state'   => SslState::PENDING_VALIDATION,
+				'unknown' => true,
+			);
 		}
 
 		if ( 'revoked' === $hostname || 'revoked' === $ssl ) {
-			return array( 'state' => SslState::REVOKED, 'unknown' => false );
+			return array(
+				'state'   => SslState::REVOKED,
+				'unknown' => false,
+			);
 		}
 
 		if ( 'failed' === $hostname || 'failed' === $ssl ) {
-			return array( 'state' => SslState::FAILED, 'unknown' => false );
+			return array(
+				'state'   => SslState::FAILED,
+				'unknown' => false,
+			);
 		}
 
 		if ( 'active' === $hostname && 'active' === $ssl ) {
-			return array( 'state' => SslState::ACTIVE, 'unknown' => false );
+			return array(
+				'state'   => SslState::ACTIVE,
+				'unknown' => false,
+			);
 		}
 
-		return array( 'state' => SslState::PENDING_VALIDATION, 'unknown' => false );
+		return array(
+			'state'   => SslState::PENDING_VALIDATION,
+			'unknown' => false,
+		);
 	}
 
 	/**

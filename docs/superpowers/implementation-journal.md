@@ -171,3 +171,5 @@ Note on the snapshot: retrieved live from
 (`info.version` 4.0.0) — the one network fetch the task authorises. It yielded
 exactly the 16 hostname and 21 SSL values the plan pinned. No Cloudflare
 credentials were used or requested; nothing was sent to Cloudflare.
+| 09 | 2 | completed | (next commit) | `src/Ssl/CloudflareStatusMap.php` | `--filter CloudflareStatusMapTest` OK | unit OK | — | — |
+| 09 | 3 | completed | (next commit) | `src/Support/PublicSuffix.php`, `src/Ssl/ApexRouting.php`, `src/Ssl/ApexCapability.php`, `references/public_suffix_list.dat` (committed, 16,424 lines) | `--filter ApexCapabilityTest` → 22 OK with the status-map tests | unit OK | — | Apex is decided against the registrable domain via the committed PSL, never a label count — `example.co.uk` proves it. |

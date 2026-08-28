@@ -15,8 +15,20 @@ final class ExecutionPermitTest extends TestCase {
 
 	private function context( string $token, int $mapping_id = 12 ): SslResourceContext {
 		return new SslResourceContext(
-			$mapping_id, 'mapped.test', 'install-a', 'test-driver', 'test-driver:default', 'ref-1', null, null,
-			'_post-domain-challenge.mapped.test', 'post-domain-verify=abc', 'abc', 4, $token, 'txt'
+			$mapping_id,
+			'mapped.test',
+			'install-a',
+			'test-driver',
+			'test-driver:default',
+			'ref-1',
+			null,
+			null,
+			'_post-domain-challenge.mapped.test',
+			'post-domain-verify=abc',
+			'abc',
+			4,
+			$token,
+			'txt'
 		);
 	}
 
@@ -86,8 +98,20 @@ final class ExecutionPermitTest extends TestCase {
 
 	public function test_assert_for_rejects_a_context_with_no_token(): void {
 		$context = new SslResourceContext(
-			12, 'mapped.test', 'install-a', 'test-driver', 'test-driver:default', 'ref-1', null, null,
-			'_x', 'v', 'abc', 4, null, 'txt'
+			12,
+			'mapped.test',
+			'install-a',
+			'test-driver',
+			'test-driver:default',
+			'ref-1',
+			null,
+			null,
+			'_x',
+			'v',
+			'abc',
+			4,
+			null,
+			'txt'
 		);
 
 		$this->expectException( \InvalidArgumentException::class );

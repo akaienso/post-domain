@@ -81,20 +81,38 @@ final class IdentityResultTest extends TestCase {
 
 	public function test_recoverable_create_requires_an_unbound_reference_and_a_naming_marker(): void {
 		$valid = new IdentityResult(
-			IdentityVerdict::RECOVERABLE_CREATE, null, 'ref-9', 'mapped.test',
-			new ProviderMarker( 'install-a', 12, array() ), MarkerSupport::SUPPORTED, true, false
+			IdentityVerdict::RECOVERABLE_CREATE,
+			null,
+			'ref-9',
+			'mapped.test',
+			new ProviderMarker( 'install-a', 12, array() ),
+			MarkerSupport::SUPPORTED,
+			true,
+			false
 		);
 		$this->assertTrue( $valid->is_recoverable_create( 'install-a', 12, 'mapped.test' ) );
 
 		$bound = new IdentityResult(
-			IdentityVerdict::RECOVERABLE_CREATE, 'ref-1', 'ref-9', 'mapped.test',
-			new ProviderMarker( 'install-a', 12, array() ), MarkerSupport::SUPPORTED, true, false
+			IdentityVerdict::RECOVERABLE_CREATE,
+			'ref-1',
+			'ref-9',
+			'mapped.test',
+			new ProviderMarker( 'install-a', 12, array() ),
+			MarkerSupport::SUPPORTED,
+			true,
+			false
 		);
 		$this->assertFalse( $bound->is_recoverable_create( 'install-a', 12, 'mapped.test' ) );
 
 		$unmarked = new IdentityResult(
-			IdentityVerdict::RECOVERABLE_CREATE, null, 'ref-9', 'mapped.test',
-			null, MarkerSupport::UNAVAILABLE, true, false
+			IdentityVerdict::RECOVERABLE_CREATE,
+			null,
+			'ref-9',
+			'mapped.test',
+			null,
+			MarkerSupport::UNAVAILABLE,
+			true,
+			false
 		);
 		$this->assertFalse( $unmarked->is_recoverable_create( 'install-a', 12, 'mapped.test' ) );
 	}
