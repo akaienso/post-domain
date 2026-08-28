@@ -4,7 +4,7 @@
         "Read more about it at https://getcomposer.org/doc/01-basic-usage.md#installing-dependencies",
         "This file is @generated automatically"
     ],
-    "content-hash": "14a25ab106bdda5ab0b74435185ed465",
+    "content-hash": "8f2a6ac088660526be695e67a2a1144a",
     "packages": [
         {
             "name": "jeremykendall/php-domain-parser",
