@@ -6,6 +6,7 @@ namespace PostDomain;
 use PostDomain\Contracts\MappingRepository;
 use PostDomain\Contracts\RoutingContract;
 use PostDomain\Http\AdminRedirect;
+use PostDomain\Http\Cors;
 use PostDomain\Mapping\AliasResolver;
 use PostDomain\Mapping\DbRepository;
 use PostDomain\Routing\Classifier;
@@ -240,6 +241,7 @@ final class Plugin {
 		( new OptionHome( $this->context ) )->register();
 		( new RelCanonical( $this->context ) )->register();
 		( new RedirectCanonicalGuard( $this->context ) )->register();
+		( new Cors( $this->repository ) )->register();
 	}
 
 	public function resolve_request( \WP $wp ): void {
