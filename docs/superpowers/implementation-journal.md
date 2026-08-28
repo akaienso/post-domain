@@ -152,3 +152,10 @@ state (PHPStan level 8); named it explicitly rather than adding an unreachable
 default. `WpHttpClient` called `->getAll()` on the result of
 `wp_remote_retrieve_headers()`, which is not always an object; guarded it.
 | 02 | 8 | completed | (this commit) | `uninstall.php` | `UninstallTest` → 1 OK, 8 assertions | integration → 97 OK | — | — |
+| 01 | 10 | completed | (next commit) | `bin/check-plan-examples.php`, `tests/unit/PlanExamplesTest.php`, `tests/fixtures/plan-examples/*.md` (9 fixtures) | `--filter PlanExamplesTest` → **15 OK, 26 assertions** | `composer lint:plans` → 268 examples, 49 fragments listed, 259 types, **0 errors** | **Deviation 14** | — |
+
+**Deviation 14 — the checker demanded coverage markers from its own fixtures.**
+The prescribed `bin/check-plan-examples.php` excluded `checker fixture` blocks from
+linting but not from the uncovered-critical-fragment rule, so its own deliberately
+broken examples failed the run. Skipped fixtures in that loop too; the rule's
+purpose is real fragments, and the fixtures are still listed as skipped.
