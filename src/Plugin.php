@@ -31,7 +31,12 @@ use PostDomain\Support\IdnaNormalizer;
 use PostDomain\Support\InfrastructureAllowlist;
 use PostDomain\Support\Schema;
 use PostDomain\Support\TrustedProxy;
+use PostDomain\Url\Adapters\CommentLinks;
 use PostDomain\Url\Adapters\CoreLinks;
+use PostDomain\Url\Adapters\EmbedLinks;
+use PostDomain\Url\Adapters\FeedLinks;
+use PostDomain\Url\Adapters\OptionHome;
+use PostDomain\Url\Adapters\SitemapLinks;
 use PostDomain\Url\UrlPolicy;
 
 final class Plugin {
@@ -222,6 +227,11 @@ final class Plugin {
 		$verifier = new RoundTripVerifier( $this->routing() );
 
 		( new CoreLinks( $this->context, $policy, $verifier, home_url() ) )->register();
+		( new FeedLinks( $this->context, $policy ) )->register();
+		( new CommentLinks( $this->context, $policy ) )->register();
+		( new EmbedLinks( $this->context, $policy ) )->register();
+		( new SitemapLinks( $this->context, $policy ) )->register();
+		( new OptionHome( $this->context ) )->register();
 	}
 
 	public function resolve_request( \WP $wp ): void {
