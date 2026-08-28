@@ -200,3 +200,85 @@ Plans 06 and 08 place their cron registrations and sweep methods inside
 `CronWiring` class (`PostDomain\Verification\CronWiring`, and the SSL equivalent)
 and `Plugin::boot()` calls `::register()`. `CronWiringTest` asserts the hooks
 still land, which is the only thing the decomposition could have broken.
+
+## 2026-08-28 — Plans 08 and 09 complete
+
+Both plans are green and committed (`2e1b04e`, `5388ea6`). Unit 316, integration
+570, phpcs clean, PHPStan level 8 clean.
+
+### `Schema::probe_engine()` gained a fallback — a production fix, not a test fix
+
+Three `DeletionServiceTest` COMMIT_UNCERTAIN cases reported `removed` where the
+specification requires `deferred`. The tests were right and the diagnosis led
+somewhere real: `probe_engine()` asked only `INFORMATION_SCHEMA.TABLES`, which
+lists neither temporary tables nor, on a restricted host, tables the connecting
+user lacks privileges to see. It answered `unknown`, `AtomicTransition` took the
+non-transactional path, and the deliberately-broken COMMIT was never reached.
+
+The harness exposed it, but the defect is production's: on a shared host whose
+grants hide INFORMATION_SCHEMA, event atomicity would have been silently dropped
+on a database that fully supports it. `probe_engine()` now falls back to
+`SHOW CREATE TABLE`, which sees both. `OwnedSessionTestCase` no longer needs to
+force `pd_schema_engine`, so the harness is smaller as a result.
+
+### Deviations recorded this session
+
+17. `CloudflareRegistrationTest::test_a_provisioned_mapping_records_the_zone_it_lives_in`
+    asserted `$refusal->driver_id === 'cf-zone:zone-1'` — an environment id in the
+    driver-id field. That is exactly the conflation correction 9 exists to
+    prevent. The test now asserts `driver_id`, `expected_environment` and
+    `configured_environment` separately.
+18. Plan 08 Task 6's `SweepTest` calls `new Plugin()`. `Plugin` is a singleton
+    with a private constructor (Plan 03 Task 1). Changed to `Plugin::instance()`.
+19. `ReconcilerTest` and `SweepTest` extend `OwnedSessionTestCase`, not
+    `WP_UnitTestCase`: both assert committed transitions, which the WP harness's
+    ambient transaction correctly refuses. Same rationale as deviation 12.
+20. `DriverRecoveryResolverTest`'s mapping fixture bound `ssl_provider` and
+    `ssl_ref` without `ssl_provider_environment`, which the durable-binding
+    invariant now rejects. Made all five move together. Its host and challenge
+    also vary per call, both being unique columns.
+21. Stale `@return array{... lease: array{token: string, revision: int} ...}`
+    docblocks on four authorizers described the lease before it became
+    `LeaseOwner`. Corrected; that also resolved every downstream PHPStan error
+    about accessing `$driver` on `array<string, int|string>`.
+22. `CloudflareSaasDriver::payload()` was documented `array<string, mixed>|null`
+    but Cloudflare returns a list for a query and an object for a single read.
+    Widened to `array<array-key, mixed>|null`.
+23. Unused constructor dependencies removed: `Clock` from `CreateService`,
+    `AdoptionService` and `MethodChangeService`; `MappingRepository` from
+    `DeletionService`. No caller outside `for_tests()` existed.
+24. `phpcs.xml.dist` now scopes `file_put_contents` and `shell_exec` out of
+    `tests/` and `bin/` alongside the existing `file_get_contents` exclusion.
+    Developer tools run under PHP directly; `WP_Filesystem` is not loaded there.
+    Neither exclusion reaches `src/`.
+
+No `Ssl\CronWiring` was needed: `Verification\Schedule` already schedules
+`pd_ssl_sweep` at 900s, so `Plugin::boot()` only adds the action.
+
+## 2026-08-28 (later) — Plan 11 Task 5, the acceptance suite
+
+Green: 4 tests, 11 assertions. A domain goes added → pending → verified →
+activated → serving → deactivated, and the subtree resolves with links carrying
+the mapped host, with no subsystem stubbed.
+
+25. `AcceptanceTest` extends `OwnedSessionTestCase`. Its first test drives a real
+    `Verifier::verify()`, which is a committed transition. Same rationale as
+    deviations 12 and 19.
+26. The plan's `AcceptanceTest` sets a serving context but no host context, so
+    `Plugin::resolve_request()` returned early — it runs only for a routed
+    request on a mapped host (spec §5.4). Added the `HostContext` the resolution
+    step actually requires. The plan example was incomplete, not the production
+    guard.
+27. The same test asserted `https://acceptance.test/events/` without setting a
+    permalink structure. Under the plain-permalink default `user_trailingslashit()`
+    has no trailing-slash preference to reflect. Added
+    `set_permalink_structure( '/%postname%/' )`, matching `RenderedOutputTest`.
+
+Structural verification re-run at this point, all clean:
+- `DriverFactory::for_mapping` has exactly one caller in `src/`: `src/Ssl/BoundResource.php:33`.
+- No mutating driver call (`create`, `adopt`, `change_validation_method`, `remove`)
+  exists outside `MutationGate.php` and `NullDriver.php`.
+- Secrets scan over `src/`, `references/` and the root: no matches.
+- `composer generate:status-map` followed by `git diff --exit-code` on the
+  generated map: reproducible.
+- `composer lint:plans`: exit 0.
