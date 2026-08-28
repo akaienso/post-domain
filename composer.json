@@ -37,7 +37,7 @@
 		"test": "phpunit --testsuite unit",
 		"test:integration": "wp-env run tests-cli --env-cwd=wp-content/plugins/post-domain vendor/bin/phpunit -c phpunit-integration.xml.dist",
 		"lint": "phpcs",
-		"analyse": "phpstan analyse",
+		"analyse": "phpstan analyse --memory-limit=1G",
 		"lint:plans": "php bin/check-plan-examples.php"
 	}
 }

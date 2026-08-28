@@ -1,0 +1,29 @@
+<?xml version="1.0"?>
+<ruleset name="post-domain">
+	<file>src</file>
+	<file>post-domain.php</file>
+	<file>tests</file>
+	<exclude-pattern>*/vendor/*</exclude-pattern>
+	<exclude-pattern>*/node_modules/*</exclude-pattern>
+	<rule ref="WordPress-Extra">
+		<!--
+			The project is PSR-4 (composer.json "autoload"), so class files are
+			StudlyCase and directories mirror namespaces. WordPress's own
+			hyphenated-lowercase file naming cannot coexist with that; the
+			autoloader, not a filename convention, is what finds a class here.
+		-->
+		<exclude name="WordPress.Files.FileName"/>
+	</rule>
+	<!--
+		Tests and developer tools read local fixture files with file_get_contents().
+		wp_remote_get() is for remote URLs and is not available in the unit suite,
+		which bootstraps Composer only.
+	-->
+	<rule ref="WordPress.WP.AlternativeFunctions.file_get_contents_file_get_contents">
+		<exclude-pattern>tests/*</exclude-pattern>
+		<exclude-pattern>bin/*</exclude-pattern>
+	</rule>
+
+	<config name="minimum_supported_wp_version" value="6.4"/>
+	<config name="testVersion" value="8.1-"/>
+</ruleset>

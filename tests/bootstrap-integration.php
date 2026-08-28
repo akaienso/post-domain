@@ -1,7 +1,8 @@
 <?php
 declare( strict_types = 1 );
 
-$pd_tests_dir = getenv( 'WP_TESTS_DIR' ) ?: '/wordpress-phpunit';
+$pd_tests_env = getenv( 'WP_TESTS_DIR' );
+$pd_tests_dir = is_string( $pd_tests_env ) && '' !== $pd_tests_env ? $pd_tests_env : '/wordpress-phpunit';
 
 require_once __DIR__ . '/../vendor/autoload.php';
 require_once $pd_tests_dir . '/includes/functions.php';

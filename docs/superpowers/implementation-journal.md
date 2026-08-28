@@ -49,3 +49,25 @@ Plan 01's file map and Task 6 both place the fixture at
 Corrected the test to `__DIR__ . '/../fixtures/uts46.txt'`, keeping the file where
 the plan's file map says it lives and matching Plan 09's `tests/unit/fixtures/`
 convention.
+
+**Deviation 3 — `BuildConfigTest` matched scoper config by exact whitespace.**
+The planned assertion looked for `'prefix' => 'PostDomain\\Vendor'` with a single
+space, but WPCS aligns double arrows in multi-line arrays, so the file legitimately
+has more. Replaced with a whitespace-tolerant regex; the invariant is the prefix
+value, not its column.
+
+**Deviation 4 — `phpcs.xml.dist` needed PSR-4 and fixture exclusions.**
+`WordPress-Extra` enforces hyphenated-lowercase, `class-`-prefixed filenames, which
+cannot coexist with the PSR-4 autoloading the plans specify in `composer.json`.
+Excluded `WordPress.Files.FileName`. Also scoped
+`WordPress.WP.AlternativeFunctions.file_get_contents_file_get_contents` out of
+`tests/` and `bin/`, which read local fixture files — `wp_remote_get()` is for
+remote URLs and is not even loaded in the unit suite.
+
+**Deviation 5 — PHPStan needed an explicit memory limit.**
+`phpstan analyse` crashed its parallel worker at the default 128M. The `analyse`
+script is now `phpstan analyse --memory-limit=1G`.
+
+| Plan | Task | Status | Commit | Notes |
+|---|---|---|---|---|
+| 01 | 9 | completed | (this commit) | `scoper.inc.php`, `phpcs.xml.dist`, `phpstan.neon.dist`, `.github/workflows/ci.yml`; `composer lint` → clean, `composer analyse` → `[OK] No errors`, unit → 73 OK. Deviations 3–5. |
