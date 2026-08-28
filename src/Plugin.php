@@ -12,14 +12,18 @@ use PostDomain\Routing\Classifier;
 use PostDomain\Routing\ContentPolicy;
 use PostDomain\Routing\ContextHolder;
 use PostDomain\Routing\Disposition;
+use PostDomain\Routing\EndpointClass;
 use PostDomain\Routing\EnumerationScopeProvider;
 use PostDomain\Routing\HostContextFactory;
 use PostDomain\Routing\MappedHostGuard;
 use PostDomain\Routing\MembershipFilter;
+use PostDomain\Routing\PathDecomposer;
 use PostDomain\Routing\PathNormalizer;
+use PostDomain\Routing\Resolver;
 use PostDomain\Routing\ServingEligibility;
 use PostDomain\Routing\Subtree;
 use PostDomain\Routing\UnknownHostGuard;
+use PostDomain\Routing\UnmatchedPolicy;
 use PostDomain\Support\AuthorityParser;
 use PostDomain\Support\HostNormalizer;
 use PostDomain\Support\IdnaNormalizer;
@@ -68,6 +72,7 @@ final class Plugin {
 		add_action( 'plugins_loaded', array( $plugin, 'freeze_eligibility' ), 11 );
 		add_action( 'init', array( $plugin, 'freeze_content_policy' ), 99 );
 		add_action( 'parse_request', array( $plugin, 'enforce_disposition' ), 0 );
+		add_action( 'parse_request', array( $plugin, 'resolve_request' ), 1 );
 		add_action( 'pre_get_posts', array( $plugin, 'scope_feed_query' ) );
 		add_filter( 'the_posts', array( $plugin, 'enforce_membership' ), 10, 2 );
 
@@ -204,6 +209,51 @@ final class Plugin {
 		}
 
 		status_header( $status );
+		nocache_headers();
+		exit;
+	}
+
+	public function resolve_request( \WP $wp ): void {
+		$serving = $this->context->serving();
+		$host    = $this->context->host();
+
+		if ( null === $serving
+			|| null === $host
+			|| EndpointClass::ROUTED !== $host->endpoint ) {
+			return;
+		}
+
+		$decomposer = new PathDecomposer();
+		$resolver   = new Resolver( $this->routing(), $decomposer );
+		$resolution = $resolver->resolve( $serving, $wp );
+
+		if ( null !== $resolution ) {
+			$this->context->resolve(
+				$resolution,
+				$decomposer->decompose( (string) $wp->request )->rep
+			);
+
+			return;
+		}
+
+		$mode   = (string) apply_filters( 'pd_unmatched_policy', 'redirect' );
+		$policy = new UnmatchedPolicy( $mode, home_url() );
+		$uri    = isset( $_SERVER['REQUEST_URI'] )
+			? esc_url_raw( wp_unslash( (string) $_SERVER['REQUEST_URI'] ) )
+			: '/';
+
+		$response = $policy->response_for( $host->method, $uri );
+
+		if ( null === $response ) {
+			return;
+		}
+
+		if ( isset( $response['url'] ) ) {
+			wp_redirect( $response['url'], $response['status'] ); // phpcs:ignore WordPress.Security.SafeRedirect
+			exit;
+		}
+
+		status_header( $response['status'] );
 		nocache_headers();
 		exit;
 	}
