@@ -97,6 +97,8 @@ final class Plugin {
 			Schema::maybe_upgrade();
 		}
 
+		add_action( 'pd_ssl_sweep', array( $plugin, 'sweep_ssl' ) );
+
 		// Subsystem cron topologies register themselves. Each is one line here
 		// rather than a subsystem absorbed into this class.
 		\PostDomain\Verification\CronWiring::register();
@@ -327,6 +329,28 @@ final class Plugin {
 		}
 
 		return ( new MembershipFilter( $this->routing() ) )->keep_members( $posts, $serving );
+	}
+
+	/**
+	 * One cron pass: finish what was interrupted, then read what is true.
+	 *
+	 * Recovery runs first because a fenced mutation's row is not yet a fact
+	 * anyone should reconcile against.
+	 */
+	public function sweep_ssl(): void {
+		$clock = new \PostDomain\Support\SystemClock();
+		$lease = new \PostDomain\Ssl\MutationLease( $clock );
+
+		// No registry is built here. Cron resolves drivers through exactly the
+		// factory REST uses, so the two can never disagree about a row's owner.
+		$recovery = new \PostDomain\Ssl\LeaseRecovery( $lease, $this->repository, $clock );
+		$resolver = new \PostDomain\Ssl\DriverRecoveryResolver();
+
+		foreach ( $recovery->due( 50 ) as $mapping ) {
+			$recovery->recover( $mapping, $resolver );
+		}
+
+		\PostDomain\Ssl\Reconciler::run( $this->repository->all() );
 	}
 
 	public function routing(): RoutingContract {
