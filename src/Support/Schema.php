@@ -125,6 +125,15 @@ final class Schema {
 		return (string) get_option( 'pd_schema_engine', '' );
 	}
 
+	/**
+	 * Which engine the domains table actually ended up on.
+	 *
+	 * INFORMATION_SCHEMA is asked first, then SHOW CREATE TABLE. The fallback is
+	 * not redundant: INFORMATION_SCHEMA lists neither temporary tables nor, on
+	 * some restricted hosts, tables this user lacks privileges to see, and
+	 * answering 'unknown' there would silently drop the event-atomicity guarantee
+	 * on a database that in fact supports it (spec §12.3).
+	 */
 	private static function probe_engine(): string {
 		global $wpdb;
 
@@ -136,6 +145,16 @@ final class Schema {
 			)
 		);
 
-		return null === $engine ? 'unknown' : (string) $engine;
+		if ( null !== $engine && '' !== $engine ) {
+			return (string) $engine;
+		}
+
+		$created = $wpdb->get_row( 'SHOW CREATE TABLE ' . self::domains_table(), ARRAY_N ); // phpcs:ignore WordPress.DB
+
+		if ( is_array( $created ) && isset( $created[1] ) && 1 === preg_match( '/ENGINE=(\w+)/i', (string) $created[1], $m ) ) {
+			return $m[1];
+		}
+
+		return 'unknown';
 	}
 }

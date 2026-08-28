@@ -55,13 +55,26 @@ final class DriverFactory {
 	}
 
 	/**
-	 * Built-in drivers that are configured well enough to construct. Plan 09 adds
-	 * Cloudflare here; nothing else about this class changes when it does.
+	 * Built-in drivers that are configured well enough to construct. A driver
+	 * missing part of its configuration is left unregistered on purpose: a named
+	 * "not registered" refusal is more useful than a half-built driver that
+	 * fails later inside a transport call.
 	 *
 	 * @return SslDriver[]
 	 */
 	private static function built_in_drivers(): array {
-		return array();
+		$drivers = array();
+
+		if ( Credentials::cloudflare_is_configured() ) {
+			$drivers[] = new CloudflareSaasDriver(
+				new \PostDomain\Support\WpHttpClient(),
+				Credentials::api_token(),
+				Credentials::zone_id(),
+				Credentials::cname_target()
+			);
+		}
+
+		return $drivers;
 	}
 
 	/** The operator's explicit choice. There is no implicit one. */

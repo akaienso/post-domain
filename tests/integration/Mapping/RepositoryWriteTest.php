@@ -337,9 +337,10 @@ final class RepositoryWriteTest extends WP_UnitTestCase {
 	public static function partial_bindings(): array {
 		$fields = array( 'provider', 'environment', 'ref', 'origin', 'owner' );
 		$cases  = array();
+		$last   = ( 1 << count( $fields ) ) - 1;
 
 		// Every subset except the empty one and the complete one.
-		for ( $mask = 1; $mask < ( 1 << count( $fields ) ) - 1; $mask++ ) {
+		for ( $mask = 1; $mask < $last; $mask++ ) {
 			$present = array();
 
 			foreach ( $fields as $bit => $field ) {

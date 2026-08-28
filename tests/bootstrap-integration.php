@@ -15,3 +15,15 @@ tests_add_filter(
 );
 
 require $pd_tests_dir . '/includes/bootstrap.php';
+
+/**
+ * The plugin boots at `muplugins_loaded`, before WP_UnitTestCase installs the
+ * filter that makes CREATE TABLE temporary — so a schema upgrade during boot
+ * leaves PERSISTENT plugin tables and options behind, and the next run starts
+ * dirty. Drop them once, here, so every run starts from the same state.
+ */
+global $wpdb;
+
+$wpdb->query( 'DROP TABLE IF EXISTS ' . $wpdb->prefix . 'pd_domains' ); // phpcs:ignore WordPress.DB
+$wpdb->query( 'DROP TABLE IF EXISTS ' . $wpdb->prefix . 'pd_domain_events' ); // phpcs:ignore WordPress.DB
+$wpdb->query( "DELETE FROM {$wpdb->options} WHERE option_name LIKE 'pd\_%'" ); // phpcs:ignore WordPress.DB

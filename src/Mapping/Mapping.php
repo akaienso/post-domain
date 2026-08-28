@@ -35,7 +35,11 @@ final class Mapping {
 		public readonly ?string $ssl_next_attempt_at = null,
 		public readonly int $ssl_transient_count = 0,
 		public readonly ?string $ssl_adopted_at = null,
-		public readonly ?int $ssl_adopted_by = null
+		public readonly ?int $ssl_adopted_by = null,
+		public readonly ?string $ssl_error = null,
+		public readonly ?string $ssl_checked_at = null,
+		public readonly ?string $deletion_requested_at = null,
+		public readonly int $deletion_attempts = 0
 	) {}
 
 	/**
@@ -69,7 +73,11 @@ final class Mapping {
 			$row['ssl_next_attempt_at'],
 			(int) ( $row['ssl_transient_count'] ?? 0 ),
 			$row['ssl_adopted_at'],
-			null === $row['ssl_adopted_by'] ? null : (int) $row['ssl_adopted_by']
+			null === $row['ssl_adopted_by'] ? null : (int) $row['ssl_adopted_by'],
+			$row['ssl_error'],
+			$row['ssl_checked_at'],
+			$row['deletion_requested_at'],
+			(int) ( $row['deletion_attempts'] ?? 0 )
 		);
 	}
 

@@ -6,11 +6,11 @@ namespace PostDomain\Ssl;
 final class ValidationPlan {
 
 	/**
-	 * @param array<string, array<int, object>> $dns
-	 * @param array<int, object>                $http
-	 * @param array<int, object>                $manual
-	 * @param array<int, object>                $pending
-	 * @param array<int, object>                $blockers
+	 * @param array<string, DnsRequirementSet[]> $dns
+	 * @param HttpRequirementSet[]               $http
+	 * @param ManualRequirement[]                $manual
+	 * @param ValidationPending[]                $pending
+	 * @param DnsBlocker[]                       $blockers
 	 */
 	public function __construct(
 		public readonly array $dns,
@@ -23,9 +23,7 @@ final class ValidationPlan {
 	/** True when a purpose offers more than one genuinely sufficient route. */
 	public function alternatives_for( string $purpose ): bool {
 		$dns  = count( $this->dns[ $purpose ] ?? array() );
-		$http = count(
-			array_filter( $this->http, static fn( object $h ): bool => ( $h->purpose ?? '' ) === $purpose )
-		);
+		$http = count( array_filter( $this->http, static fn( HttpRequirementSet $h ): bool => $h->purpose === $purpose ) );
 
 		return ( $dns + $http ) > 1;
 	}
