@@ -47,3 +47,6 @@ if ( null !== $pd_blocker ) {
 
 	return;
 }
+
+// 4. The composition root: hooks are registered only past every refusal above.
+\PostDomain\Plugin::boot();

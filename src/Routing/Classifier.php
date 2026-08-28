@@ -24,7 +24,8 @@ final class Classifier {
 			return EndpointClass::CLI;
 		}
 
-		$path = '/' . ltrim( parse_url( $path, PHP_URL_PATH ) ?? $path, '/' );
+		$path = (string) strtok( $path, '?#' );
+		$path = '/' . ltrim( $path, '/' );
 
 		if ( isset( $get['rest_route'] ) ) {
 			return $this->rest_class( (string) $get['rest_route'] );
