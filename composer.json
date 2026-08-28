@@ -35,9 +35,10 @@
 	},
 	"scripts": {
 		"test": "phpunit --testsuite unit",
-		"test:integration": "wp-env run tests-cli --env-cwd=wp-content/plugins/post-domain vendor/bin/phpunit -c phpunit-integration.xml.dist",
+		"test:integration": "bin/integration-env.sh && WP_TESTS_DIR=$PWD/tmp/wp-tests phpunit -c phpunit-integration.xml.dist",
 		"lint": "phpcs",
 		"analyse": "phpstan analyse --memory-limit=1G",
-		"lint:plans": "php bin/check-plan-examples.php"
+		"lint:plans": "php bin/check-plan-examples.php",
+		"test:integration:wp-env": "wp-env run tests-cli --env-cwd=wp-content/plugins/post-domain vendor/bin/phpunit -c phpunit-integration.xml.dist"
 	}
 }

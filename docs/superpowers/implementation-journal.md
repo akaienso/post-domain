@@ -71,3 +71,26 @@ script is now `phpstan analyse --memory-limit=1G`.
 | Plan | Task | Status | Commit | Notes |
 |---|---|---|---|---|
 | 01 | 9 | completed | (this commit) | `scoper.inc.php`, `phpcs.xml.dist`, `phpstan.neon.dist`, `.github/workflows/ci.yml`; `composer lint` → clean, `composer analyse` → `[OK] No errors`, unit → 73 OK. Deviations 3–5. |
+| 01 | 3 | completed | (this commit) | `.wp-env.json`, `package.json`, `phpunit-integration.xml.dist`, `tests/bootstrap-integration.php`, `bin/integration-env.sh`, `tests/integration/ActivationTest.php` | — | `composer test:integration` → **OK (4 tests, 5 assertions)** against real WordPress 7.1 | **Deviation 6** | — |
+| 01 | 10 | pending | — | plan-example checker | — | — | Deferred to the end of the session: it validates the planning documents, not the plugin, and nothing depends on it. | — |
+
+**Deviation 6 — the integration harness runs natively, not through wp-env's container.**
+`npx wp-env start` fails building its `tests-cli` image in this environment:
+`composer global require --dev phpunit/phpunit:"..."` exits 100. `.wp-env.json`,
+`package.json`, and a `test:integration:wp-env` script are kept exactly as Plan 01
+prescribes, and CI still uses them. Locally, `bin/integration-env.sh` brings up an
+isolated `mysql:8.4` container on port 33306 and a WordPress checkout plus the
+official WordPress test suite under `tmp/` (gitignored), and `composer
+test:integration` runs the same `phpunit-integration.xml.dist` against them.
+
+Two consequences worth stating plainly. The harness runs **WordPress 7.1 on PHP
+8.5**, not the pinned 6.4/8.1 — 6.4 predates PHP 8.5 and emits fatal-level
+deprecations under it. 6.4 remains the declared *floor* and `Environment::MIN_WP`
+still enforces it; what integration proves here is that the plugin works on a
+current WordPress, not that it works on the oldest supported one. CI, which uses
+the wp-env config unchanged, is what covers 6.4/8.1.
+
+The container is disposable and isolated: a named `pd-mysql` container on a
+non-default port with its own volume. The developer's local Homebrew MySQL was
+**not** touched — its data directory is from an older major version and
+initialising it would have destroyed the user's data.
