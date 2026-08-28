@@ -42,6 +42,13 @@ final class Verifier {
 			return DnsOutcome::TRANSIENT;
 		}
 
+		// A row that has been deleted since the sweep read it must not be leased:
+		// the lease CAS would find nothing, but the DNS query would already have
+		// been paid for.
+		if ( null === $this->repo->by_id( $mapping->id ) ) {
+			return DnsOutcome::TRANSIENT;
+		}
+
 		$token = $this->take_lease( $mapping );
 
 		if ( null === $token ) {
