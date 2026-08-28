@@ -31,7 +31,10 @@ final class DispositionMatrixTest extends WP_UnitTestCase {
 		$this->repo    = new DbRepository();
 		$this->aliases = new AliasResolver( $this->repo );
 		$this->post_id = self::factory()->post->create(
-			array( 'post_type' => 'page', 'post_status' => 'publish' )
+			array(
+				'post_type'   => 'page',
+				'post_status' => 'publish',
+			)
 		);
 	}
 
@@ -51,15 +54,31 @@ final class DispositionMatrixTest extends WP_UnitTestCase {
 
 	private function context( HostKind $kind, ?Mapping $mapping ): HostContext {
 		return new HostContext(
-			'x', null, $mapping?->host, $kind, $mapping, EndpointClass::ROUTED, true, 'GET'
+			'x',
+			null,
+			$mapping?->host,
+			$kind,
+			$mapping,
+			EndpointClass::ROUTED,
+			true,
+			'GET'
 		);
 	}
 
 	private function mapping( VerificationState $v, ActivationState $a, ?string $integrity = null, ?int $post = null ): Mapping {
 		return $this->repo->save(
 			new Mapping(
-				0, 'mapped' . wp_rand( 1000, 9999 ) . '.test', null, $post ?? $this->post_id, 1,
-				$v, $a, SslState::NONE, $integrity, str_repeat( wp_rand( 0, 9 ) . '', 32 ), '_post-domain-challenge'
+				0,
+				'mapped' . wp_rand( 1000, 9999 ) . '.test',
+				null,
+				$post ?? $this->post_id,
+				1,
+				$v,
+				$a,
+				SslState::NONE,
+				$integrity,
+				str_repeat( wp_rand( 0, 9 ) . '', 32 ),
+				'_post-domain-challenge'
 			)
 		);
 	}
@@ -103,7 +122,12 @@ final class DispositionMatrixTest extends WP_UnitTestCase {
 	}
 
 	public function test_a_broken_content_policy_is_503(): void {
-		$orphan  = self::factory()->post->create( array( 'post_type' => 'page', 'post_status' => 'publish' ) );
+		$orphan  = self::factory()->post->create(
+			array(
+				'post_type'   => 'page',
+				'post_status' => 'publish',
+			)
+		);
 		$mapping = $this->mapping( VerificationState::VERIFIED, ActivationState::ACTIVE, null, $orphan );
 		wp_delete_post( $orphan, true );
 
@@ -113,9 +137,17 @@ final class DispositionMatrixTest extends WP_UnitTestCase {
 	public function test_an_integrity_error_is_503(): void {
 		$mapping = $this->repo->save(
 			new Mapping(
-				0, 'corrupt.test', null, $this->post_id, 1,
-				VerificationState::VERIFIED, ActivationState::ACTIVE, SslState::NONE,
-				'challenge_label_invalid', str_repeat( 'z', 32 ), '_post-domain-challenge'
+				0,
+				'corrupt.test',
+				null,
+				$this->post_id,
+				1,
+				VerificationState::VERIFIED,
+				ActivationState::ACTIVE,
+				SslState::NONE,
+				'challenge_label_invalid',
+				str_repeat( 'z', 32 ),
+				'_post-domain-challenge'
 			)
 		);
 
