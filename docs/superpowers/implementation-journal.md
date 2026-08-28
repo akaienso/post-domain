@@ -282,3 +282,41 @@ Structural verification re-run at this point, all clean:
 - `composer generate:status-map` followed by `git diff --exit-code` on the
   generated map: reproducible.
 - `composer lint:plans`: exit 0.
+
+## 2026-08-28 (later) — Plan 11 Tasks 1–3, the admin surface
+
+Green as reported and re-run here: `AdminScreensTest` 11, `DomainDetailTest` 10,
+`DiagnosticsTest` 14, `WiringTest` 2 — 49 tests, 104 assertions across
+`tests/integration/Admin/`.
+
+Wired into `Plugin::boot()` with one line, `\PostDomain\Admin\Wiring::register()`,
+on the same terms as `Verification\CronWiring`.
+
+28. `Admin\Wiring` exists so `Plugin` gains a line rather than two subsystems.
+    `ProbeEndpoint::boot()` resolves its context through `Plugin::instance()`
+    instead of a `use ( $plugin )` capture, since it no longer lives inside
+    `boot()`'s scope. `Plugin` is a singleton, so it is the same object.
+29. `ProbeEndpoint::page()` built its asset URL from `dirname( __DIR__ )`, which
+    resolves to `src/` and would have 404'd on
+    `…/post-domain/src/assets/probe.js`. Corrected to `dirname( __DIR__, 2 )`.
+    The prescribed test only asserts the substring `probe.js`, so it would have
+    passed against a broken URL either way.
+30. `Diagnostics::drifted_resources()` could not satisfy its own test. With no
+    Cloudflare credentials configured the refusal is `driver_not_registered`,
+    which carries no environment — only `environment_changed` does — so the zone
+    the test asserts on was unreachable. It now reads the environment from
+    `$mapping->ssl_provider_environment`, the row's own durable binding, which is
+    what spec §16.1 requires. No credential is involved.
+31. `Diagnostics::ssl_driver()`'s message contradicted its own test. Reworded to
+    match the test and spec §19 item 20.
+32. Three `AdminScreensTest` nonce fixtures set only `$_POST['_wpnonce']`, but
+    `check_admin_referer()` reads `$_REQUEST`. All three reached `wp_die()`. The
+    fixtures now set `$_REQUEST` as a real POST does; the nonce check itself is
+    untouched.
+33. A `DomainDetail` closure parameter is typed for PHPStan level 8.
+34. phpcs conformance only: one value per line in associative arrays, and the
+    four `Diagnostics` queries use the `$table` +
+    `phpcs:disable …InterpolatedNotPrepared` pattern already established by
+    `src/Ssl/LeaseRecovery.php`. Every user value remains a placeholder.
+    `ProbeEndpoint::page()` suppresses `NonEnqueuedScript`: the probe page has no
+    `wp_head`.
