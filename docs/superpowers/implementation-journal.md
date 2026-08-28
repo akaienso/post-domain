@@ -159,3 +159,15 @@ The prescribed `bin/check-plan-examples.php` excluded `checker fixture` blocks f
 linting but not from the uncovered-critical-fragment rule, so its own deliberately
 broken examples failed the run. Skipped fixtures in that loop too; the rule's
 purpose is real fragments, and the fixtures are still listed as skipped.
+| 09 | 1 | completed | 9526d51 | `references/cloudflare-api-schema.2026-08-27.json` (16+21), `references/cloudflare-schema-provenance.json`, `references/cloudflare-status-policy.php`, `references/cloudflare-status-map.php`, `bin/extract-cloudflare-status-schema.sh`, `bin/generate-cloudflare-status-map.php`, `tests/unit/Ssl/StatusMapGeneratorTest.php`, `tests/unit/fixtures/cloudflare-schema-extra-value.json` | `--filter StatusMapGeneratorTest` → **11 OK, 92 assertions** | `composer generate:status-map && git diff --exit-code` → clean (reproducible) | **Deviation 15** | Done ahead of Plan 09's other tasks because it is offline and independent. |
+
+**Deviation 15 — the digest-mismatch test did not perturb the file.**
+It rewrote the snapshot as `rtrim($saved) . "\n"`, which reproduces a file already
+ending in exactly one newline byte for byte, so the digest still matched and the
+expected failure never occurred. Changed to append a newline.
+
+Note on the snapshot: retrieved live from
+`https://raw.githubusercontent.com/cloudflare/api-schemas/main/openapi.json`
+(`info.version` 4.0.0) — the one network fetch the task authorises. It yielded
+exactly the 16 hostname and 21 SSL values the plan pinned. No Cloudflare
+credentials were used or requested; nothing was sent to Cloudflare.

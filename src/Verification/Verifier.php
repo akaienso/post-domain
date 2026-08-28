@@ -75,8 +75,9 @@ final class Verifier {
 		$now     = $this->clock->mysql();
 		$table   = Schema::domains_table();
 
+		// phpcs:disable WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 		$affected = $wpdb->query( // phpcs:ignore WordPress.DB
-			$wpdb->prepare( // phpcs:ignore WordPress.DB
+			$wpdb->prepare(
 				"UPDATE {$table}
 				    SET verify_lease_token = %s, verify_lease_expires_at = %s, revision = revision + 1
 				  WHERE id = %d AND revision = %d
@@ -88,6 +89,7 @@ final class Verifier {
 				$now
 			)
 		);
+		// phpcs:enable WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 
 		return 1 === $affected ? $token : null;
 	}
@@ -135,9 +137,10 @@ final class Verifier {
 		// engine the event is attempted only after the CAS has already won: a row
 		// that changed underneath this attempt is discarded, never replayed and
 		// never logged.
+		// phpcs:disable WordPress.DB.PreparedSQL.NotPrepared
 		AtomicTransition::commit(
 			fn (): bool => 1 === $wpdb->query( // phpcs:ignore WordPress.DB
-				$wpdb->prepare( // phpcs:ignore WordPress.DB
+				$wpdb->prepare(
 					$sql,
 					$resolved,
 					$result->outcome->value,
@@ -169,6 +172,7 @@ final class Verifier {
 				)
 			)
 		);
+		// phpcs:enable WordPress.DB.PreparedSQL.NotPrepared
 	}
 
 	private function resolved_state( Mapping $mapping, DnsResult $result, int $limit ): VerificationState {

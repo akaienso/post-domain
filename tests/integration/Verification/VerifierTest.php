@@ -101,12 +101,14 @@ final class VerifierTest extends OwnedSessionTestCase {
 		( new Verifier( $this->repo, $resolver, new SystemClock() ) )->verify( $mapping );
 
 		global $wpdb;
+		// phpcs:disable WordPress.DB.PreparedSQL.NotPrepared
 		$recorded = $wpdb->get_var( // phpcs:ignore WordPress.DB
-			$wpdb->prepare( // phpcs:ignore WordPress.DB
+			$wpdb->prepare(
 				'SELECT resolver_class FROM ' . Schema::domains_table() . ' WHERE id = %d',
 				$mapping->id
 			)
 		);
+		// phpcs:enable WordPress.DB.PreparedSQL.NotPrepared
 
 		$this->assertSame( $resolver::class, $recorded );
 	}
