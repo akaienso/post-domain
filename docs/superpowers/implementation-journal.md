@@ -94,3 +94,19 @@ The container is disposable and isolated: a named `pd-mysql` container on a
 non-default port with its own volume. The developer's local Homebrew MySQL was
 **not** touched — its data directory is from an older major version and
 initialising it would have destroyed the user's data.
+| 02 | 1 | completed | (next commit) | `src/Mapping/{VerificationState,ActivationState,SslState,OwnershipOrigin}.php`, `src/Ssl/{MutationKind,MutationPhase}.php` | unit → 82 OK | unit 82 OK | — | — |
+| 02 | 2 | completed | (next commit) | `src/Support/Schema.php` | `SchemaTest` → 16 OK | integration → 16 OK | **Deviation 7**, **Deviation 8** | — |
+| 02 | 3 | completed | (next commit) | `src/Mapping/Mapping.php`, `src/Contracts/MappingRepository.php`, `src/Mapping/DbRepository.php` | `RepositoryReadTest` OK | integration → 16 OK | — | — |
+
+**Deviation 7 — `SHOW TABLES` / `INFORMATION_SCHEMA` cannot see the tables under test.**
+`WP_UnitTestCase` rewrites `CREATE TABLE` to `CREATE TEMPORARY TABLE` for the
+duration of a test, and temporary tables appear in neither `SHOW TABLES` nor
+`INFORMATION_SCHEMA.COLUMNS`. Two prescribed assertions in `SchemaTest` could
+therefore never pass in the harness the plans themselves chose. Rewrote
+`test_both_tables_exist` to describe each table (`SHOW COLUMNS`, asserting no
+error and a non-empty result) and the `host` column check to read `SHOW FULL
+COLUMNS`, which reports the same `varchar(230)` / `ascii_bin` facts.
+
+**Deviation 8 — domains-table column count is 51, not 49.**
+The expectation predates the two mutation-binding columns and the durable
+`ssl_provider_environment` added during the plan corrections. Updated to 51.
