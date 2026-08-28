@@ -31,12 +31,24 @@ final class DohResolverTest extends TestCase {
 		return new HttpResponse(
 			200,
 			array( 'content-type' => 'application/dns-json' ),
-			(string) json_encode( array( 'Status' => $status, 'Answer' => $answers ) )
+			(string) json_encode( // phpcs:ignore WordPress.WP.AlternativeFunctions.json_encode_json_encode
+				array(
+					'Status' => $status,
+					'Answer' => $answers,
+				)
+			)
 		);
 	}
 
 	private function txt( string $value ): array {
-		return array( array( 'name' => '_x.example', 'type' => 16, 'TTL' => 300, 'data' => '"' . $value . '"' ) );
+		return array(
+			array(
+				'name' => '_x.example',
+				'type' => 16,
+				'TTL'  => 300,
+				'data' => '"' . $value . '"',
+			),
+		);
 	}
 
 	public function test_both_endpoints_agreeing_on_the_value_is_a_match(): void {
@@ -132,7 +144,12 @@ final class DohResolverTest extends TestCase {
 		$wrong = new HttpResponse(
 			200,
 			array( 'content-type' => 'application/dns-json' ),
-			(string) json_encode( array( 'Status' => 'zero', 'Answer' => 'nope' ) )
+			(string) json_encode( // phpcs:ignore WordPress.WP.AlternativeFunctions.json_encode_json_encode
+				array(
+					'Status' => 'zero',
+					'Answer' => 'nope',
+				)
+			)
 		);
 
 		$this->assertSame(
@@ -154,12 +171,22 @@ final class DohResolverTest extends TestCase {
 		$mixed = new HttpResponse(
 			200,
 			array( 'content-type' => 'application/dns-json' ),
-			(string) json_encode(
+			(string) json_encode( // phpcs:ignore WordPress.WP.AlternativeFunctions.json_encode_json_encode
 				array(
 					'Status' => 0,
 					'Answer' => array(
-						array( 'name' => '_x.example', 'type' => 5, 'TTL' => 300, 'data' => 'cname.example.' ),
-						array( 'name' => '_x.example', 'type' => 16, 'TTL' => 300, 'data' => '"post-domain-verify=abc"' ),
+						array(
+							'name' => '_x.example',
+							'type' => 5,
+							'TTL'  => 300,
+							'data' => 'cname.example.',
+						),
+						array(
+							'name' => '_x.example',
+							'type' => 16,
+							'TTL'  => 300,
+							'data' => '"post-domain-verify=abc"',
+						),
 					),
 				)
 			)
@@ -175,12 +202,22 @@ final class DohResolverTest extends TestCase {
 		$many = new HttpResponse(
 			200,
 			array( 'content-type' => 'application/dns-json' ),
-			(string) json_encode(
+			(string) json_encode( // phpcs:ignore WordPress.WP.AlternativeFunctions.json_encode_json_encode
 				array(
 					'Status' => 0,
 					'Answer' => array(
-						array( 'name' => '_x.example', 'type' => 16, 'TTL' => 300, 'data' => '"v=spf1 -all"' ),
-						array( 'name' => '_x.example', 'type' => 16, 'TTL' => 300, 'data' => '"post-domain-verify=abc"' ),
+						array(
+							'name' => '_x.example',
+							'type' => 16,
+							'TTL'  => 300,
+							'data' => '"v=spf1 -all"',
+						),
+						array(
+							'name' => '_x.example',
+							'type' => 16,
+							'TTL'  => 300,
+							'data' => '"post-domain-verify=abc"',
+						),
 					),
 				)
 			)
@@ -196,11 +233,16 @@ final class DohResolverTest extends TestCase {
 		$split = new HttpResponse(
 			200,
 			array( 'content-type' => 'application/dns-json' ),
-			(string) json_encode(
+			(string) json_encode( // phpcs:ignore WordPress.WP.AlternativeFunctions.json_encode_json_encode
 				array(
 					'Status' => 0,
 					'Answer' => array(
-						array( 'name' => '_x.example', 'type' => 16, 'TTL' => 300, 'data' => '"post-domain-" "verify=abc"' ),
+						array(
+							'name' => '_x.example',
+							'type' => 16,
+							'TTL'  => 300,
+							'data' => '"post-domain-" "verify=abc"',
+						),
 					),
 				)
 			)

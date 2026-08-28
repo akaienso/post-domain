@@ -17,7 +17,7 @@ final class NativeDnsResolver implements DnsResolver {
 	private $lookup;
 
 	public function __construct( ?callable $lookup = null ) {
-		$this->lookup = $lookup ?? static fn( string $name ) => @dns_get_record( $name, DNS_TXT );
+		$this->lookup = $lookup ?? static fn( string $name ) => @dns_get_record( $name, DNS_TXT ); // phpcs:ignore WordPress.PHP.NoSilencedErrors.Discouraged
 	}
 
 	public function txt( string $name, string $expected ): DnsResult {

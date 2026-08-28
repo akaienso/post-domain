@@ -11,7 +11,12 @@ final class NativeDnsResolverTest extends TestCase {
 
 	public function test_a_matching_record_is_a_match(): void {
 		$resolver = new NativeDnsResolver(
-			static fn(): array => array( array( 'type' => 'TXT', 'txt' => 'post-domain-verify=abc' ) )
+			static fn(): array => array(
+				array(
+					'type' => 'TXT',
+					'txt'  => 'post-domain-verify=abc',
+				),
+			)
 		);
 
 		$this->assertSame(
@@ -22,7 +27,12 @@ final class NativeDnsResolverTest extends TestCase {
 
 	public function test_a_present_but_different_record_is_a_mismatch(): void {
 		$resolver = new NativeDnsResolver(
-			static fn(): array => array( array( 'type' => 'TXT', 'txt' => 'post-domain-verify=zzz' ) )
+			static fn(): array => array(
+				array(
+					'type' => 'TXT',
+					'txt'  => 'post-domain-verify=zzz',
+				),
+			)
 		);
 
 		$this->assertSame(

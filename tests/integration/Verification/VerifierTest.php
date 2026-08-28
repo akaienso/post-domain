@@ -39,16 +39,27 @@ final class VerifierTest extends OwnedSessionTestCase {
 	private function seed( VerificationState $state, int $hard = 0 ): Mapping {
 		$mapping = $this->repo->save(
 			new Mapping(
-				0, 'example.test', null, self::factory()->post->create(), 1,
-				VerificationState::UNVERIFIED, ActivationState::INACTIVE, SslState::NONE,
-				null, str_repeat( 'a', 32 ), '_post-domain-challenge'
+				0,
+				'example.test',
+				null,
+				self::factory()->post->create(),
+				1,
+				VerificationState::UNVERIFIED,
+				ActivationState::INACTIVE,
+				SslState::NONE,
+				null,
+				str_repeat( 'a', 32 ),
+				'_post-domain-challenge'
 			)
 		);
 
 		global $wpdb;
 		$wpdb->update( // phpcs:ignore WordPress.DB
 			Schema::domains_table(),
-			array( 'verification_state' => $state->value, 'hard_failure_count' => $hard ),
+			array(
+				'verification_state' => $state->value,
+				'hard_failure_count' => $hard,
+			),
 			array( 'id' => $mapping->id )
 		);
 
@@ -91,7 +102,7 @@ final class VerifierTest extends OwnedSessionTestCase {
 
 		global $wpdb;
 		$recorded = $wpdb->get_var( // phpcs:ignore WordPress.DB
-			$wpdb->prepare(
+			$wpdb->prepare( // phpcs:ignore WordPress.DB
 				'SELECT resolver_class FROM ' . Schema::domains_table() . ' WHERE id = %d',
 				$mapping->id
 			)
@@ -125,7 +136,10 @@ final class VerifierTest extends OwnedSessionTestCase {
 				global $wpdb;
 				$wpdb->update( // phpcs:ignore WordPress.DB
 					Schema::domains_table(),
-					array( 'challenge' => str_repeat( 'z', 32 ), 'revision' => 99 ),
+					array(
+						'challenge' => str_repeat( 'z', 32 ),
+						'revision'  => 99,
+					),
 					array( 'id' => $this->mapping->id )
 				);
 

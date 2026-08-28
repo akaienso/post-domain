@@ -76,7 +76,7 @@ final class Verifier {
 		$table   = Schema::domains_table();
 
 		$affected = $wpdb->query( // phpcs:ignore WordPress.DB
-			$wpdb->prepare(
+			$wpdb->prepare( // phpcs:ignore WordPress.DB
 				"UPDATE {$table}
 				    SET verify_lease_token = %s, verify_lease_expires_at = %s, revision = revision + 1
 				  WHERE id = %d AND revision = %d
@@ -137,7 +137,7 @@ final class Verifier {
 		// never logged.
 		AtomicTransition::commit(
 			fn (): bool => 1 === $wpdb->query( // phpcs:ignore WordPress.DB
-				$wpdb->prepare(
+				$wpdb->prepare( // phpcs:ignore WordPress.DB
 					$sql,
 					$resolved,
 					$result->outcome->value,
@@ -198,8 +198,14 @@ final class Verifier {
 		AtomicTransition::commit(
 			static fn (): bool => 1 === $wpdb->update( // phpcs:ignore WordPress.DB
 				Schema::domains_table(),
-				array( 'integrity_error' => $reason, 'updated_at' => gmdate( 'Y-m-d H:i:s' ) ),
-				array( 'id' => $mapping->id, 'integrity_error' => null )
+				array(
+					'integrity_error' => $reason,
+					'updated_at'      => gmdate( 'Y-m-d H:i:s' ),
+				),
+				array(
+					'id'              => $mapping->id,
+					'integrity_error' => null,
+				)
 			),
 			static fn (): bool => EventLog::record(
 				$mapping->id,

@@ -17,9 +17,17 @@ final class FreshProofTest extends WP_UnitTestCase {
 
 	private function mapping( string $challenge, VerificationState $state ): Mapping {
 		return new Mapping(
-			1, 'example.test', null, 42, 1,
-			$state, ActivationState::ACTIVE, SslState::ACTIVE,
-			null, $challenge, '_post-domain-challenge'
+			1,
+			'example.test',
+			null,
+			42,
+			1,
+			$state,
+			ActivationState::ACTIVE,
+			SslState::ACTIVE,
+			null,
+			$challenge,
+			'_post-domain-challenge'
 		);
 	}
 
