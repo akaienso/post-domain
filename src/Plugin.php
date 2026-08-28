@@ -64,7 +64,14 @@ final class Plugin {
 		add_action( 'init', array( $plugin, 'freeze_content_policy' ), 99 );
 		add_action( 'parse_request', array( $plugin, 'enforce_disposition' ), 0 );
 
-		Schema::maybe_upgrade();
+		/**
+		 * Schema upgrades run only where a slow dbDelta() is acceptable and a
+		 * failure is visible: the admin, cron, and WP-CLI. A front-end request
+		 * never migrates the database out from under itself.
+		 */
+		if ( is_admin() || wp_doing_cron() || ( defined( 'WP_CLI' ) && constant( 'WP_CLI' ) ) ) {
+			Schema::maybe_upgrade();
+		}
 	}
 
 	public function context(): ContextHolder {
