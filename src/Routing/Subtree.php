@@ -126,9 +126,9 @@ final class Subtree implements RoutingContract {
 	}
 
 	/** @return \WP_Post[] */
-	private function children_of( ServingContext $context, \WP_Post $parent ): array {
+	private function children_of( ServingContext $context, \WP_Post $parent_post ): array {
 		/** @var \WP_Post[]|null $supplied */
-		$supplied = apply_filters( 'pd_subtree_children', null, $parent, $context->mapping );
+		$supplied = apply_filters( 'pd_subtree_children', null, $parent_post, $context->mapping );
 
 		if ( is_array( $supplied ) ) {
 			return $supplied;
@@ -136,7 +136,7 @@ final class Subtree implements RoutingContract {
 
 		return get_posts(
 			array(
-				'post_parent'      => $parent->ID,
+				'post_parent'      => $parent_post->ID,
 				'post_type'        => $context->subtree_post_types,
 				'post_status'      => $context->post_statuses,
 				'posts_per_page'   => -1,

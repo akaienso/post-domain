@@ -121,7 +121,11 @@ final class SubtreeTest extends WP_UnitTestCase {
 
 		add_filter(
 			'pd_path_segment_for_post',
-			static fn( string $segment, \WP_Post $post ): string => 'x-' . $segment,
+			static function ( string $segment, \WP_Post $post ): string {
+				unset( $post );
+
+				return 'x-' . $segment;
+			},
 			10,
 			2
 		);

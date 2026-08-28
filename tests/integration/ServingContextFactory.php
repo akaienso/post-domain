@@ -12,13 +12,13 @@ use PostDomain\Routing\ServingContext;
 
 trait ServingContextFactory {
 
-	protected function make_page( string $slug, int $parent, string $status = 'publish' ): int {
+	protected function make_page( string $slug, int $parent_id, string $status = 'publish' ): int {
 		return self::factory()->post->create(
 			array(
 				'post_type'   => 'page',
 				'post_status' => $status,
 				'post_name'   => $slug,
-				'post_parent' => $parent,
+				'post_parent' => $parent_id,
 				'post_title'  => $slug,
 			)
 		);
