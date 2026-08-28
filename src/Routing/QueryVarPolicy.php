@@ -34,7 +34,7 @@ final class QueryVarPolicy {
 
 		$vars = array_filter(
 			$vars,
-			static fn( $var ): bool => is_string( $var ) && 1 === preg_match( '/^[a-z0-9_]{1,32}$/', $var )
+			static fn( $name ): bool => is_string( $name ) && 1 === preg_match( '/^[a-z0-9_]{1,32}$/', $name )
 		);
 
 		$vars = array_diff( $vars, self::RESERVED );

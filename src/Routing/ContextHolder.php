@@ -36,12 +36,12 @@ final class ContextHolder {
 	/**
 	 * Scoped push and pop, so cron, CLI, and mail can borrow a mapping's context.
 	 */
-	public function with( ServingContext $context, callable $fn ): mixed {
+	public function with( ServingContext $context, callable $callback ): mixed {
 		$previous      = $this->serving;
 		$this->serving = $context;
 
 		try {
-			return $fn();
+			return $callback();
 		} finally {
 			$this->serving = $previous;
 		}
