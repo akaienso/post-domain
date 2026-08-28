@@ -48,7 +48,12 @@ final class LeaseOutcome {
 	}
 
 	public static function state( SslState $state ): self {
-		return new self( array( 'ssl_state' => $state->value, 'ssl_checked_at' => gmdate( 'Y-m-d H:i:s' ) ) );
+		return new self(
+			array(
+				'ssl_state'      => $state->value,
+				'ssl_checked_at' => gmdate( 'Y-m-d H:i:s' ),
+			)
+		);
 	}
 
 	/**
@@ -115,7 +120,11 @@ final class LeaseOutcome {
 			array(
 				'ssl_state'      => $state->value,
 				'ssl_error'      => (string) wp_json_encode(
-					array( 'code' => $code, 'message' => mb_substr( $message, 0, 500 ), 'at' => gmdate( 'Y-m-d H:i:s' ) )
+					array(
+						'code'    => $code,
+						'message' => mb_substr( $message, 0, 500 ),
+						'at'      => gmdate( 'Y-m-d H:i:s' ),
+					)
 				),
 				'ssl_checked_at' => gmdate( 'Y-m-d H:i:s' ),
 			)

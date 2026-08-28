@@ -7,6 +7,16 @@ use PostDomain\Contracts\Clock;
 use PostDomain\Contracts\SslDriver;
 use PostDomain\Support\Schema;
 
+/*
+ * Every statement in this class is built from string literals, class constants,
+ * and column names this file owns; no fragment of SQL comes from a caller. The
+ * sniffs below cannot follow a shared WHERE constant or a value list assembled
+ * by LeaseOwner, so they are disabled here rather than silenced line by line.
+ */
+// phpcs:disable WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+// phpcs:disable WordPress.DB.PreparedSQL.NotPrepared
+// phpcs:disable WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber
+
 final class MutationLease {
 
 	/**
@@ -229,7 +239,10 @@ final class MutationLease {
 		// timestamp that no longer means anything. An outcome that names either
 		// column deliberately wins: assigning the same column twice in one SET
 		// would silently discard the value the caller asked for.
-		$reset = array( 'ssl_next_attempt_at' => 'NULL', 'ssl_transient_count' => '0' );
+		$reset = array(
+			'ssl_next_attempt_at' => 'NULL',
+			'ssl_transient_count' => '0',
+		);
 
 		foreach ( $reset as $column => $literal ) {
 			if ( ! array_key_exists( $column, $outcome->columns() ) ) {

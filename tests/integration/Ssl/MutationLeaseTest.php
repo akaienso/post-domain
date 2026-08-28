@@ -43,9 +43,17 @@ final class MutationLeaseTest extends WP_UnitTestCase {
 	private function seed_host( string $host, bool $owned = false ): Mapping {
 		return $this->repo->save(
 			new Mapping(
-				0, $host, null, self::factory()->post->create(), 1,
-				VerificationState::VERIFIED, ActivationState::ACTIVE, SslState::NONE,
-				null, substr( md5( $host ), 0, 32 ), '_post-domain-challenge',
+				0,
+				$host,
+				null,
+				self::factory()->post->create(),
+				1,
+				VerificationState::VERIFIED,
+				ActivationState::ACTIVE,
+				SslState::NONE,
+				null,
+				substr( md5( $host ), 0, 32 ),
+				'_post-domain-challenge',
 				$owned ? OwnershipOrigin::CREATED : null,
 				$owned ? 'install-a' : null,
 				$owned ? 'test-driver' : null,
@@ -64,9 +72,19 @@ final class MutationLeaseTest extends WP_UnitTestCase {
 
 	private function binding( Mapping $m, string $token, int $revision, MutationKind $kind = MutationKind::CREATE ): LeaseBinding {
 		return new LeaseBinding(
-			$m->id, $revision, $token, $kind, $m->host, $m->ssl_provider, $m->ssl_ref,
-			$m->challenge, $m->ssl_method, $m->ssl_ownership_origin, $m->ssl_owner_installation_id,
-			$this->driver->id(), $this->driver->environment_id()
+			$m->id,
+			$revision,
+			$token,
+			$kind,
+			$m->host,
+			$m->ssl_provider,
+			$m->ssl_ref,
+			$m->challenge,
+			$m->ssl_method,
+			$m->ssl_ownership_origin,
+			$m->ssl_owner_installation_id,
+			$this->driver->id(),
+			$this->driver->environment_id()
 		);
 	}
 
@@ -137,10 +155,19 @@ final class MutationLeaseTest extends WP_UnitTestCase {
 		$lease = $this->lease->acquire( $m->id, $m->revision, MutationKind::CREATE, $this->driver );
 
 		$binding = new LeaseBinding(
-			$m->id, $lease->revision, $lease->token, MutationKind::CREATE, $m->host,
-			$m->ssl_provider, $m->ssl_ref, $m->challenge, $m->ssl_method,
-			$m->ssl_ownership_origin, $m->ssl_owner_installation_id,
-			$this->driver->id(), 'zone:somewhere-else'
+			$m->id,
+			$lease->revision,
+			$lease->token,
+			MutationKind::CREATE,
+			$m->host,
+			$m->ssl_provider,
+			$m->ssl_ref,
+			$m->challenge,
+			$m->ssl_method,
+			$m->ssl_ownership_origin,
+			$m->ssl_owner_installation_id,
+			$this->driver->id(),
+			'zone:somewhere-else'
 		);
 
 		$this->assertNull( $this->lease->consume( $binding ) );
@@ -151,10 +178,19 @@ final class MutationLeaseTest extends WP_UnitTestCase {
 		$lease = $this->lease->acquire( $m->id, $m->revision, MutationKind::CREATE, $this->driver );
 
 		$binding = new LeaseBinding(
-			$m->id, $lease->revision, $lease->token, MutationKind::CREATE, $m->host,
-			$m->ssl_provider, $m->ssl_ref, $m->challenge, $m->ssl_method,
-			$m->ssl_ownership_origin, $m->ssl_owner_installation_id,
-			'some-other-driver', $this->driver->environment_id()
+			$m->id,
+			$lease->revision,
+			$lease->token,
+			MutationKind::CREATE,
+			$m->host,
+			$m->ssl_provider,
+			$m->ssl_ref,
+			$m->challenge,
+			$m->ssl_method,
+			$m->ssl_ownership_origin,
+			$m->ssl_owner_installation_id,
+			'some-other-driver',
+			$this->driver->environment_id()
 		);
 
 		$this->assertNull( $this->lease->consume( $binding ) );
@@ -170,7 +206,10 @@ final class MutationLeaseTest extends WP_UnitTestCase {
 		// Pretend a recovery had already scheduled re-reads on this row.
 		$wpdb->update( // phpcs:ignore WordPress.DB
 			Schema::domains_table(),
-			array( 'ssl_next_attempt_at' => gmdate( 'Y-m-d H:i:s', time() + 300 ), 'ssl_transient_count' => 4 ),
+			array(
+				'ssl_next_attempt_at' => gmdate( 'Y-m-d H:i:s', time() + 300 ),
+				'ssl_transient_count' => 4,
+			),
 			array( 'id' => $m->id )
 		);
 
@@ -324,14 +363,14 @@ final class MutationLeaseTest extends WP_UnitTestCase {
 	 *
 	 * @dataProvider owner_pinned_writes
 	 */
-	public function test_an_owner_pinned_write_hits_its_own_row_and_no_other( string $case ): void {
+	public function test_an_owner_pinned_write_hits_its_own_row_and_no_other( string $scenario ): void {
 		$mine      = $this->seed();
 		$bystander = $this->seed_host( 'bystander.test' );
 		$other     = $this->lease->acquire( $bystander->id, $bystander->revision, MutationKind::CREATE, $this->driver );
 
 		$this->assertNotNull( $other, 'the bystander holds its own lease throughout' );
 
-		switch ( $case ) {
+		switch ( $scenario ) {
 			case 'release_reserved':
 				$owner = $this->lease->acquire( $mine->id, $mine->revision, MutationKind::CREATE, $this->driver );
 
@@ -437,7 +476,9 @@ final class MutationLeaseTest extends WP_UnitTestCase {
 		return array(
 			'revision'    => array( 'revision', 999 ),
 			'token'       => array( 'token', '00000000000000000000000000000000' ),
-			'kind'        => array( 'kind', MutationKind::REMOVE ),
+			// ADOPT is wrong for both users of this provider: the release case
+			// holds a CREATE lease and the recovery case holds a REMOVE one.
+			'kind'        => array( 'kind', MutationKind::ADOPT ),
 			'phase'       => array( 'phase', MutationPhase::IN_FLIGHT ),
 			'driver'      => array( 'driver', 'some-other-driver' ),
 			'environment' => array( 'environment', 'zone:somewhere-else' ),

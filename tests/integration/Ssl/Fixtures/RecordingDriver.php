@@ -111,8 +111,15 @@ final class RecordingDriver implements SslDriver {
 
 	public static function confirming_method( string $method ): self {
 		return new self(
-			'ref-1', false, IdentityVerdict::MATCH, 'ref-1', null, MarkerSupport::UNAVAILABLE,
-			true, RemovalOutcome::REMOVED, $method
+			'ref-1',
+			false,
+			IdentityVerdict::MATCH,
+			'ref-1',
+			null,
+			MarkerSupport::UNAVAILABLE,
+			true,
+			RemovalOutcome::REMOVED,
+			$method
 		);
 	}
 
