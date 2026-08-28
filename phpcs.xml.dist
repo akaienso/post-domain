@@ -5,6 +5,11 @@
 	<file>tests</file>
 	<exclude-pattern>*/vendor/*</exclude-pattern>
 	<exclude-pattern>*/node_modules/*</exclude-pattern>
+	<!--
+		A generated artifact: its bytes must equal `composer generate:status-map`
+		output exactly, which a formatter would silently break.
+	-->
+	<exclude-pattern>references/cloudflare-status-map.php</exclude-pattern>
 	<rule ref="WordPress-Extra">
 		<!--
 			The project is PSR-4 (composer.json "autoload"), so class files are
