@@ -25,6 +25,11 @@ Inherit every constraint from Plan 01, and add:
 - **`DbRepository::save()` is the only write path to `pd_domains`** (spec §12.1).
 - **Events are audit-only.** No authorization, routing, or state transition ever
   reads `pd_domain_events` (spec §12.3).
+- **The durable provider binding moves as one:** `ssl_provider`,
+  `ssl_provider_environment`, `ssl_ref`, `ssl_ownership_origin`, and
+  `ssl_owner_installation_id` are all null or all populated. A row keeping a
+  provider without the rest is exactly the shape that lets a later read resolve
+  from current configuration (spec §12.6).
 - **Ownership authority is `ssl_ownership_origin IS NOT NULL` AND
   `ssl_owner_installation_id === pd_installation_id`.** There is no boolean
   duplicating it (spec §12.2).
@@ -651,7 +656,7 @@ default label costs 23. The limit is structural rather than a runtime check."
 **Interfaces:**
 - Consumes: `Schema` (Task 2), the enums (Task 1).
 - Produces:
-  - `PostDomain\Mapping\Mapping` — readonly, with `int $id`, `string $host`, `?int $alias_of`, `?int $post_id`, `int $revision`, `VerificationState $verification_state`, `ActivationState $activation_state`, `SslState $ssl_state`, `?string $integrity_error`, `string $challenge`, `string $challenge_label`, `?OwnershipOrigin $ssl_ownership_origin`, `?string $ssl_owner_installation_id`, `?string $ssl_provider`, `?string $ssl_provider_environment`, `?string $ssl_ref`, `?string $ssl_method`, `?string $ssl_mutation_token`, `?MutationKind $ssl_mutation_kind`, `?MutationPhase $ssl_mutation_phase`, `?string $ssl_mutation_expires_at`, `?string $ssl_mutation_driver`, `?string $ssl_mutation_environment`, `?string $ssl_next_attempt_at`, `int $ssl_transient_count`.
+  - `PostDomain\Mapping\Mapping` — readonly, with `int $id`, `string $host`, `?int $alias_of`, `?int $post_id`, `int $revision`, `VerificationState $verification_state`, `ActivationState $activation_state`, `SslState $ssl_state`, `?string $integrity_error`, `string $challenge`, `string $challenge_label`, `?OwnershipOrigin $ssl_ownership_origin`, `?string $ssl_owner_installation_id`, `?string $ssl_provider`, `?string $ssl_provider_environment`, `?string $ssl_ref`, `?string $ssl_method`, `?string $ssl_mutation_token`, `?MutationKind $ssl_mutation_kind`, `?MutationPhase $ssl_mutation_phase`, `?string $ssl_mutation_expires_at`, `?string $ssl_mutation_driver`, `?string $ssl_mutation_environment`, `?string $ssl_next_attempt_at`, `int $ssl_transient_count`, `?string $ssl_adopted_at`, `?int $ssl_adopted_by`.
 
   `ssl_next_attempt_at` and `ssl_transient_count` are **readable but not
   writable through `save()`** — they are scheduling state owned by the
@@ -788,7 +793,9 @@ final class Mapping {
 		public readonly ?string $ssl_mutation_driver = null,
 		public readonly ?string $ssl_mutation_environment = null,
 		public readonly ?string $ssl_next_attempt_at = null,
-		public readonly int $ssl_transient_count = 0
+		public readonly int $ssl_transient_count = 0,
+		public readonly ?string $ssl_adopted_at = null,
+		public readonly ?int $ssl_adopted_by = null
 	) {}
 
 	/**
@@ -820,7 +827,9 @@ final class Mapping {
 			$row['ssl_mutation_driver'],
 			$row['ssl_mutation_environment'],
 			$row['ssl_next_attempt_at'],
-			(int) ( $row['ssl_transient_count'] ?? 0 )
+			(int) ( $row['ssl_transient_count'] ?? 0 ),
+			$row['ssl_adopted_at'],
+			null === $row['ssl_adopted_by'] ? null : (int) $row['ssl_adopted_by']
 		);
 	}
 
@@ -1124,40 +1133,101 @@ final class RepositoryWriteTest extends WP_UnitTestCase {
 		$this->assertSame( 'zone:abc123', $after?->ssl_mutation_environment );
 	}
 
-	public function test_partial_ownership_provenance_is_rejected(): void {
+	public function test_the_completely_unbound_state_is_valid(): void {
+		$saved = $this->repo->save(
+			new Mapping(
+				0, 'unbound.test', null, 42, 1,
+				VerificationState::UNVERIFIED, ActivationState::INACTIVE, SslState::NONE,
+				null, str_repeat( 'n', 32 ), '_post-domain-challenge'
+			)
+		);
+
+		$this->assertNull( $this->repo->by_id( $saved->id )?->ssl_provider );
+	}
+
+	/**
+	 * The binding is one fact in five columns, so every proper subset is a lie
+	 * about the row. Thirty of the thirty-two combinations are rejected; the two
+	 * that are not are covered above and below.
+	 *
+	 * @dataProvider partial_bindings
+	 */
+	public function test_every_partial_durable_binding_is_rejected( array $present ): void {
 		$this->expectException( InvalidMapping::class );
+
 		$this->repo->save(
 			new Mapping(
-				0, 'example.test', null, 42, 1,
+				0, 'partial.test', null, 42, 1,
 				VerificationState::UNVERIFIED, ActivationState::INACTIVE, SslState::NONE,
-				null, str_repeat( 'h', 32 ), '_post-domain-challenge',
-				\PostDomain\Mapping\OwnershipOrigin::CREATED, null, 'cloudflare-saas', 'cf-zone:a', 'ref-1'
+				null, str_repeat( 'p', 32 ), '_post-domain-challenge',
+				in_array( 'origin', $present, true ) ? \PostDomain\Mapping\OwnershipOrigin::CREATED : null,
+				in_array( 'owner', $present, true ) ? 'install-a' : null,
+				in_array( 'provider', $present, true ) ? 'cloudflare-saas' : null,
+				in_array( 'environment', $present, true ) ? 'cf-zone:a' : null,
+				in_array( 'ref', $present, true ) ? 'ref-1' : null
 			)
 		);
 	}
 
-	public function test_a_bound_resource_without_its_environment_is_rejected(): void {
-		// Otherwise an ordinary read falls back to current configuration and can
-		// ask the wrong account about somebody else's certificate.
-		$this->expectException( InvalidMapping::class );
-		$this->repo->save(
-			new Mapping(
-				0, 'example.test', null, 42, 1,
-				VerificationState::UNVERIFIED, ActivationState::INACTIVE, SslState::NONE,
-				null, str_repeat( 'j', 32 ), '_post-domain-challenge',
-				\PostDomain\Mapping\OwnershipOrigin::CREATED, 'install-a', 'cloudflare-saas', null, 'ref-1'
-			)
-		);
+	/** @return array<string, array{0: string[]}> */
+	public static function partial_bindings(): array {
+		$fields = array( 'provider', 'environment', 'ref', 'origin', 'owner' );
+		$cases  = array();
+
+		// Every subset except the empty one and the complete one.
+		for ( $mask = 1; $mask < ( 1 << count( $fields ) ) - 1; $mask++ ) {
+			$present = array();
+
+			foreach ( $fields as $bit => $field ) {
+				if ( $mask & ( 1 << $bit ) ) {
+					$present[] = $field;
+				}
+			}
+
+			$cases[ implode( '+', $present ) ] = array( $present );
+		}
+
+		return $cases;
 	}
 
-	public function test_an_environment_without_a_bound_resource_is_rejected(): void {
+	public function test_an_adopted_binding_records_when_it_was_adopted(): void {
+		global $wpdb;
+
+		// Adoption goes through MutationGate, so the timestamp is written by the
+		// lease CAS rather than by save(). A row claiming ADOPTED without it is
+		// the forgery the invariant exists to catch (spec §12.2).
+		$saved = $this->repo->save(
+			new Mapping(
+				0, 'adopted.test', null, 42, 1,
+				VerificationState::UNVERIFIED, ActivationState::INACTIVE, SslState::NONE,
+				null, str_repeat( 'q', 32 ), '_post-domain-challenge',
+				\PostDomain\Mapping\OwnershipOrigin::CREATED, 'install-a', 'cloudflare-saas', 'cf-zone:a', 'ref-1'
+			)
+		);
+
+		$wpdb->update( // phpcs:ignore WordPress.DB
+			Schema::domains_table(),
+			array( 'ssl_ownership_origin' => 'adopted', 'ssl_adopted_at' => gmdate( 'Y-m-d H:i:s' ), 'ssl_adopted_by' => 1 ),
+			array( 'id' => $saved->id )
+		);
+
+		$adopted = $this->repo->by_id( $saved->id );
+
+		$this->assertSame( \PostDomain\Mapping\OwnershipOrigin::ADOPTED, $adopted?->ssl_ownership_origin );
+		$this->assertNotNull( $adopted?->ssl_adopted_at );
+
+		// And it round-trips through the repository, which the invariant accepts.
+		$this->assertNotNull( $this->repo->save( $adopted ) );
+	}
+
+	public function test_an_adopted_origin_without_an_adoption_timestamp_is_rejected(): void {
 		$this->expectException( InvalidMapping::class );
 		$this->repo->save(
 			new Mapping(
-				0, 'example.test', null, 42, 1,
+				0, 'forged.test', null, 42, 1,
 				VerificationState::UNVERIFIED, ActivationState::INACTIVE, SslState::NONE,
-				null, str_repeat( 'k', 32 ), '_post-domain-challenge',
-				null, null, 'cloudflare-saas', 'cf-zone:a', null
+				null, str_repeat( 'r', 32 ), '_post-domain-challenge',
+				\PostDomain\Mapping\OwnershipOrigin::ADOPTED, 'install-a', 'cloudflare-saas', 'cf-zone:a', 'ref-1'
 			)
 		);
 	}
@@ -1171,7 +1241,7 @@ final class RepositoryWriteTest extends WP_UnitTestCase {
 				0, 'roundtrip.test', null, 42, 1,
 				VerificationState::UNVERIFIED, ActivationState::INACTIVE, SslState::ACTIVE,
 				null, str_repeat( 'm', 32 ), '_pd',
-				\PostDomain\Mapping\OwnershipOrigin::ADOPTED, 'install-z',
+				\PostDomain\Mapping\OwnershipOrigin::CREATED, 'install-z',
 				'cloudflare-saas', 'cf-zone:z', 'ref-z', 'http'
 			)
 		);
@@ -1179,7 +1249,7 @@ final class RepositoryWriteTest extends WP_UnitTestCase {
 		$after = $this->repo->by_id( $saved->id );
 
 		$this->assertSame( 'roundtrip.test', $after?->host );
-		$this->assertSame( \PostDomain\Mapping\OwnershipOrigin::ADOPTED, $after?->ssl_ownership_origin );
+		$this->assertSame( \PostDomain\Mapping\OwnershipOrigin::CREATED, $after?->ssl_ownership_origin );
 		$this->assertSame( 'install-z', $after?->ssl_owner_installation_id );
 		$this->assertSame( 'cloudflare-saas', $after?->ssl_provider );
 		$this->assertSame( 'cf-zone:z', $after?->ssl_provider_environment );
@@ -1188,7 +1258,7 @@ final class RepositoryWriteTest extends WP_UnitTestCase {
 		$this->assertSame( SslState::ACTIVE, $after?->ssl_state );
 	}
 
-	public function test_a_bound_resource_with_its_environment_is_accepted(): void {
+	public function test_a_complete_created_binding_is_valid(): void {
 		$saved = $this->repo->save(
 			new Mapping(
 				0, 'example.test', null, 42, 1,
@@ -1198,7 +1268,14 @@ final class RepositoryWriteTest extends WP_UnitTestCase {
 			)
 		);
 
-		$this->assertSame( 'cf-zone:a', $this->repo->by_id( $saved->id )?->ssl_provider_environment );
+		$after = $this->repo->by_id( $saved->id );
+
+		$this->assertSame( 'cloudflare-saas', $after?->ssl_provider );
+		$this->assertSame( 'cf-zone:a', $after?->ssl_provider_environment );
+		$this->assertSame( 'ref-1', $after?->ssl_ref );
+		$this->assertSame( \PostDomain\Mapping\OwnershipOrigin::CREATED, $after?->ssl_ownership_origin );
+		$this->assertSame( 'install-a', $after?->ssl_owner_installation_id );
+		$this->assertNull( $after?->ssl_adopted_at );
 	}
 
 	public function test_an_illegal_state_transition_is_rejected(): void {
@@ -1283,8 +1360,10 @@ Replace `DbRepository::save()` with:
 			'updated_at'                => $now,
 		);
 
-		// ssl_next_attempt_at and ssl_transient_count are deliberately absent:
-		// they are scheduling state written only by the CAS that owns them.
+		// ssl_next_attempt_at, ssl_transient_count, ssl_adopted_at, and
+		// ssl_adopted_by are deliberately absent: they are written only by the CAS
+		// that owns them. An adoption in particular is not something save() may
+		// mint — it happens through MutationGate or not at all.
 
 		if ( 0 === $m->id ) {
 			$data['revision']   = 1;
@@ -1376,22 +1455,32 @@ Replace `DbRepository::save()` with:
 			throw new InvalidMapping( 'The six lease columns move together.' );
 		}
 
-		// A bound resource must say which environment it lives in, and an unbound
-		// one must not claim an environment it has no resource in. Without this,
-		// an ordinary read would fall back to current configuration and could ask
-		// the wrong account about somebody else's certificate (spec §12.6).
-		if ( ( null === $m->ssl_ref ) !== ( null === $m->ssl_provider_environment ) ) {
-			throw new InvalidMapping( 'A bound provider resource carries its provider environment, and only a bound one does.' );
-		}
-
-		$owned = array(
+		// The durable resource binding is one fact in five columns: which driver,
+		// which environment, which reference, and on whose authority. A row that
+		// keeps ssl_provider without the rest is the shape that lets an ordinary
+		// read fall back to current configuration and ask the wrong account about
+		// somebody else's certificate (spec §12.6).
+		$bound = array(
+			null !== $m->ssl_provider,
+			null !== $m->ssl_provider_environment,
+			null !== $m->ssl_ref,
 			null !== $m->ssl_ownership_origin,
 			null !== $m->ssl_owner_installation_id,
-			null !== $m->ssl_ref,
 		);
 
-		if ( count( array_unique( $owned ) ) > 1 ) {
-			throw new InvalidMapping( 'Ownership origin, owner installation, and provider ref move together.' );
+		if ( count( array_unique( $bound ) ) > 1 ) {
+			throw new InvalidMapping(
+				'The durable provider binding moves as one: provider, provider environment, ref, ownership origin, and owner installation.'
+			);
+		}
+
+		// Spec §12.2: adopted => ssl_adopted_at IS NOT NULL; created => it is NULL.
+		if ( OwnershipOrigin::ADOPTED === $m->ssl_ownership_origin && null === $m->ssl_adopted_at ) {
+			throw new InvalidMapping( 'An adopted binding records when it was adopted.' );
+		}
+
+		if ( OwnershipOrigin::CREATED === $m->ssl_ownership_origin && null !== $m->ssl_adopted_at ) {
+			throw new InvalidMapping( 'A created binding was never adopted.' );
 		}
 	}
 

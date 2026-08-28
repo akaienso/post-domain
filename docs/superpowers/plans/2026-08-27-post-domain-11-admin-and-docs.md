@@ -919,6 +919,7 @@ use PostDomain\Mapping\DbRepository;
 use PostDomain\Mapping\Mapping;
 use PostDomain\Mapping\SslState;
 use PostDomain\Mapping\VerificationState;
+use PostDomain\Ssl\Environment;
 use PostDomain\Ssl\MutationKind;
 use PostDomain\Support\Schema;
 use WP_UnitTestCase;
@@ -1023,10 +1024,14 @@ final class DiagnosticsTest extends WP_UnitTestCase {
 
 		$wpdb->update( // phpcs:ignore WordPress.DB
 			Schema::domains_table(),
+			// A complete binding: the repository invariant forbids a partial one,
+			// so a fixture that wrote half of it would be testing an impossible row.
 			array(
-				'ssl_provider'             => 'cloudflare-saas',
-				'ssl_provider_environment' => 'cf-zone:the-old-zone',
-				'ssl_ref'                  => 'ref-1',
+				'ssl_provider'              => 'cloudflare-saas',
+				'ssl_provider_environment'  => 'cf-zone:the-old-zone',
+				'ssl_ref'                   => 'ref-1',
+				'ssl_ownership_origin'      => 'created',
+				'ssl_owner_installation_id' => Environment::installation_id(),
 			),
 			array( 'id' => $mapping->id )
 		);
@@ -1038,6 +1043,7 @@ final class DiagnosticsTest extends WP_UnitTestCase {
 		$this->assertSame( 'warning', $check['status'] );
 		$this->assertStringContainsString( 'moved.test', $check['detail'] );
 		$this->assertStringContainsString( 'cf-zone:the-old-zone', $check['detail'] );
+		$this->assertStringContainsString( 'cloudflare-saas', $check['detail'], 'the driver is named as a driver' );
 	}
 
 	public function test_no_credential_appears_in_any_diagnostic(): void {
@@ -1388,11 +1394,12 @@ final class Diagnostics {
 				continue;
 			}
 
+			// Each identifier from its own field, correctly labelled.
 			$drifted[] = sprintf(
-				'%s: certificate lives in "%s" (%s)',
+				'%s [%s]: %s',
 				$mapping->host,
-				(string) $mapping->ssl_provider_environment,
-				$driver->reason
+				$driver->reason,
+				$driver->detail()
 			);
 		}
 

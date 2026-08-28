@@ -2825,6 +2825,8 @@ final class NullDriver implements SslDriver {
 	public function validation_plan( SslResourceContext $ctx, ?object $apex ): ValidationPlan {
 		unset( $ctx, $apex );
 
+		++$this->plan_calls;
+
 		return new ValidationPlan( array(), array(), array(), array(), array() );
 	}
 }
@@ -2903,6 +2905,10 @@ final class RecordingDriver implements SslDriver {
 	public int $remove_calls = 0;
 
 	public int $identify_calls = 0;
+
+	public int $status_calls = 0;
+
+	public int $plan_calls = 0;
 
 	/** @var string[] */
 	public array $phases_observed = array();
@@ -2996,6 +3002,8 @@ final class RecordingDriver implements SslDriver {
 	}
 
 	public function status( SslResourceContext $ctx ): SslStatus {
+		++$this->status_calls;
+
 		return new SslStatus( SslState::REQUESTED, $ctx->provider_ref, null, null, $this->confirmed_method );
 	}
 
@@ -3068,6 +3076,8 @@ final class RecordingDriver implements SslDriver {
 
 	public function validation_plan( SslResourceContext $ctx, ?object $apex ): ValidationPlan {
 		unset( $ctx, $apex );
+
+		++$this->plan_calls;
 
 		return new ValidationPlan( array(), array(), array(), array(), array() );
 	}
@@ -3963,6 +3973,26 @@ final class LeaseRecoveryTest extends WP_UnitTestCase {
 		);
 	}
 
+	public function test_a_partial_binding_fails_closed_rather_than_falling_through(): void {
+		global $wpdb;
+
+		// Raw SQL, because the repository invariant forbids writing this state.
+		// A future mistake or a legacy row must still not resolve from current
+		// configuration and read somebody else's account.
+		$m = $this->seed( 'partial.test', null, 0 );
+
+		$wpdb->update( // phpcs:ignore WordPress.DB
+			Schema::domains_table(),
+			array( 'ssl_provider' => 'recording' ),
+			array( 'id' => $m->id )
+		);
+
+		$result = \PostDomain\Ssl\BoundResource::driver_for( $this->repo->by_id( $m->id ) );
+
+		$this->assertInstanceOf( \PostDomain\Ssl\DriverUnavailable::class, $result );
+		$this->assertSame( 'provider_binding_incomplete', $result->reason );
+	}
+
 	public function test_a_deregistered_bound_driver_blocks_recovery_without_asking_anyone(): void {
 		$m = $this->seed( 'inflight.test', MutationPhase::IN_FLIGHT, -600 );
 
@@ -4599,7 +4629,7 @@ final class LeaseRecovery {
 - [ ] **Step 4: Run the test to verify it passes**
 
 Run: `composer test:integration -- --filter LeaseRecoveryTest`
-Expected: PASS — 31 tests
+Expected: PASS — 32 tests
 
 - [ ] **Step 5: Commit**
 
@@ -4720,10 +4750,13 @@ final class EnvironmentTest extends WP_UnitTestCase {
 		$after = $this->repo->by_id( $m->id );
 
 		$this->assertNotSame( $id, Environment::installation_id() );
+		// Every field of the durable binding, not merely most of them.
+		$this->assertNull( $after?->ssl_provider );
+		$this->assertNull( $after?->ssl_provider_environment );
+		$this->assertNull( $after?->ssl_ref );
 		$this->assertNull( $after?->ssl_ownership_origin );
 		$this->assertNull( $after?->ssl_owner_installation_id );
-		$this->assertNull( $after?->ssl_ref );
-		$this->assertNull( $after?->ssl_provider_environment, 'a clone owns nothing, anywhere' );
+		$this->assertNull( $after?->ssl_adopted_at, 'a clone owns nothing, anywhere' );
 		$this->assertSame( SslState::NONE, $after?->ssl_state );
 		$this->assertNotSame( $m->challenge, $after?->challenge );
 		$this->assertSame( VerificationState::UNVERIFIED, $after?->verification_state );
@@ -4831,13 +4864,18 @@ final class Environment {
 		foreach ( $ids as $id ) {
 			$wpdb->update( // phpcs:ignore WordPress.DB
 				$table,
+				// The durable binding is cleared whole, ssl_provider included: a
+				// clone owns nothing anywhere, and a row keeping a provider
+				// without the rest is exactly the partial state the repository
+				// invariant forbids (spec §12.2, §14.9).
 				array(
+					'ssl_provider'              => null,
+					'ssl_provider_environment'  => null,
+					'ssl_ref'                   => null,
 					'ssl_ownership_origin'      => null,
 					'ssl_owner_installation_id' => null,
 					'ssl_adopted_at'            => null,
 					'ssl_adopted_by'            => null,
-					'ssl_ref'                   => null,
-					'ssl_provider_environment'  => null,
 					'ssl_provider_state'        => null,
 					'ssl_state'                 => SslState::NONE->value,
 					'ssl_mutation_token'        => null,
@@ -4894,8 +4932,8 @@ needing a rule of its own."
 - Produces:
   - `SslDriverRegistry::register( SslDriver $d ): true|DriverUnavailable`, `::get()`, `::default()`, `::ids(): string[]`, `::holds( SslDriver $d ): bool`, `::rejected(): DriverUnavailable[]`, `::reject( DriverUnavailable $r ): void`. Re-registering the *same instance* is a no-op; a *different* driver claiming a taken id is refused.
   - `PostDomain\Ssl\DriverIdentity::of( SslDriver $d ): self|DriverUnavailable` — checks length, syntax, and **determinism of both `id()` and `environment_id()`** — with readonly `string $driver_id`, `string $environment_id`, and the public constants `MAX_DRIVER_ID` (60), `MAX_ENVIRONMENT_ID` (190), `DRIVER_ID_SYNTAX`, `ENVIRONMENT_SYNTAX`.
-  - `PostDomain\Ssl\DriverUnavailable` — readonly `string $reason`, `string $driver_id`.
-  - `PostDomain\Ssl\BoundResource::driver_for( Mapping $m ): SslDriver|DriverUnavailable` — `DriverFactory::for_mapping()` plus, for a mapping with a bound resource, the environment comparison; and `::drift_detail( Mapping $m ): string`. **Every path that touches an existing resource resolves through this, not through `DriverFactory` directly.**
+  - `PostDomain\Ssl\DriverUnavailable` — a typed refusal with readonly `string $reason`, `?string $driver_id`, `?string $expected_environment`, `?string $configured_environment`, named constructors `::driver()` and `::environment_changed()`, and `::detail(): string`. The environment identifiers have their own fields: overloading `driver_id` with one is how a screen ends up telling an operator a zone name is a driver.
+  - `PostDomain\Ssl\BoundResource::driver_for( Mapping $m ): SslDriver|DriverUnavailable` — `DriverFactory::for_mapping()` plus, for a mapping with a bound resource, the environment comparison, and a fail-closed refusal for a partially-bound row. **`DriverFactory::for_mapping()` has exactly one production caller, and it is this method.** Everything else — the authorizers via `AuthorizerSupport::open_window()`, the reconciler, the REST layer, Diagnostics, CLI — goes through `BoundResource`.
   - `PostDomain\Ssl\DriverFactory::registry(): SslDriverRegistry`, `::selected_driver_id(): string`, `::for_mapping( Mapping $m ): SslDriver|DriverUnavailable`, `::for_new_mapping(): SslDriver|DriverUnavailable`, `::reset(): void`.
   - `Cooldown::active_for()`, `::set()`.
   - `PostDomain\Ssl\AuthorizerSupport::open_window( MappingRepository $repo, MutationLease $lease, Mapping $m, MutationOperation $op ): array{driver: SslDriver, context: SslResourceContext, lease: LeaseOwner, mapping: Mapping}|MutationRefusal` — resolves its driver through `DriverFactory`, so no caller can supply a different registry, `::check_identity( SslDriver $d, SslResourceContext $c, bool $require_bound_match ): ?MutationRefusal`, and `::refuse( MutationLease $l, Mapping $m, ?LeaseOwner $held, MutationKind $k, string $precondition, bool $transient ): MutationRefusal` — which **releases the reservation**.
@@ -5056,6 +5094,7 @@ final class DeletionAuthorizerTest extends WP_UnitTestCase {
 		global $wpdb;
 
 		// A row bound to a provider nobody registers: unreadable, so unmutable.
+		// The binding stays complete — only which driver it names changes.
 		$m = $this->deletable();
 		$wpdb->update( // phpcs:ignore WordPress.DB
 			Schema::domains_table(),
@@ -5071,16 +5110,16 @@ final class DeletionAuthorizerTest extends WP_UnitTestCase {
 	}
 
 	public function test_no_configured_driver_refuses_by_name(): void {
-		global $wpdb;
-
-		$m = $this->deletable();
-		$this->authorizer( RecordingDriver::succeeding( 'ref-1' ), $this->proof( DnsOutcome::MATCH ) );
-
-		$wpdb->update( // phpcs:ignore WordPress.DB
-			Schema::domains_table(),
-			array( 'ssl_provider' => null ),
-			array( 'id' => $m->id )
+		// A genuinely unbound mapping, not a half-cleared one: nulling only
+		// ssl_provider would leave a partial binding the repository forbids.
+		$m = $this->repo->save(
+			new Mapping(
+				0, 'unbound.test', null, self::factory()->post->create(), 1,
+				VerificationState::VERIFIED, ActivationState::ACTIVE, SslState::NONE,
+				null, str_repeat( 'u', 32 ), '_post-domain-challenge'
+			)
 		);
+
 		delete_option( 'pd_settings' );
 		DriverFactory::reset();
 
@@ -5308,7 +5347,7 @@ final class SslDriverRegistry {
 		// answered would depend on filter order, and a bound row would resolve to
 		// a driver that is not the one it was bound to.
 		if ( isset( $this->drivers[ $identity->driver_id ] ) ) {
-			return new DriverUnavailable( 'driver_id_duplicate', $identity->driver_id );
+			return DriverUnavailable::driver( 'driver_id_duplicate', $identity->driver_id );
 		}
 
 		$this->drivers[ $identity->driver_id ] = $driver;
@@ -5345,10 +5384,50 @@ namespace PostDomain\Ssl;
  */
 final class DriverUnavailable {
 
-	public function __construct(
+	private function __construct(
 		public readonly string $reason,
-		public readonly string $driver_id
+		public readonly ?string $driver_id = null,
+		public readonly ?string $expected_environment = null,
+		public readonly ?string $configured_environment = null
 	) {}
+
+	/** No driver by that id, or none selected, or the identifiers were malformed. */
+	public static function driver( string $reason, ?string $driver_id = null ): self {
+		return new self( $reason, $driver_id );
+	}
+
+	/**
+	 * The driver exists but is pointed somewhere else. Both environments are
+	 * carried because an operator needs to see which one to go back to and which
+	 * one they are currently on; neither is a credential.
+	 */
+	public static function environment_changed(
+		string $driver_id,
+		string $expected_environment,
+		string $configured_environment
+	): self {
+		return new self( 'provider_environment_changed', $driver_id, $expected_environment, $configured_environment );
+	}
+
+	/** A sentence for a screen, a REST body, or an event. Never a credential. */
+	public function detail(): string {
+		if ( 'provider_environment_changed' !== $this->reason ) {
+			return sprintf(
+				/* translators: 1: refusal reason, 2: driver id. */
+				__( 'No SSL driver is available (%1$s: %2$s).', 'post-domain' ),
+				$this->reason,
+				(string) $this->driver_id
+			);
+		}
+
+		return sprintf(
+			/* translators: 1: driver id, 2: environment the resource lives in, 3: currently configured environment. */
+			__( 'This certificate lives in "%2$s", but driver "%1$s" is currently configured for "%3$s". Restore it to read or change the certificate.', 'post-domain' ),
+			(string) $this->driver_id,
+			(string) $this->expected_environment,
+			(string) $this->configured_environment
+		);
+	}
 }
 ```
 
@@ -5393,25 +5472,37 @@ final class BoundResource {
 			return $driver;
 		}
 
-		if ( null === $mapping->ssl_ref || null === $mapping->ssl_provider_environment ) {
+		$bound = array(
+			null !== $mapping->ssl_provider,
+			null !== $mapping->ssl_provider_environment,
+			null !== $mapping->ssl_ref,
+			null !== $mapping->ssl_ownership_origin,
+			null !== $mapping->ssl_owner_installation_id,
+		);
+
+		// Nothing bound: this is a first create or an unbound adoption, and the
+		// configured selection is the right answer.
+		if ( ! in_array( true, $bound, true ) ) {
 			return $driver;
 		}
 
+		// Partially bound. The repository invariant forbids this, so reaching here
+		// means a legacy row, a raw-SQL fixture, or a future mistake — and the one
+		// safe reading of a half-written binding is to refuse it, not to fall
+		// through to current configuration.
+		if ( in_array( false, $bound, true ) ) {
+			return DriverUnavailable::driver( 'provider_binding_incomplete', $mapping->ssl_provider );
+		}
+
 		if ( $driver->environment_id() !== $mapping->ssl_provider_environment ) {
-			return new DriverUnavailable( 'provider_environment_changed', $mapping->ssl_provider_environment );
+			return DriverUnavailable::environment_changed(
+				(string) $mapping->ssl_provider,
+				(string) $mapping->ssl_provider_environment,
+				$driver->environment_id()
+			);
 		}
 
 		return $driver;
-	}
-
-	/** A sentence an operator can act on, for Diagnostics, REST, and events. */
-	public static function drift_detail( Mapping $mapping ): string {
-		return sprintf(
-			/* translators: 1: driver id, 2: environment the resource lives in. */
-			__( 'This certificate lives in "%2$s". Restore driver "%1$s" to that environment to read or change it.', 'post-domain' ),
-			(string) $mapping->ssl_provider,
-			(string) $mapping->ssl_provider_environment
-		);
 	}
 }
 ```
@@ -5462,33 +5553,33 @@ final class DriverIdentity {
 		$id = $driver->id();
 
 		if ( '' === $id || strlen( $id ) > self::MAX_DRIVER_ID ) {
-			return new DriverUnavailable( 'driver_id_length', self::describe( $id ) );
+			return DriverUnavailable::driver( 'driver_id_length', self::describe( $id ) );
 		}
 
 		if ( 1 !== preg_match( self::DRIVER_ID_SYNTAX, $id ) ) {
-			return new DriverUnavailable( 'driver_id_syntax', self::describe( $id ) );
+			return DriverUnavailable::driver( 'driver_id_syntax', self::describe( $id ) );
 		}
 
 		// An id that changes between registration and lease acquisition would
 		// write a durable binding the registry can never resolve again.
 		if ( $driver->id() !== $id ) {
-			return new DriverUnavailable( 'driver_id_unstable', self::describe( $id ) );
+			return DriverUnavailable::driver( 'driver_id_unstable', self::describe( $id ) );
 		}
 
 		$environment = $driver->environment_id();
 
 		if ( '' === $environment || strlen( $environment ) > self::MAX_ENVIRONMENT_ID ) {
-			return new DriverUnavailable( 'environment_id_length', $id );
+			return DriverUnavailable::driver( 'environment_id_length', $id );
 		}
 
 		if ( 1 !== preg_match( self::ENVIRONMENT_SYNTAX, $environment ) ) {
-			return new DriverUnavailable( 'environment_id_syntax', $id );
+			return DriverUnavailable::driver( 'environment_id_syntax', $id );
 		}
 
 		// Determinism is the property the whole binding rests on: a value that
 		// differs between two calls cannot be compared across a process boundary.
 		if ( $driver->environment_id() !== $environment ) {
-			return new DriverUnavailable( 'environment_id_unstable', $id );
+			return DriverUnavailable::driver( 'environment_id_unstable', $id );
 		}
 
 		return new self( $id, $environment );
@@ -5595,7 +5686,7 @@ final class DriverFactory {
 
 		// A bound row is never reinterpreted: without its own driver the resource
 		// cannot be read, let alone changed.
-		return $driver ?? new DriverUnavailable( 'driver_not_registered', $mapping->ssl_provider );
+		return $driver ?? DriverUnavailable::driver( 'driver_not_registered', $mapping->ssl_provider );
 	}
 
 	/** @return SslDriver|DriverUnavailable */
@@ -5603,12 +5694,12 @@ final class DriverFactory {
 		$selected = self::selected_driver_id();
 
 		if ( self::NULL_DRIVER === $selected ) {
-			return new DriverUnavailable( 'ssl_not_configured', $selected );
+			return DriverUnavailable::driver( 'ssl_not_configured', $selected );
 		}
 
 		$driver = self::registry()->get( $selected );
 
-		return $driver ?? new DriverUnavailable( 'driver_not_registered', $selected );
+		return $driver ?? DriverUnavailable::driver( 'driver_not_registered', $selected );
 	}
 
 	/** Tests and the settings screen invalidate the memoized registry. */
@@ -5688,12 +5779,16 @@ final class AuthorizerSupport {
 			return new MutationRefusal( 'environment_unresolved', false );
 		}
 
-		// One factory, never a locally-built registry, and never a silent
-		// fallback to NullDriver for a mapping that has no provider yet.
-		$driver = DriverFactory::for_mapping( $mapping );
+		// BoundResource, never DriverFactory directly. For an unbound mapping this
+		// is the configured selection; for a bound one it additionally proves the
+		// driver is still pointed at the environment the resource lives in. That
+		// check must happen HERE, before a lease is acquired and before any
+		// provider read — a lease taken against the wrong environment would then
+		// be self-consistent all the way through the gate (spec §12.6).
+		$driver = BoundResource::driver_for( $mapping );
 
 		if ( $driver instanceof DriverUnavailable ) {
-			return new MutationRefusal( $driver->reason, false, $driver->driver_id );
+			return new MutationRefusal( $driver->reason, false, $driver->detail() );
 		}
 
 		if ( Cooldown::active_for( $driver->id() ) ) {
@@ -6321,6 +6416,32 @@ final class DriverFactoryTest extends WP_UnitTestCase {
 		$this->assertSame( 'driver_not_registered', $result->reason );
 	}
 
+	public function test_only_bound_resource_resolves_a_mapping_in_production(): void {
+		// The environment check lives in BoundResource. A production caller that
+		// went to DriverFactory directly would skip it, take a lease bound to the
+		// wrong environment, and then pass every later check self-consistently.
+		$offenders = array();
+
+		/** @var \SplFileInfo $file */
+		foreach ( new \RecursiveIteratorIterator(
+			new \RecursiveDirectoryIterator( dirname( __DIR__, 3 ) . '/src' )
+		) as $file ) {
+			if ( 'php' !== $file->getExtension() || 'BoundResource.php' === $file->getFilename() ) {
+				continue;
+			}
+
+			if ( str_contains( (string) file_get_contents( $file->getPathname() ), 'DriverFactory::for_mapping' ) ) {
+				$offenders[] = $file->getFilename();
+			}
+		}
+
+		$this->assertSame(
+			array(),
+			$offenders,
+			'DriverFactory::for_mapping() has exactly one production caller: BoundResource::driver_for()'
+		);
+	}
+
 	public function test_a_filter_returning_junk_is_ignored_rather_than_fatal(): void {
 		add_filter( 'pd_ssl_drivers', static fn(): array => array( 'not a driver', 42 ) );
 		DriverFactory::reset();
@@ -6333,7 +6454,7 @@ final class DriverFactoryTest extends WP_UnitTestCase {
 - [ ] **Step 8: Run it and verify it passes**
 
 Run: `composer test:integration -- --filter DriverFactoryTest`
-Expected: PASS — 17 tests
+Expected: PASS — 18 tests
 
 - [ ] **Step 9: Run the full suite**
 

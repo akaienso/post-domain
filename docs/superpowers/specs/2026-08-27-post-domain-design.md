@@ -1004,15 +1004,20 @@ alias_of IS NULL      =>  post_id IS NOT NULL        (canonical row)
 alias_of IS NOT NULL  =>  post_id IS NULL            (alias row)
 alias target must itself have alias_of IS NULL       (no chaining)
 
-ssl_ownership_origin IS NOT NULL
-   <=> ssl_owner_installation_id IS NOT NULL
+-- The durable provider binding is one fact in five columns.
+ssl_provider IS NOT NULL
+   <=> ssl_provider_environment IS NOT NULL
    <=> ssl_ref IS NOT NULL
+   <=> ssl_ownership_origin IS NOT NULL
+   <=> ssl_owner_installation_id IS NOT NULL
 ssl_ownership_origin = 'adopted'  =>  ssl_adopted_at IS NOT NULL
 ssl_ownership_origin = 'created'  =>  ssl_adopted_at IS NULL
 ssl_mutation_token IS NULL
    =>  ssl_mutation_kind IS NULL
    AND ssl_mutation_phase IS NULL
    AND ssl_mutation_expires_at IS NULL
+   AND ssl_mutation_driver IS NULL
+   AND ssl_mutation_environment IS NULL
 ssl_mutation_token IS NOT NULL
    =>  ssl_mutation_kind IS NOT NULL
    AND ssl_mutation_phase IS NOT NULL
@@ -1200,7 +1205,7 @@ Its lifecycle is exact:
 | create or adoption recovered | likewise, promoted from the lease's binding, never from current configuration |
 | status, identify, reconcile, method change, deletion attempts | **retained unchanged** |
 | provider binding deliberately cleared | cleared with `ssl_provider`, `ssl_ref`, and ownership provenance |
-| clone resolution (§14.9) | cleared with them |
+| clone resolution (§14.9) | cleared with the whole binding, `ssl_provider` included |
 | mapping deleted | gone with the row |
 
 It is **never** derived from the event log and **never** silently replaced by
@@ -2077,7 +2082,7 @@ at the top of every sweep — never on the front-end path. A mismatch sets
 | Operator choice | Effect |
 |---|---|
 | **Restore / Move** | keep the installation id, the challenges, and all ownership columns; update the stored primary host; clear the flag. This remains the same installation. |
-| **Clone** | generate a **new** installation id; clear `ssl_ownership_origin`, `ssl_owner_installation_id`, `ssl_adopted_at`, `ssl_adopted_by`, `ssl_ref`, `ssl_provider_state`, and any stale mutation lease; set `ssl_state = none`; reset every row to `unverified` with **rotated challenges**; adopt nothing remotely |
+| **Clone** | generate a **new** installation id; clear the **complete** durable binding — `ssl_provider`, `ssl_provider_environment`, `ssl_ref`, `ssl_ownership_origin`, `ssl_owner_installation_id` — together with `ssl_adopted_at`, `ssl_adopted_by`, `ssl_provider_state`, and any stale mutation lease; set `ssl_state = none`; reset every row to `unverified` with **rotated challenges**; adopt nothing remotely |
 
 A database copy is not evidence of domain control, so a clone re-proves from scratch and
 — by §14.4 — cannot touch the original's provider resources.
@@ -2858,8 +2863,11 @@ Cloudflare client):**
   deletion execution all perform **zero** provider reads and **zero** provider
   mutations, and change no local provider state
 - restoring the original environment lets every one of those resume
-- clone resolution clears `ssl_provider_environment` with `ssl_provider`,
-  `ssl_ref`, and the ownership columns
+- clone resolution clears the complete durable binding in one write —
+  `ssl_provider`, `ssl_provider_environment`, `ssl_ref`, `ssl_ownership_origin`,
+  `ssl_owner_installation_id` — leaving no field of it behind
+- the repository refuses every partial durable binding, so a row can never reach a
+  state in which a later read would resolve its driver from current configuration
 - REST and Diagnostics distinguish the durable resource environment from the
   environment of a mutation currently in flight
 - the lease TTL and recovery grace exceed the driver's provider HTTP timeout by the

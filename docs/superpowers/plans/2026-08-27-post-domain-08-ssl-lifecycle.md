@@ -1546,16 +1546,33 @@ final class MethodChangeTest extends WP_UnitTestCase {
 		);
 	}
 
-	public function test_a_method_change_against_a_drifted_environment_sends_nothing(): void {
+	public function test_a_method_change_against_a_drifted_environment_touches_nothing_at_all(): void {
 		$driver = RecordingDriver::confirming_method( 'http' )->in_environment( 'recording:somewhere-else' );
 		$m      = $this->mapping();
+		$before = $this->repo->by_id( $m->id );
 
 		$result = MethodChangeService::for_tests( $driver, $this->proof( DnsOutcome::MATCH ) )->change( $m, 'http' );
 
+		$after = $this->repo->by_id( $m->id );
+
 		$this->assertSame( MutationDisposition::REFUSED, $result->disposition );
 		$this->assertSame( 'provider_environment_changed', $result->refusal?->precondition );
+
+		// Refused before the lease, and therefore before every provider call —
+		// not merely before the mutating one.
+		$this->assertSame( 0, $driver->identify_calls, 'no identity read against the wrong account' );
+		$this->assertSame( 0, $driver->status_calls, 'no status read either' );
+		$this->assertSame( 0, $driver->plan_calls, 'and no validation planning' );
 		$this->assertSame( 0, $driver->method_calls );
-		$this->assertSame( 'txt', $this->repo->by_id( $m->id )?->ssl_method );
+		$this->assertNull( $after?->ssl_mutation_token, 'no lease was ever acquired' );
+		$this->assertSame( $before->revision, $after?->revision, 'not even a revision bump' );
+
+		// Every field of the durable binding, and the method, exactly as before.
+		$this->assertSame( 'txt', $after?->ssl_method );
+		$this->assertSame( $before->ssl_provider, $after?->ssl_provider );
+		$this->assertSame( $before->ssl_provider_environment, $after?->ssl_provider_environment );
+		$this->assertSame( $before->ssl_ref, $after?->ssl_ref );
+		$this->assertSame( $before->ssl_state, $after?->ssl_state );
 	}
 
 	public function test_a_method_change_resumes_once_the_environment_is_restored(): void {
@@ -2166,16 +2183,52 @@ final class DeletionServiceTest extends WP_UnitTestCase {
 		$this->assertSame( 1, $driver->remove_calls, 'the provider already confirmed; asking again proves nothing' );
 	}
 
-	public function test_a_deletion_against_a_drifted_environment_sends_nothing(): void {
+	public function test_a_deletion_against_a_drifted_environment_touches_nothing_at_all(): void {
 		$driver  = RecordingDriver::removing( RemovalOutcome::REMOVED )->in_environment( 'recording:somewhere-else' );
 		$m       = $this->owned();
 		$service = DeletionService::for_tests( $driver, $this->proof( DnsOutcome::MATCH ) );
 
 		$service->request( $m );
 
-		$this->assertSame( 'refused', $service->process( $this->repo->by_id( $m->id ) ) );
+		$before  = $this->repo->by_id( $m->id );
+		$outcome = $service->process( $before );
+		$after   = $this->repo->by_id( $m->id );
+
+		$this->assertSame( 'refused', $outcome );
+
+		// Refused before the lease, and therefore before every provider call.
+		$this->assertSame( 0, $driver->identify_calls, 'no identity read against the wrong account' );
+		$this->assertSame( 0, $driver->status_calls );
+		$this->assertSame( 0, $driver->plan_calls );
 		$this->assertSame( 0, $driver->remove_calls, 'zone B has no certificate of ours to delete' );
-		$this->assertNotNull( $this->repo->by_id( $m->id ) );
+		$this->assertNull( $after?->ssl_mutation_token, 'no lease was ever acquired' );
+
+		$this->assertNotNull( $after );
+		$this->assertSame( $before->ssl_provider, $after?->ssl_provider );
+		$this->assertSame( $before->ssl_provider_environment, $after?->ssl_provider_environment );
+		$this->assertSame( $before->ssl_ref, $after?->ssl_ref );
+		$this->assertSame( $before->ssl_ownership_origin, $after?->ssl_ownership_origin );
+	}
+
+	public function test_deletion_resumes_once_the_environment_is_restored(): void {
+		$m       = $this->owned();
+		$drifted = DeletionService::for_tests(
+			RecordingDriver::removing( RemovalOutcome::REMOVED )->in_environment( 'recording:somewhere-else' ),
+			$this->proof( DnsOutcome::MATCH )
+		);
+
+		$drifted->request( $m );
+		$drifted->process( $this->repo->by_id( $m->id ) );
+
+		remove_all_filters( 'pd_ssl_drivers' );
+
+		$restored = DeletionService::for_tests(
+			RecordingDriver::removing( RemovalOutcome::REMOVED ),
+			$this->proof( DnsOutcome::MATCH )
+		);
+
+		$this->assertSame( 'removed', $restored->process( $this->repo->by_id( $m->id ) ) );
+		$this->assertNull( $this->repo->by_id( $m->id ) );
 	}
 
 	public function test_a_fenced_worker_does_not_hard_delete(): void {
@@ -2666,7 +2719,7 @@ final class DeletionService {
 - [ ] **Step 4: Run the test to verify it passes**
 
 Run: `composer test:integration -- --filter DeletionServiceTest`
-Expected: PASS — 31 tests (including the two six-case lease-state providers)
+Expected: PASS — 32 tests (including the two six-case lease-state providers)
 
 - [ ] **Step 5: Commit**
 
@@ -3097,19 +3150,25 @@ final class ReconcilerTest extends WP_UnitTestCase {
 	}
 
 	public function test_reconciliation_never_adopts_ownership(): void {
-		global $wpdb;
-
-		$m = $this->mapping( SslState::ACTIVE );
-		$wpdb->update( // phpcs:ignore WordPress.DB
-			Schema::domains_table(),
-			array( 'ssl_ownership_origin' => null, 'ssl_owner_installation_id' => null, 'ssl_ref' => null ),
-			array( 'id' => $m->id )
+		// A genuinely unbound mapping — not a half-cleared one, which the
+		// repository invariant forbids — for which the provider reports a
+		// resource. Finding one is not a reason to claim it.
+		$m = $this->repo->save(
+			new Mapping(
+				0, 'unbound.test', null, self::factory()->post->create(), 1,
+				VerificationState::VERIFIED, ActivationState::ACTIVE, SslState::NONE,
+				null, str_repeat( 'u', 32 ), '_post-domain-challenge'
+			)
 		);
 
-		$this->install( $this->driver( array( 'mapped.test' => new SslStatus( SslState::ACTIVE, 'ref-1' ) ), true ) );
+		$this->install( $this->driver( array( 'unbound.test' => new SslStatus( SslState::ACTIVE, 'ref-1' ) ), true ) );
 		Reconciler::run( array( $this->repo->by_id( $m->id ) ) );
 
-		$this->assertNull( $this->repo->by_id( $m->id )?->ssl_ownership_origin );
+		$after = $this->repo->by_id( $m->id );
+
+		$this->assertNull( $after?->ssl_ownership_origin );
+		$this->assertNull( $after?->ssl_ref );
+		$this->assertNull( $after?->ssl_provider_environment );
 	}
 
 	public function test_a_revision_race_is_not_counted_as_an_update(): void {

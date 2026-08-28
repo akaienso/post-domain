@@ -130,6 +130,7 @@ final class SerializerTest extends WP_UnitTestCase {
 				OwnershipOrigin::CREATED,
 				Environment::installation_id(),
 				'cloudflare-saas',
+				'cf-zone:zone-1',
 				'ref-1'
 			)
 		);
@@ -324,6 +325,7 @@ final class SerializerTest extends WP_UnitTestCase {
 
 		$mapping = $this->mapping( VerificationState::VERIFIED, ActivationState::ACTIVE );
 
+		// The binding stays complete — only which environment it names changes.
 		$wpdb->update( // phpcs:ignore WordPress.DB
 			Schema::domains_table(),
 			array( 'ssl_provider_environment' => 'cf-zone:a-zone-nobody-configured' ),
@@ -2210,17 +2212,24 @@ and:
 		$driver = $this->ssl->driver_for( $mapping );
 
 		if ( $driver instanceof \PostDomain\Ssl\DriverUnavailable ) {
+			// The refusal carries its own accurately-labelled fields; nothing here
+			// reads an environment out of a driver-id slot.
 			if ( 'provider_environment_changed' === $driver->reason ) {
-				return self::error(
-					Errors::ENVIRONMENT_DRIFTED,
-					\PostDomain\Ssl\BoundResource::drift_detail( $mapping ),
-					409
-				);
+				$response = self::error( Errors::ENVIRONMENT_DRIFTED, $driver->detail(), 409 );
+				$data     = $response->get_data();
+
+				$data['data']['driver']                 = $driver->driver_id;
+				$data['data']['expected_environment']   = $driver->expected_environment;
+				$data['data']['configured_environment'] = $driver->configured_environment;
+
+				$response->set_data( $data );
+
+				return $response;
 			}
 
 			return self::error(
 				'ssl_not_configured' === $driver->reason ? Errors::SSL_NOT_CONFIGURED : Errors::NO_DRIVER,
-				sprintf( 'No SSL driver is available for this mapping (%s).', $driver->reason ),
+				$driver->detail(),
 				409
 			);
 		}
