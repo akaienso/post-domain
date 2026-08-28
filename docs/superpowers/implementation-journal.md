@@ -110,3 +110,44 @@ COLUMNS`, which reports the same `varchar(230)` / `ascii_bin` facts.
 **Deviation 8 — domains-table column count is 51, not 49.**
 The expectation predates the two mutation-binding columns and the durable
 `ssl_provider_environment` added during the plan corrections. Updated to 51.
+| 02 | 4 | completed | (next commit) | `DbRepository::save()` + invariants, `InvalidMapping`, `StaleRevision` | `RepositoryWriteTest` → 44 OK (incl. 30 partial-binding cases) | integration → 96 OK | **Deviation 9**, **Deviation 10** | — |
+| 02 | 5 | completed | (next commit) | `EventLog`, `AtomicTransition`, `TransitionOutcome`, `TransitionResult`, `tests/integration/OwnedSessionTestCase.php` | `AtomicTransitionTest` → 21 OK | integration → 96 OK | **Deviation 11**, **Deviation 12** | — |
+| 02 | 6 | completed | (next commit) | `AliasResolver`, `AliasInUse`, `DbRepository::delete()` | `AliasTest` OK | integration → 96 OK | — | — |
+| 02 | 7 | completed | (next commit) | `Contracts/{Clock,Scheduler,HttpClient}.php`, `Support/{SystemClock,WpCronScheduler,WpHttpClient,HttpResponse}.php`, `tests/Fixtures/FrozenClock.php` | `SystemClockTest`, `WpCronSchedulerTest` OK | unit 85 / integration 96 OK | **Deviation 13** | — |
+
+**Deviation 9 — `DbRepository::save()` could not write NULL on the update path.**
+The planned update built `"{$column} = %s"` for every column and bound the values
+through `$wpdb->prepare()`, which casts a null bound to `%s` into the **empty
+string**. A nullable column could therefore never be cleared, and reading the row
+back blew up with `"" is not a valid backing value for enum OwnershipOrigin`.
+Null values now emit a literal `NULL` in the SET clause; the column names come
+from the method's own fixed list, never from a caller.
+
+**Deviation 10 — positional `Mapping` constructor arguments in Plan 02's tests.**
+Three lease fixtures passed five `null`s before the lease token, which predates
+`ssl_provider_environment`. Corrected to six.
+
+**Deviation 11 — `EventLogTest`'s "nothing else reads the events table" scan.**
+It excluded only `EventLog.php`, but `Schema.php` *declares* `events_table()`.
+Excluded both; the invariant is that nothing else *reads* the table.
+
+**Deviation 12 — the WordPress test harness is always inside a transaction.**
+`WP_UnitTestCase` wraps each test in a transaction *and* sets `autocommit = 0`,
+under which a transaction is always implicitly open. `AtomicTransition` therefore
+correctly refuses every transition inside a stock `WP_UnitTestCase`. Added
+`tests/integration/OwnedSessionTestCase.php`, which commits the harness
+transaction, restores `autocommit = 1`, and cleans the plugin tables by hand;
+tests that exercise transition behaviour extend it. **No production code was
+changed** — the refusal is the specified behaviour and is asserted directly by
+`test_an_ambient_transaction_refuses_before_the_transition_runs()`.
+
+This surfaced a genuine production consideration, recorded here as a limitation:
+on a host that runs MySQL with `autocommit = 0`, `AtomicTransition` will refuse
+every transition, because there is no transaction it can own. WordPress does not
+set that, but a hosting environment could. See "Known limitations" in the handoff.
+
+**Deviation 13 — two static-analysis corrections.**
+`SslState::can_transition_to()`'s `match` did not handle `FAILED` as a source
+state (PHPStan level 8); named it explicitly rather than adding an unreachable
+default. `WpHttpClient` called `->getAll()` on the result of
+`wp_remote_retrieve_headers()`, which is not always an object; guarded it.

@@ -24,6 +24,14 @@
 		<exclude-pattern>bin/*</exclude-pattern>
 	</rule>
 
+	<!--
+		An exception message is not output. It reaches a log or a developer, never
+		a page, and escaping it would corrupt the diagnostic.
+	-->
+	<rule ref="WordPress-Extra">
+		<exclude name="WordPress.Security.EscapeOutput.ExceptionNotEscaped"/>
+	</rule>
+
 	<config name="minimum_supported_wp_version" value="6.4"/>
 	<config name="testVersion" value="8.1-"/>
 </ruleset>

@@ -78,17 +78,26 @@ final class StateTransitionTest extends TestCase {
 	}
 
 	public function test_supporting_enum_values(): void {
-		$this->assertSame( array( 'created', 'adopted' ), array_map(
-			static fn( OwnershipOrigin $o ): string => $o->value,
-			OwnershipOrigin::cases()
-		) );
-		$this->assertSame( array( 'create', 'adopt', 'method', 'remove' ), array_map(
-			static fn( MutationKind $k ): string => $k->value,
-			MutationKind::cases()
-		) );
-		$this->assertSame( array( 'reserved', 'in_flight', 'recovering' ), array_map(
-			static fn( MutationPhase $p ): string => $p->value,
-			MutationPhase::cases()
-		) );
+		$this->assertSame(
+			array( 'created', 'adopted' ),
+			array_map(
+				static fn( OwnershipOrigin $o ): string => $o->value,
+				OwnershipOrigin::cases()
+			)
+		);
+		$this->assertSame(
+			array( 'create', 'adopt', 'method', 'remove' ),
+			array_map(
+				static fn( MutationKind $k ): string => $k->value,
+				MutationKind::cases()
+			)
+		);
+		$this->assertSame(
+			array( 'reserved', 'in_flight', 'recovering' ),
+			array_map(
+				static fn( MutationPhase $p ): string => $p->value,
+				MutationPhase::cases()
+			)
+		);
 	}
 }

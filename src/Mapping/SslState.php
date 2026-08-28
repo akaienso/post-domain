@@ -36,6 +36,10 @@ enum SslState: string {
 			self::ACTIVE             => self::ACTIVE === $to,
 			self::PENDING_REMOVAL    => false,
 			self::REVOKED            => self::REQUESTED === $to,
+			// FAILED is handled by the early return above for every $to it can
+			// reach; naming it here keeps the match exhaustive rather than
+			// relying on an unreachable default.
+			self::FAILED             => self::REQUESTED === $to,
 		};
 	}
 }

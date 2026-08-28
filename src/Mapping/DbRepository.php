@@ -49,10 +49,200 @@ final class DbRepository implements MappingRepository {
 	}
 
 	public function save( Mapping $m ): Mapping {
-		throw new \RuntimeException( 'save() lands in Task 4.' );
+		global $wpdb;
+
+		$this->assert_valid( $m );
+
+		$table = Schema::domains_table();
+		$now   = gmdate( 'Y-m-d H:i:s' );
+
+		$data = array(
+			'host'                      => $m->host,
+			'alias_of'                  => $m->alias_of,
+			'post_id'                   => $m->post_id,
+			'verification_state'        => $m->verification_state->value,
+			'activation_state'          => $m->activation_state->value,
+			'ssl_state'                 => $m->ssl_state->value,
+			'integrity_error'           => $m->integrity_error,
+			'challenge'                 => $m->challenge,
+			'challenge_label'           => $m->challenge_label,
+			'ssl_ownership_origin'      => $m->ssl_ownership_origin?->value,
+			'ssl_owner_installation_id' => $m->ssl_owner_installation_id,
+			'ssl_provider'              => $m->ssl_provider,
+			'ssl_provider_environment'  => $m->ssl_provider_environment,
+			'ssl_ref'                   => $m->ssl_ref,
+			'ssl_method'                => $m->ssl_method,
+			'ssl_mutation_token'        => $m->ssl_mutation_token,
+			'ssl_mutation_kind'         => $m->ssl_mutation_kind?->value,
+			'ssl_mutation_phase'        => $m->ssl_mutation_phase?->value,
+			'ssl_mutation_expires_at'   => $m->ssl_mutation_expires_at,
+			'ssl_mutation_driver'       => $m->ssl_mutation_driver,
+			'ssl_mutation_environment'  => $m->ssl_mutation_environment,
+			'updated_at'                => $now,
+		);
+
+		// ssl_next_attempt_at, ssl_transient_count, ssl_adopted_at, and
+		// ssl_adopted_by are deliberately absent: they are written only by the CAS
+		// that owns them. An adoption in particular is not something save() may
+		// mint — it happens through MutationGate or not at all.
+
+		if ( 0 === $m->id ) {
+			$data['revision']   = 1;
+			$data['created_at'] = $now;
+
+			$wpdb->insert( $table, $data ); // phpcs:ignore WordPress.DB
+
+			$saved = $this->by_id( (int) $wpdb->insert_id );
+
+			if ( null === $saved ) {
+				throw new \RuntimeException( 'The inserted mapping could not be read back.' );
+			}
+
+			return $saved;
+		}
+
+		$existing = $this->by_id( $m->id );
+
+		if ( null === $existing ) {
+			throw new InvalidMapping( 'Cannot update a mapping that does not exist.' );
+		}
+
+		$this->assert_transitions( $existing, $m );
+
+		$sets   = array();
+		$values = array();
+
+		foreach ( $data as $column => $value ) {
+			// wpdb::prepare() casts a null bound to %s into the empty string, so a
+			// nullable column could never be cleared through a placeholder. The
+			// column names come from the fixed list above, never from a caller.
+			if ( null === $value ) {
+				$sets[] = "{$column} = NULL";
+
+				continue;
+			}
+
+			$sets[]   = "{$column} = %s";
+			$values[] = $value;
+		}
+
+		$sql = "UPDATE {$table} SET " . implode( ', ', $sets )
+			. ', revision = revision + 1 WHERE id = %d AND revision = %d';
+
+		$values[] = $m->id;
+		$values[] = $m->revision;
+
+		$affected = $wpdb->query( $wpdb->prepare( $sql, $values ) ); // phpcs:ignore WordPress.DB
+
+		if ( 1 !== $affected ) {
+			throw new StaleRevision(
+				sprintf( 'Mapping %d changed underneath revision %d.', $m->id, $m->revision )
+			);
+		}
+
+		$saved = $this->by_id( $m->id );
+
+		if ( null === $saved ) {
+			throw new \RuntimeException( 'The updated mapping could not be read back.' );
+		}
+
+		return $saved;
+	}
+
+	private function assert_valid( Mapping $m ): void {
+		if ( null === $m->alias_of && null === $m->post_id ) {
+			throw new InvalidMapping( 'A canonical mapping must carry a post_id.' );
+		}
+
+		if ( null !== $m->alias_of && null !== $m->post_id ) {
+			throw new InvalidMapping( 'An alias mapping must not carry a post_id.' );
+		}
+
+		if ( null !== $m->alias_of ) {
+			$parent = $this->by_id( $m->alias_of );
+
+			if ( null === $parent ) {
+				throw new InvalidMapping( 'An alias must point at an existing mapping.' );
+			}
+
+			if ( $parent->is_alias() ) {
+				throw new InvalidMapping( 'Aliases may not chain.' );
+			}
+		}
+
+		// Every lease column moves together, including the durable binding to the
+		// driver and provider environment the mutation began against (spec §12.6).
+		$lease = array(
+			null !== $m->ssl_mutation_token,
+			null !== $m->ssl_mutation_kind,
+			null !== $m->ssl_mutation_phase,
+			null !== $m->ssl_mutation_expires_at,
+			null !== $m->ssl_mutation_driver,
+			null !== $m->ssl_mutation_environment,
+		);
+
+		if ( count( array_unique( $lease ) ) > 1 ) {
+			throw new InvalidMapping( 'The six lease columns move together.' );
+		}
+
+		// The durable resource binding is one fact in five columns: which driver,
+		// which environment, which reference, and on whose authority. A row that
+		// keeps ssl_provider without the rest is the shape that lets an ordinary
+		// read fall back to current configuration and ask the wrong account about
+		// somebody else's certificate (spec §12.6).
+		$bound = array(
+			null !== $m->ssl_provider,
+			null !== $m->ssl_provider_environment,
+			null !== $m->ssl_ref,
+			null !== $m->ssl_ownership_origin,
+			null !== $m->ssl_owner_installation_id,
+		);
+
+		if ( count( array_unique( $bound ) ) > 1 ) {
+			throw new InvalidMapping(
+				'The durable provider binding moves as one: provider, provider environment, ref, ownership origin, and owner installation.'
+			);
+		}
+
+		// Spec §12.2: adopted => ssl_adopted_at IS NOT NULL; created => it is NULL.
+		if ( OwnershipOrigin::ADOPTED === $m->ssl_ownership_origin && null === $m->ssl_adopted_at ) {
+			throw new InvalidMapping( 'An adopted binding records when it was adopted.' );
+		}
+
+		if ( OwnershipOrigin::CREATED === $m->ssl_ownership_origin && null !== $m->ssl_adopted_at ) {
+			throw new InvalidMapping( 'A created binding was never adopted.' );
+		}
+	}
+
+	private function assert_transitions( Mapping $from, Mapping $to ): void {
+		if ( ! $from->verification_state->can_transition_to( $to->verification_state ) ) {
+			throw new InvalidMapping(
+				sprintf(
+					'Illegal verification transition %s -> %s.',
+					$from->verification_state->value,
+					$to->verification_state->value
+				)
+			);
+		}
+
+		if ( ! $from->ssl_state->can_transition_to( $to->ssl_state ) ) {
+			throw new InvalidMapping(
+				sprintf( 'Illegal SSL transition %s -> %s.', $from->ssl_state->value, $to->ssl_state->value )
+			);
+		}
 	}
 
 	public function delete( int $id ): void {
-		throw new \RuntimeException( 'delete() lands in Task 6.' );
+		global $wpdb;
+
+		foreach ( $this->all() as $mapping ) {
+			if ( $mapping->alias_of === $id ) {
+				throw new AliasInUse(
+					sprintf( 'Mapping %d still has aliases pointing at it.', $id )
+				);
+			}
+		}
+
+		$wpdb->delete( Schema::domains_table(), array( 'id' => $id ), array( '%d' ) ); // phpcs:ignore WordPress.DB
 	}
 }
