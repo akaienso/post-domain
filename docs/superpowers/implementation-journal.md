@@ -385,7 +385,8 @@ anywhere else, and the hook is half of what is under test.
   confirms removal, because `DeletionService::process()` is the durable
   mapping-deletion workflow of spec §14.15 step 3 and is the only service
   available. That is what the plan prescribes, but the route name promises
-  something narrower.
+  something narrower. *(Superseded — fixed in the 2026-08-28 correction pass,
+  finding 4.)*
 - **Not covered by any Plan 10 task**, and therefore absent: collection
   pagination and filters, `title` and `favicon_attachment_id`,
   `DELETE ?force=true`, and several §15.1 resource members (`verification`
@@ -417,3 +418,161 @@ the installation id, and whether `DELETE /domains/{id}/ssl` should delete the
 whole mapping row.
 
 IMPLEMENTATION SESSION COMPLETE
+
+---
+
+## 2026-08-28 — correction pass, six verified findings
+
+Six defects found in review of `60233fd`, all confirmed against the code before
+being fixed.
+
+### 1. Durable mapping deletion never executed
+
+`DELETE /domains/{id}` set `deletion_requested_at`, forced `activation_state =
+inactive`, set `ssl_state = pending_removal` and `deletion_next_attempt_at =
+now` — and nothing ever picked those rows up. `Plugin::sweep_ssl()` ran
+`LeaseRecovery` and `Reconciler` and neither selects a pending-removal row. A
+provider-backed mapping sat in `pending_removal` forever with its next-attempt
+time permanently due.
+
+`Ssl\DeletionSchedule` is the production selector: `pending_removal`, due, and
+`ssl_mutation_token IS NULL`, so every leased row is skipped whatever its phase
+or expiry. `Ssl\CronWiring` registers it on `pd_ssl_sweep` at priority 20, so
+recovery at the default 10 still runs first — a fenced mutation's row is not yet
+a fact anything should act on. It calls `Verification\Schedule::run_sweep()`
+unmodified for the batch, the budget and the bounded continuation, and each row
+goes through the unchanged authorizer → gate → permit → finalize CAS.
+
+The retry schedule was wrong in the same place: every non-`FAILED` outcome took
+`LeaseOutcome::checked()`, which leaves `deletion_next_attempt_at` untouched and
+therefore permanently due — a hot loop. `RemovalWorkflow::retry_schedule()` now
+gives `PENDING` a future time with no counter increment, `TRANSIENT` no
+increment and the driver's `retry_after` when supplied (clamped) or bounded
+backoff otherwise, and `FAILED` an increment plus bounded backoff. No branch can
+leave the column at or before now.
+
+`Ssl\DeletionSweepTest` fires the real hook: 8 tests, 48 assertions, including a
+data provider asserting the *stored* next-attempt time and attempt count for all
+four outcomes, and a two-sweep test proving no hot loop.
+
+### 2. A stale DNS result could overwrite a concurrent edit
+
+`Verifier::take_lease()` incremented the revision, but the result CAS bound only
+`id`, `verify_lease_token` and `challenge`. An edit landing between acquisition
+and application that did not rotate the challenge was silently overwritten by
+the older DNS result.
+
+`Verification\VerificationLease` now carries the token and the exact leased
+revision, and the result CAS binds all four. The revision is computed as
+`$mapping->revision + 1` rather than re-read — the winning CAS matched
+`revision = $mapping->revision` and incremented it, so that is the value the row
+holds, whereas a re-read would return the interloper's revision and hand the CAS
+the very number that defeats it. `AtomicTransition` already ran the event
+callback only after a true transition on both paths; that is now asserted rather
+than assumed. Covered by a revision-only race test: state unchanged,
+`last_outcome` still NULL, no event.
+
+### 3. One DoH endpoint could produce a hard outcome
+
+`DohResolver`'s docblock promised that a hard outcome requires two independent
+endpoints to agree, but `txt()` only checked unanimity. With one endpoint, one
+answer was trivially unanimous. Duplicate strings passed as two independent
+resolvers, and a non-HTTPS endpoint merely cast a TRANSIENT vote instead of
+disqualifying the run.
+
+Qualification and deduplication now happen before any request is made. Fewer
+than two distinct usable HTTPS endpoints returns TRANSIENT without contacting
+anything. "Trivially equivalent" is documented and bounded: surrounding
+whitespace, scheme and host case, an explicit `:443`, a trailing slash. A
+non-default port or a query string still distinguishes two endpoints, and
+userinfo is rejected rather than stripped. `ResolverFactory` passes a filtered
+list through as given and deliberately does not top it back up from the
+defaults — restoring a second endpoint would both ignore the filter and
+manufacture the corroboration the operator removed.
+
+13 unit cases plus 5 integration cases covering the factory, none reaching a
+network.
+
+### 4. `DELETE /domains/{id}/ssl` deleted the whole mapping
+
+The SSL-specific route called `DeletionService::process()`, which on a confirmed
+removal hard-deletes the row (§14.15 step 3) — destroying the host, the post
+binding, verification state and aliases.
+
+The two operations are now separate services sharing one `RemovalWorkflow`, so
+the authorization, lease and gate machinery is identical and neither is a
+shortcut. `DELETE /domains/{id}` still performs whole-mapping deletion.
+`SslResourceRemoval` retains the row and, in the same single finalize CAS, nulls
+all five binding columns together with the adoption fields, the error and
+provider state, resets the deletion counters, and sets `ssl_state = revoked`.
+`PENDING`, `TRANSIENT` and `FAILED` clear nothing — the binding survives until
+the provider confirms.
+
+Proved by a REST test asserting the mapping's host, post, verification state,
+activation state, challenge and alias are all unchanged with the five columns
+null, and by tests that `PENDING`/`TRANSIENT` retain the binding.
+
+### 5. Cron never recurred, and `pd_maintenance` had no listener
+
+`Schedule::HOOKS` declared 900/3600/900/86400, and `register_cron()` ignored
+every one of them: `wp_schedule_single_event( time() + 60, $hook )`. Each hook
+fired once, about a minute after `init`, and then never again.
+
+`register_cron()` now uses WordPress recurring events with plugin-owned custom
+schedules registered through `cron_schedules`. Recurring rather than
+self-rescheduling on purpose: WP-Cron re-arms a recurring event *before* running
+the callback, so the hook survives a callback that fatals, whereas a
+self-rescheduling handler stops forever the first time it dies. An event already
+at the right cadence is left alone; one at a wrong cadence — including the single
+events the old code left on installed sites — is cleared and replaced.
+`run_sweep()`'s bounded continuation is untouched.
+
+`Verification\Maintenance` implements the four §13.6 duties. Pruning is the only
+deletion and it touches the event log only, which is never a decision input. The
+orphan-alias and dangling-target scans are diagnostics: they record events with
+`auto_repaired => false` and delete nothing. `Reconciler::run()` is called, not
+modified. Both scans are bounded by `pd_maintenance_scan_limit`.
+
+Deactivation cleanup was checked and deliberately not added: §18 specifies cron
+cleanup at *uninstall*, `uninstall.php` already clears all four hooks with a list
+matching `Schedule::HOOKS`, and the specification gives deactivation no cleanup
+behaviour anywhere.
+
+### 6. `pd_rebase_url` results bypassed the strict validator
+
+`UrlPolicy::validated()` was a weaker duplicate of `AbsoluteUrl::validated()`,
+checking only the scheme family and the host. A filter could hand back an http
+downgrade, userinfo, control characters, or an arbitrary port, and the plugin
+emitted it into a page. It now goes through the same strict validator the
+canonical filter uses, with HTTPS required unconditionally because a mapped host
+is only ever addressed over HTTPS (§11.8), and rejects any port the contract
+would not itself produce. Anything refused falls back to the original URL.
+Seven cases, one per rejection reason plus an accepted one.
+
+### The reported suite flakiness was the harness, not the code
+
+Both tracks reported the full integration suite giving different error counts on
+identical runs. It reproduced only while two agents were running PHPUnit
+concurrently against the single shared `pd-mysql` container. Run serially with
+nothing else touching the database, the suite gave **OK (731 tests, 1647
+assertions) four consecutive times**. No production or test change was needed.
+Worth knowing for CI: this suite must not run two processes against one database.
+
+### Verification — every command executed, every result observed
+
+- `composer lint` — exit 0
+- `composer analyse` — `[OK] No errors`, PHPStan level 8
+- `composer test` — OK, 329 tests, 591 assertions
+- `composer test:integration` — OK, 731 tests, 1647 assertions, four identical consecutive runs
+- `composer lint:plans` — exit 0
+- `composer generate:status-map` then `git diff --exit-code` — byte-identical
+- `git diff --check` — clean
+- Focused across all six findings — OK, 72 tests, 255 assertions, plus 13 unit cases for the DoH quorum
+
+Invariants re-checked and intact: one `DriverFactory::for_mapping()` caller, no
+mutating driver call outside `MutationGate`, no secrets, no attribution.
+
+`GET /environment`'s installation-id omission is unchanged, and
+`CteSubtreeAdapter` remains disabled and unwired, both as instructed.
+
+No unresolved blocker.

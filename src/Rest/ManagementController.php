@@ -558,7 +558,12 @@ final class ManagementController {
 
 		// Deletion reports its own vocabulary because a removal can legitimately
 		// remain pending at the provider for a long time.
-		$outcome = $this->ssl->delete->process( $mapping );
+		//
+		// The SSL-resource removal, not the mapping deletion: this route removes
+		// a certificate, and the mapping — host, post binding, verification
+		// state, aliases — outlives it. DELETE /domains/{id} is the only normal
+		// route that deletes a mapping row (spec 14.15).
+		$outcome = $this->ssl->remove_resource->process( $mapping );
 
 		if ( 'fenced' === $outcome ) {
 			return self::error(
@@ -585,12 +590,18 @@ final class ManagementController {
 
 		$after = $this->repo->by_id( $mapping->id );
 
-		return null === $after
-			? new \WP_REST_Response( null, 204 )
-			: new \WP_REST_Response(
-				MappingSerializer::resource( $after ) + array( 'removal' => $outcome ),
-				202
-			);
+		if ( null === $after ) {
+			// Nothing here deletes the row, so its absence means someone else
+			// did — and this response cannot describe a mapping that is gone.
+			return new \WP_REST_Response( null, 204 );
+		}
+
+		// A confirmed removal is complete: the resource is gone and the mapping
+		// remains, unbound. Anything else is still outstanding at the provider.
+		return new \WP_REST_Response(
+			MappingSerializer::resource( $after ) + array( 'removal' => $outcome ),
+			'removed' === $outcome ? 200 : 202
+		);
 	}
 
 	/**

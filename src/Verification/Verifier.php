@@ -49,9 +49,9 @@ final class Verifier {
 			return DnsOutcome::TRANSIENT;
 		}
 
-		$token = $this->take_lease( $mapping );
+		$lease = $this->take_lease( $mapping );
 
-		if ( null === $token ) {
+		if ( null === $lease ) {
 			return DnsOutcome::TRANSIENT;
 		}
 
@@ -69,12 +69,12 @@ final class Verifier {
 			false
 		);
 
-		$this->apply_under_cas( $mapping, $token, $result, $after, $limit );
+		$this->apply_under_cas( $mapping, $lease, $result, $after, $limit );
 
 		return $result->outcome;
 	}
 
-	private function take_lease( Mapping $mapping ): ?string {
+	private function take_lease( Mapping $mapping ): ?VerificationLease {
 		global $wpdb;
 
 		$token   = bin2hex( random_bytes( 16 ) );
@@ -98,7 +98,12 @@ final class Verifier {
 		);
 		// phpcs:enable WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 
-		return 1 === $affected ? $token : null;
+		// The CAS matched `revision = $mapping->revision` and set
+		// `revision = revision + 1`, so the row now holds exactly this value. It is
+		// computed rather than re-read on purpose: a SELECT here would pick up a
+		// concurrent writer's revision and hand the result CAS the very number that
+		// would let a stale result overwrite that writer's edit.
+		return 1 === $affected ? new VerificationLease( $token, $mapping->revision + 1 ) : null;
 	}
 
 	/**
@@ -106,7 +111,7 @@ final class Verifier {
 	 */
 	private function apply_under_cas(
 		Mapping $mapping,
-		string $token,
+		VerificationLease $lease,
 		DnsResult $result,
 		array $after,
 		int $limit
@@ -136,7 +141,7 @@ final class Verifier {
 		               verify_lease_expires_at = NULL,
 		               revision = revision + 1,
 		               updated_at = %s
-		         WHERE id = %d AND verify_lease_token = %s AND challenge = %s";
+		         WHERE id = %d AND revision = %d AND verify_lease_token = %s AND challenge = %s";
 
 		$resolved = $this->resolved_state( $mapping, $result, $limit )->value;
 
@@ -161,7 +166,8 @@ final class Verifier {
 					$this->resolver::class,
 					$now,
 					$mapping->id,
-					$token,
+					$lease->revision,
+					$lease->token,
 					$mapping->challenge
 				)
 			),
@@ -175,7 +181,7 @@ final class Verifier {
 				array(
 					'outcome'        => $result->outcome->value,
 					'resolver_class' => $this->resolver::class,
-					'attempt_id'     => $token,
+					'attempt_id'     => $lease->token,
 				)
 			)
 		);

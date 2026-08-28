@@ -158,6 +158,62 @@ final class VerifierTest extends OwnedSessionTestCase {
 		);
 	}
 
+	public function test_a_result_is_discarded_when_only_the_revision_moved(): void {
+		$mapping = $this->seed( VerificationState::PENDING );
+
+		// The challenge is untouched and the lease token is untouched: the only
+		// thing that changes is the revision. Binding the challenge and the token
+		// alone would let this stale MATCH overwrite the concurrent writer's edit.
+		$racing = new class( $mapping ) implements DnsResolver {
+			public function __construct( private readonly Mapping $mapping ) {}
+
+			public function txt( string $name, string $expected ): DnsResult {
+				global $wpdb;
+
+				$table = Schema::domains_table();
+				// phpcs:disable WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- $table is Schema::domains_table(), never caller input.
+				$wpdb->query( // phpcs:ignore WordPress.DB
+					$wpdb->prepare(
+						"UPDATE {$table} SET revision = revision + 1 WHERE id = %d",
+						$this->mapping->id
+					)
+				);
+				// phpcs:enable WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+
+				return new DnsResult( DnsOutcome::MATCH );
+			}
+		};
+
+		( new Verifier( $this->repo, $racing, new SystemClock() ) )->verify( $mapping );
+
+		$after = $this->repo->by_id( $mapping->id );
+
+		$this->assertSame(
+			VerificationState::PENDING,
+			$after?->verification_state,
+			'a revision bump alone must lose the CAS'
+		);
+		global $wpdb;
+		$table = Schema::domains_table();
+		// phpcs:disable WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- $table is Schema::domains_table(), never caller input.
+		$last = $wpdb->get_var( // phpcs:ignore WordPress.DB
+			$wpdb->prepare( "SELECT last_outcome FROM {$table} WHERE id = %d", $mapping->id )
+		);
+		// phpcs:enable WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+
+		$this->assertNull( $last, 'the discarded result left no trace on the row' );
+		$this->assertSame(
+			array(),
+			array_values(
+				array_filter(
+					EventLog::for_domain( $mapping->id ),
+					static fn( array $event ): bool => 'verification' === $event['type']
+				)
+			),
+			'a zero-row CAS writes no event'
+		);
+	}
+
 	public function test_a_corrupt_challenge_label_sets_the_integrity_error(): void {
 		$mapping = $this->seed( VerificationState::PENDING );
 

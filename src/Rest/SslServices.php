@@ -18,6 +18,7 @@ use PostDomain\Ssl\MethodChangeAuthorizer;
 use PostDomain\Ssl\MethodChangeService;
 use PostDomain\Ssl\MutationGate;
 use PostDomain\Ssl\MutationLease;
+use PostDomain\Ssl\SslResourceRemoval;
 use PostDomain\Support\SystemClock;
 use PostDomain\Verification\FreshProof;
 use PostDomain\Verification\ResolverFactory;
@@ -32,7 +33,8 @@ final class SslServices {
 		public readonly CreateService $create,
 		public readonly AdoptionService $adopt,
 		public readonly MethodChangeService $method,
-		public readonly DeletionService $delete
+		public readonly DeletionService $delete,
+		public readonly SslResourceRemoval $remove_resource
 	) {}
 
 	public static function production(): self {
@@ -50,7 +52,11 @@ final class SslServices {
 			new MethodChangeService( $repo, new MethodChangeAuthorizer( $repo, $proof, $lease, $clock ), $lease, $gate ),
 			// DeletionService owns the clock instead of a repository: its writes are
 			// CAS statements it issues itself, not repository saves.
-			new DeletionService( new DeletionAuthorizer( $repo, $proof, $lease, $clock ), $lease, $gate, $clock )
+			new DeletionService( new DeletionAuthorizer( $repo, $proof, $lease, $clock ), $lease, $gate, $clock ),
+			// Removing the certificate is not deleting the domain. It shares every
+			// piece of the removal machinery and differs only in what a confirmed
+			// removal means for the row (spec 14.15).
+			new SslResourceRemoval( new DeletionAuthorizer( $repo, $proof, $lease, $clock ), $lease, $gate, $clock )
 		);
 	}
 

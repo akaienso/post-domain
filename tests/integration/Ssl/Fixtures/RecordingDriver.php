@@ -50,7 +50,8 @@ final class RecordingDriver implements SslDriver {
 		private readonly bool $identity_complete = true,
 		private readonly RemovalOutcome $removal = RemovalOutcome::REMOVED,
 		private readonly ?string $confirmed_method = 'txt',
-		private readonly string $environment = 'recording:default'
+		private readonly string $environment = 'recording:default',
+		private readonly ?int $removal_retry_after = null
 	) {}
 
 	/** Same driver id, different provider account or zone. */
@@ -65,7 +66,8 @@ final class RecordingDriver implements SslDriver {
 			$this->identity_complete,
 			$this->removal,
 			$this->confirmed_method,
-			$environment
+			$environment,
+			$this->removal_retry_after
 		);
 	}
 
@@ -107,6 +109,23 @@ final class RecordingDriver implements SslDriver {
 
 	public static function removing( RemovalOutcome $outcome ): self {
 		return new self( 'ref-1', false, IdentityVerdict::MATCH, 'ref-1', null, MarkerSupport::UNAVAILABLE, true, $outcome );
+	}
+
+	/** A driver that tells the caller when the provider will answer again. */
+	public static function removing_with_retry_after( RemovalOutcome $outcome, int $seconds ): self {
+		return new self(
+			'ref-1',
+			false,
+			IdentityVerdict::MATCH,
+			'ref-1',
+			null,
+			MarkerSupport::UNAVAILABLE,
+			true,
+			$outcome,
+			'txt',
+			'recording:default',
+			$seconds
+		);
 	}
 
 	public static function confirming_method( string $method ): self {
@@ -198,7 +217,7 @@ final class RecordingDriver implements SslDriver {
 		++$this->remove_calls;
 		$this->observe_phase( $ctx );
 
-		return new RemovalResult( $this->removal );
+		return new RemovalResult( $this->removal, null, null, $this->removal_retry_after );
 	}
 
 	/** @param SslResourceContext[] $contexts */

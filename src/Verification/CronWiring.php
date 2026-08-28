@@ -18,9 +18,16 @@ use PostDomain\Support\SystemClock;
 final class CronWiring {
 
 	public static function register(): void {
+		// The custom intervals have to exist on every request, not only on the one
+		// that schedules the events: WP-Cron re-arms a recurring event by looking
+		// its recurrence up in the filtered list, and an unknown recurrence there
+		// silently ends the series.
+		add_filter( 'cron_schedules', array( Schedule::class, 'register_schedules' ) ); // phpcs:ignore WordPress.WP.CronInterval.ChangeDetected
+
 		add_action( 'init', array( self::class, 'register_cron' ), 100 );
 		add_action( 'pd_verify_pending', array( self::class, 'sweep_pending' ) );
 		add_action( 'pd_verify_established', array( self::class, 'sweep_established' ) );
+		add_action( 'pd_maintenance', array( self::class, 'maintenance' ) );
 		add_action( 'pd_verify_now', array( self::class, 'verify_one' ) );
 	}
 
@@ -34,6 +41,14 @@ final class CronWiring {
 
 	public static function sweep_established(): void {
 		self::sweep( Schedule::due_established( 50 ), 'pd_verify_established' );
+	}
+
+	/**
+	 * The daily bounded duties (spec §13.6). Diagnostics record findings; only
+	 * the event log is ever deleted from.
+	 */
+	public static function maintenance(): void {
+		Maintenance::run();
 	}
 
 	/**

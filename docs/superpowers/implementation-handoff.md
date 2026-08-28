@@ -272,11 +272,11 @@ c3c7883 Avoid reserved keywords in parameter names
   the response; Plan 10 withholds it and has a test asserting it stays out. The
   plan's behaviour was implemented, because keeping an identifier out of a
   response is the reversible choice. **This needs a decision.**
-- **`DELETE /domains/{id}/ssl` deletes the whole mapping row** when the driver
-  confirms removal, because `DeletionService::process()` is the durable
-  mapping-deletion workflow of spec §14.15 step 3 and is the only service
-  available. The route name promises something narrower. **This needs a
-  decision.**
+- ~~`DELETE /domains/{id}/ssl` deletes the whole mapping row.~~ **Resolved in the
+  correction pass.** The two operations are now separate services sharing one
+  `RemovalWorkflow`: `DELETE /domains/{id}` still performs whole-mapping deletion
+  through §14.15, and `DELETE /domains/{id}/ssl` removes only the provider
+  resource, retaining the row and clearing the five binding columns together.
 - **Absent because no plan task covers them**: collection pagination and filters,
   `title` and `favicon_attachment_id`, `DELETE ?force=true`, and several §15.1
   resource members (`verification` detail, `deletion`, `branding`,
@@ -319,5 +319,42 @@ deviation from a plan example is numbered there with its reasoning, and the two
 decisions listed under *Deferred and blocked* are the only places where the
 implementation deliberately stopped short of choosing.
 
+
+---
+
+## Correction pass — 2026-08-28
+
+Six verified defects fixed on the same branch. Full reasoning per finding is in
+`docs/superpowers/implementation-journal.md`.
+
+| # | Defect | Fix |
+|---|---|---|
+| 1 | `DELETE /domains/{id}` marked a row `pending_removal` and nothing ever processed it; every retry outcome left the next-attempt time permanently due | `Ssl\DeletionSchedule` selects due, unleased pending-removal rows; `Ssl\CronWiring` runs them on `pd_ssl_sweep` after recovery; `RemovalWorkflow::retry_schedule()` gives every outcome a future time |
+| 2 | The verification result CAS omitted the leased revision, so a stale DNS result could overwrite a concurrent edit | `VerificationLease` carries the exact leased revision; the CAS binds id, revision, token and challenge |
+| 3 | A single DoH endpoint, or a duplicated one, could produce a hard outcome | Endpoints are qualified and deduplicated before any request; fewer than two distinct HTTPS endpoints returns TRANSIENT |
+| 4 | `DELETE /domains/{id}/ssl` hard-deleted the whole mapping | `SslResourceRemoval` shares `RemovalWorkflow` with `DeletionService` but retains the row and clears the five binding columns together |
+| 5 | Cron scheduled every hook once at `time() + 60`, ignoring its declared interval; `pd_maintenance` had no listener | Recurring events on plugin-owned schedules, replacing stale cadences; `Verification\Maintenance` implements the four §13.6 duties, diagnostics only |
+| 6 | `pd_rebase_url` results bypassed the strict URL validator | Routed through `AbsoluteUrl::validated()` with HTTPS required and any non-443 port refused |
+
+### Verification, every command executed and observed
+
+| Command | Result |
+|---|---|
+| `composer lint` | exit 0 |
+| `composer analyse` | `[OK] No errors`, level 8 |
+| `composer test` | OK — 329 tests, 591 assertions |
+| `composer test:integration` | OK — 731 tests, 1647 assertions, four identical consecutive runs |
+| `composer lint:plans` | exit 0 |
+| `composer generate:status-map` + `git diff --exit-code` | byte-identical |
+| `git diff --check` | clean |
+| Focused, all six findings | OK — 72 integration tests, 255 assertions, plus 13 DoH unit cases |
+
+### A note for CI
+
+The integration suite must not be run as two concurrent processes against one
+database. Doing so produces deadlocks and connection errors that look like test
+flakiness; run serially it is deterministic.
+
+No unresolved blocker.
 
 IMPLEMENTATION SESSION COMPLETE

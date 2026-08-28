@@ -17,12 +17,16 @@ use PostDomain\Verification\FreshProof;
 
 final class DeletionService {
 
+	private readonly RemovalWorkflow $workflow;
+
 	public function __construct(
-		private readonly DeletionAuthorizer $authorizer,
+		DeletionAuthorizer $authorizer,
 		private readonly MutationLease $lease,
-		private readonly MutationGate $gate,
+		MutationGate $gate,
 		private readonly Clock $clock
-	) {}
+	) {
+		$this->workflow = new RemovalWorkflow( $authorizer, $lease, $gate, $clock );
+	}
 
 	public static function for_tests( SslDriver $driver, FreshProof $proof ): self {
 		$clock = new SystemClock();
@@ -86,23 +90,11 @@ final class DeletionService {
 	}
 
 	public function process( Mapping $mapping ): string {
-		$authorized = $this->authorizer->authorize( $mapping );
-
-		if ( $authorized instanceof MutationRefusal ) {
-			if ( ! $authorized->transient ) {
-				$this->bump_attempts( $mapping );
-			}
-
-			return 'refused';
-		}
-
-		$gated = $this->gate->execute( $authorized['driver'], $authorized['context'], $authorized['auth'] );
+		$gated = $this->workflow->attempt( $mapping );
 
 		if ( $gated instanceof MutationRefusal ) {
 			return 'refused';
 		}
-
-		do_action( 'pd_test_after_provider_call' );
 
 		/** @var RemovalResult $result */
 		$result = $gated->result;
@@ -148,28 +140,20 @@ final class DeletionService {
 			return 'deferred';
 		}
 
-		$outcome = RemovalOutcome::FAILED === $result->outcome
-			? LeaseOutcome::attempted(
-				$this->attempts( $mapping ) + 1,
-				TimingPolicy::attempt_backoff( $this->attempts( $mapping ) )
-			)
-			: LeaseOutcome::checked();
-
-		$applied = AtomicTransition::commit(
-			fn (): bool => $this->lease->finalize( $gated->owner, $outcome ),
-			fn (): bool => EventLog::record(
-				$mapping->id,
-				$mapping->host,
-				'ssl',
-				$mapping->ssl_state->value,
-				'removal_' . $result->outcome->value,
-				'cron',
-				array( 'cleanup' => $result->outcome->value )
-			)
+		// Every unconfirmed outcome must leave a FUTURE next-attempt time. The
+		// row is selected by `deletion_next_attempt_at <= now`, so an outcome
+		// that left the column alone would keep the row permanently due and the
+		// sweep would re-issue the same provider call on every run.
+		$applied = $this->workflow->finalize(
+			$mapping,
+			$gated,
+			$this->workflow->retry_schedule( $mapping, $result ),
+			'removal_' . $result->outcome->value,
+			$result->outcome->value
 		);
 
-		if ( ! $applied->committed() ) {
-			return $applied->cas_lost() ? 'fenced' : 'deferred';
+		if ( 'committed' !== $applied ) {
+			return $applied;
 		}
 
 		return $result->outcome->value;
@@ -216,39 +200,5 @@ final class DeletionService {
 		}
 
 		return $deleted->committed();
-	}
-
-	private function attempts( Mapping $mapping ): int {
-		global $wpdb;
-
-		$table = Schema::domains_table();
-
-		// phpcs:disable WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- $table is Schema::domains_table(), never caller input.
-		return (int) $wpdb->get_var(
-			$wpdb->prepare( "SELECT deletion_attempts FROM {$table} WHERE id = %d", $mapping->id )
-		);
-		// phpcs:enable WordPress.DB.PreparedSQL.InterpolatedNotPrepared
-	}
-
-	/** @return bool True only when exactly one row was counted. */
-	private function bump_attempts( Mapping $mapping ): bool {
-		global $wpdb;
-
-		$table = Schema::domains_table();
-
-		// Unleased and at the revision we read: a refusal that races a real
-		// mutation must not inflate that mutation's attempt counter.
-		// phpcs:disable WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- $table is Schema::domains_table().
-		return 1 === $wpdb->query(
-			$wpdb->prepare(
-				"UPDATE {$table}
-				    SET deletion_attempts = deletion_attempts + 1, revision = revision + 1, updated_at = %s
-				  WHERE id = %d AND revision = %d AND ssl_mutation_token IS NULL",
-				$this->clock->mysql(),
-				$mapping->id,
-				$mapping->revision
-			)
-		);
-		// phpcs:enable WordPress.DB.PreparedSQL.InterpolatedNotPrepared
 	}
 }

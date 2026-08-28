@@ -103,6 +103,7 @@ final class Plugin {
 		// Subsystem hook topologies register themselves. Each is one line here
 		// rather than a subsystem absorbed into this class.
 		\PostDomain\Verification\CronWiring::register();
+		\PostDomain\Ssl\CronWiring::register();
 		\PostDomain\Admin\Wiring::register();
 	}
 
