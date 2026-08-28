@@ -72,8 +72,8 @@ final class TimingPolicy {
 	}
 
 	/** @param mixed $value */
-	private static function clamp( $value, int $default ): int {
-		$seconds = is_numeric( $value ) ? (int) $value : $default;
+	private static function clamp( $value, int $fallback ): int {
+		$seconds = is_numeric( $value ) ? (int) $value : $fallback;
 
 		// Raised to the minimum rather than rejected: a short lease is a
 		// misconfiguration, not a reason to stop working. The minimum is

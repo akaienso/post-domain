@@ -25,7 +25,8 @@ final class ExecutionPermit {
 		string $lease_token,
 		\DateTimeImmutable $expires_at
 	): self {
-		$frame  = debug_backtrace( DEBUG_BACKTRACE_IGNORE_ARGS, 2 )[1] ?? array();
+		// Not debug output: this is the check that keeps a permit unforgeable.
+		$frame  = debug_backtrace( DEBUG_BACKTRACE_IGNORE_ARGS, 2 )[1] ?? array(); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_debug_backtrace
 		$caller = $frame['class'] ?? '';
 
 		if ( MutationGate::class !== $caller ) {
