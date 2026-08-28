@@ -174,3 +174,20 @@ credentials were used or requested; nothing was sent to Cloudflare.
 | 09 | 2 | completed | (next commit) | `src/Ssl/CloudflareStatusMap.php` | `--filter CloudflareStatusMapTest` OK | unit OK | — | — |
 | 09 | 3 | completed | (next commit) | `src/Support/PublicSuffix.php`, `src/Ssl/ApexRouting.php`, `src/Ssl/ApexCapability.php`, `references/public_suffix_list.dat` (committed, 16,424 lines) | `--filter ApexCapabilityTest` → 22 OK with the status-map tests | unit OK | — | Apex is decided against the registrable domain via the committed PSL, never a label count — `example.co.uk` proves it. |
 | 11 | 4 | completed | (next commit) | `README.md` (24 sections, spec §19), `tests/unit/ReadmeTest.php` | `--filter ReadmeTest` → **28 OK, 28 assertions** | unit OK | — | Written ahead of Plan 11's other tasks because it depends on the specification, not on code. |
+
+## Parallel tracks
+
+Plans 01, 02, 09 (Tasks 1–3) and 11 (Task 4) were implemented in the primary
+session. Plans 03–05 and Plans 06–07 were dispatched to two subagents working
+concurrently on the same branch, with disjoint file ownership:
+
+- **Track A** — Plans 03, 04, 05. Owns `src/Plugin.php`, `src/Routing/*`,
+  `src/Url/*`, `src/Http/*`.
+- **Track B** — Plans 06, 07. Owns `src/Verification/*`, `src/Ssl/*` (except the
+  Plan 09 files above). Forbidden from touching `src/Plugin.php`; its cron wiring
+  goes into `CronWiring` classes that the primary session hooks into
+  `Plugin::boot()` during integration.
+
+Both were told the harness facts already discovered (temporary tables,
+`autocommit = 0` and `OwnedSessionTestCase`, the `wpdb::prepare()` null cast) so
+they would not rediscover them.
