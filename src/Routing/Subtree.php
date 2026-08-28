@@ -48,8 +48,24 @@ final class Subtree implements RoutingContract {
 				}
 			}
 
-			if ( 1 !== count( $candidates ) ) {
-				// Zero is a miss; more than one is ambiguous, and ambiguous is a miss.
+			if ( count( $candidates ) > 1 ) {
+				AmbiguousPath::record(
+					$context->mapping->id,
+					$segment,
+					array_map( static fn( \WP_Post $p ): int => $p->ID, $candidates )
+				);
+
+				/** @var \WP_Post|null $winner */
+				$winner = apply_filters( 'pd_resolve_ambiguity', null, $context->mapping, $candidates, $segment );
+
+				if ( ! $winner instanceof \WP_Post ) {
+					return null;
+				}
+
+				$candidates = array( $winner );
+			}
+
+			if ( array() === $candidates ) {
 				return null;
 			}
 
@@ -83,6 +99,10 @@ final class Subtree implements RoutingContract {
 		for ( $i = 0; $i < $context->max_depth; $i++ ) {
 			if ( ! in_array( $current->post_type, $context->subtree_post_types, true )
 				|| ! in_array( $current->post_status, $context->post_statuses, true ) ) {
+				return null;
+			}
+
+			if ( $this->has_colliding_sibling( $context, $current ) ) {
 				return null;
 			}
 
@@ -145,6 +165,25 @@ final class Subtree implements RoutingContract {
 				'suppress_filters' => false,
 			)
 		);
+	}
+
+	private function has_colliding_sibling( ServingContext $context, \WP_Post $post ): bool {
+		$parent = 0 === (int) $post->post_parent ? null : get_post( (int) $post->post_parent );
+
+		if ( null === $parent ) {
+			return false;
+		}
+
+		$segment = $this->segment_for( $context, $post );
+		$matches = 0;
+
+		foreach ( $this->children_of( $context, $parent ) as $sibling ) {
+			if ( $this->segment_for( $context, $sibling ) === $segment ) {
+				++$matches;
+			}
+		}
+
+		return $matches > 1;
 	}
 
 	private function segment_for( ServingContext $context, \WP_Post $post ): string {
