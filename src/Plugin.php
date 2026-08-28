@@ -20,6 +20,7 @@ use PostDomain\Routing\MembershipFilter;
 use PostDomain\Routing\PathDecomposer;
 use PostDomain\Routing\PathNormalizer;
 use PostDomain\Routing\Resolver;
+use PostDomain\Routing\RoundTripVerifier;
 use PostDomain\Routing\ServingEligibility;
 use PostDomain\Routing\Subtree;
 use PostDomain\Routing\UnknownHostGuard;
@@ -30,6 +31,8 @@ use PostDomain\Support\IdnaNormalizer;
 use PostDomain\Support\InfrastructureAllowlist;
 use PostDomain\Support\Schema;
 use PostDomain\Support\TrustedProxy;
+use PostDomain\Url\Adapters\CoreLinks;
+use PostDomain\Url\UrlPolicy;
 
 final class Plugin {
 
@@ -72,6 +75,7 @@ final class Plugin {
 		add_action( 'plugins_loaded', array( $plugin, 'freeze_eligibility' ), 11 );
 		add_action( 'init', array( $plugin, 'freeze_content_policy' ), 99 );
 		add_action( 'parse_request', array( $plugin, 'enforce_disposition' ), 0 );
+		add_action( 'plugins_loaded', array( $plugin, 'register_url_adapters' ), 10 );
 		add_action( 'parse_request', array( $plugin, 'resolve_request' ), 1 );
 		add_action( 'pre_get_posts', array( $plugin, 'scope_feed_query' ) );
 		add_filter( 'the_posts', array( $plugin, 'enforce_membership' ), 10, 2 );
@@ -211,6 +215,13 @@ final class Plugin {
 		status_header( $status );
 		nocache_headers();
 		exit;
+	}
+
+	public function register_url_adapters(): void {
+		$policy   = new UrlPolicy( home_url() );
+		$verifier = new RoundTripVerifier( $this->routing() );
+
+		( new CoreLinks( $this->context, $policy, $verifier, home_url() ) )->register();
 	}
 
 	public function resolve_request( \WP $wp ): void {

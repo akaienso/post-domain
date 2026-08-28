@@ -65,7 +65,12 @@ final class UrlPolicy {
 			$suffix .= '#' . $parts['fragment'];
 		}
 
-		return ( $parts['scheme'] ?? 'https' ) . '://' . $target . $suffix;
+		/*
+		 * A mapped host is always addressed over HTTPS. Rebasing must never
+		 * produce a downgrade (spec §11.8), and the mapping only serves once it
+		 * is verified and active.
+		 */
+		return 'https://' . $target . $suffix;
 	}
 
 	private function link_host( ServingContext $context, UrlKind $kind ): string {
