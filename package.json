@@ -1,0 +1,7 @@
+{
+	"name": "post-domain",
+	"private": true,
+	"devDependencies": {
+		"@wordpress/env": "^10.0.0"
+	}
+}
