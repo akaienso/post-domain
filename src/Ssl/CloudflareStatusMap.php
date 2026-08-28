@@ -56,12 +56,15 @@ final class CloudflareStatusMap {
 	/**
 	 * caa_error is not a status-axis value: it comes from the error arrays.
 	 *
-	 * @param array<int, array<string, string>> $verification_errors
-	 * @param array<int, array<string, string>> $validation_errors
+	 * Cloudflare has shipped both shapes for these arrays — objects carrying a
+	 * message, and bare strings — so both are read rather than assumed.
+	 *
+	 * @param array<int, array<string, string>|string> $verification_errors
+	 * @param array<int, array<string, string>|string> $validation_errors
 	 */
 	public static function classify_errors( array $verification_errors, array $validation_errors ): ?string {
 		foreach ( array_merge( $verification_errors, $validation_errors ) as $error ) {
-			$message = (string) ( $error['message'] ?? ( is_string( $error ) ? $error : '' ) );
+			$message = is_string( $error ) ? $error : (string) ( $error['message'] ?? '' );
 
 			if ( false !== stripos( $message, 'caa' ) ) {
 				return 'caa_error';
