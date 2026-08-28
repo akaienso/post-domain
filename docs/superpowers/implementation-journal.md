@@ -320,3 +320,74 @@ on the same terms as `Verification\CronWiring`.
     `src/Ssl/LeaseRecovery.php`. Every user value remains a placeholder.
     `ProbeEndpoint::page()` suppresses `NonEnqueuedScript`: the probe page has no
     `wp_head`.
+
+## 2026-08-28 (later) — Plan 10, the REST management API
+
+Green: `SerializerTest` 22, `CollectionTest` 14, `ResourceTest` 11,
+`VerificationRoutesTest` 6, `SslRoutesTest` 17, `EnvironmentRoutesTest` 7 —
+77 tests, 143 assertions across `tests/integration/Rest/`.
+
+### Wiring applied by the primary session
+
+`Plugin::boot()` gains `add_action( 'rest_api_init', … )` and
+`Plugin::register_rest_routes()`, which returns early unless the host is
+`HostKind::PRIMARY`. Registered, not guarded: on any other host the namespace
+does not exist at all, so it is absent from dispatch and from `/wp-json/`
+discovery. Covered by `Rest\RouteRegistrationTest` (4 tests), which fires
+`rest_api_init` rather than calling the method — core refuses a route registered
+anywhere else, and the hook is half of what is under test.
+
+### Two real gaps the track found and could not fix from its own files
+
+35. Plan 10 Task 2 says to make `Plugin::dns_resolver()` delegate to
+    `ResolverFactory`. **There is no such method on `Plugin`.** The filter-reading
+    construction lives in `Verification\CronWiring::dns_resolver()`.
+    `ResolverFactory` was a byte-for-byte lift of it, leaving the same two
+    filters read in two places. `CronWiring::dns_resolver()` now delegates, so
+    exactly one place reads `pd_doh_endpoints` and `pd_dns_resolver` and cron and
+    REST cannot end up proving ownership by different means.
+36. **`pd_verify_now` had no listener.** `ManagementController::verify()`
+    schedules the event so the REST request performs no DNS I/O, but nothing
+    handled the hook, which made the on-demand probe of spec §15.2 a silent
+    no-op. Added `CronWiring::verify_one()` and its registration, covered by
+    `Verification\VerifyNowTest` (3 tests) — including that the hook has a
+    listener at all, which is the assertion that would have caught this.
+
+### Stale plan examples corrected against the specification
+
+37. Three Plan 10 examples omitted `ssl_provider_environment` from the `Mapping`
+    constructor tail, which would have shifted `ssl_ref` into the environment
+    slot and produced exactly the partial binding `assert_valid()` rejects
+    (`update()`, `rotate_challenge()` — which dropped the binding entirely — and
+    the `SslRoutesTest` fixture).
+38. `pd_method_unsupported` is **400** per spec §15.3, not the plan's 409.
+39. `pd_txt_record_label` now actually runs at create and rotate per spec §13.1.
+    The plan hardcoded the default, which left `Challenge::label_for()` with no
+    production caller.
+40. `/environment/resolve` accepts the specification's `choice` as well as the
+    plan's `resolution`.
+41. The `/plan` refusal field `driver` was renamed `driver_id` so the wire name
+    matches its contents — the same conflation deviation 17 corrected.
+42. `test_an_unestablished_removal_never_answers_204` was passing on an
+    incidental 404; it now breaks `COMMIT` around the real removal.
+43. A shared `$wp_rest_server` leaked routes between tests; every Rest class now
+    gets a fresh one. `ResourceTest` and `SslRoutesTest` extend
+    `OwnedSessionTestCase`.
+
+### Open, and deliberately not decided here
+
+- **`GET /environment` and the installation id.** Spec §15.2's table lists it in
+  the response; the plan withholds it and has a test asserting it stays out. The
+  plan's behaviour was implemented, because keeping an identifier out of a
+  response is the reversible choice and deleting a test written to keep it out is
+  not. This needs an operator decision, not a guess.
+- **`DELETE /domains/{id}/ssl` deletes the whole mapping row** when the driver
+  confirms removal, because `DeletionService::process()` is the durable
+  mapping-deletion workflow of spec §14.15 step 3 and is the only service
+  available. That is what the plan prescribes, but the route name promises
+  something narrower.
+- **Not covered by any Plan 10 task**, and therefore absent: collection
+  pagination and filters, `title` and `favicon_attachment_id`,
+  `DELETE ?force=true`, and several §15.1 resource members (`verification`
+  detail, `deletion`, `branding`, `provider_state`, `validation_plan`,
+  timestamps). `_compute=serving` is implemented.

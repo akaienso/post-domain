@@ -98,6 +98,7 @@ final class Plugin {
 		}
 
 		add_action( 'pd_ssl_sweep', array( $plugin, 'sweep_ssl' ) );
+		add_action( 'rest_api_init', array( $plugin, 'register_rest_routes' ) );
 
 		// Subsystem hook topologies register themselves. Each is one line here
 		// rather than a subsystem absorbed into this class.
@@ -330,6 +331,21 @@ final class Plugin {
 		}
 
 		return ( new MembershipFilter( $this->routing() ) )->keep_members( $posts, $serving );
+	}
+
+	public function register_rest_routes(): void {
+		$host = $this->context->host();
+
+		// Registered, not guarded: on any other host the routes do not exist at
+		// all, so they are absent from dispatch and from /wp-json/ discovery.
+		if ( null === $host || \PostDomain\Routing\HostKind::PRIMARY !== $host->kind ) {
+			return;
+		}
+
+		( new \PostDomain\Rest\ManagementController(
+			$this->repository,
+			\PostDomain\Rest\SslServices::production()
+		) )->register();
 	}
 
 	/**

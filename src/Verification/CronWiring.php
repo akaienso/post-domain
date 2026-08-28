@@ -7,7 +7,6 @@ use PostDomain\Contracts\DnsResolver;
 use PostDomain\Mapping\DbRepository;
 use PostDomain\Mapping\Mapping;
 use PostDomain\Support\SystemClock;
-use PostDomain\Support\WpHttpClient;
 
 /**
  * The cron topology for the verification subsystem.
@@ -22,6 +21,7 @@ final class CronWiring {
 		add_action( 'init', array( self::class, 'register_cron' ), 100 );
 		add_action( 'pd_verify_pending', array( self::class, 'sweep_pending' ) );
 		add_action( 'pd_verify_established', array( self::class, 'sweep_established' ) );
+		add_action( 'pd_verify_now', array( self::class, 'verify_one' ) );
 	}
 
 	public static function register_cron(): void {
@@ -37,23 +37,27 @@ final class CronWiring {
 	}
 
 	/**
-	 * The default resolver is DoH with two independent endpoints. A replacement
-	 * installed through `pd_dns_resolver` substitutes the ownership proof
-	 * mechanism outright, so anything that is not a `DnsResolver` is ignored.
+	 * One place reads `pd_doh_endpoints` and `pd_dns_resolver`, so cron and REST
+	 * cannot end up proving ownership by different means.
 	 */
 	public static function dns_resolver(): DnsResolver {
-		/** @var string[] $endpoints */
-		$endpoints = (array) apply_filters(
-			'pd_doh_endpoints',
-			array( 'https://cloudflare-dns.com/dns-query', 'https://dns.google/resolve' )
-		);
+		return ResolverFactory::from_filters();
+	}
 
-		$default = new DohResolver( new WpHttpClient(), $endpoints );
+	/**
+	 * The on-demand probe behind `POST /domains/{id}/verify`. The REST request
+	 * schedules it rather than running it, so the response reports state instead
+	 * of blocking on DNS (spec §15.2).
+	 */
+	public static function verify_one( int $mapping_id ): void {
+		$repo    = new DbRepository();
+		$mapping = $repo->by_id( $mapping_id );
 
-		/** @var mixed $resolver */
-		$resolver = apply_filters( 'pd_dns_resolver', $default );
+		if ( null === $mapping ) {
+			return;
+		}
 
-		return $resolver instanceof DnsResolver ? $resolver : $default;
+		( new Verifier( $repo, self::dns_resolver(), new SystemClock() ) )->verify( $mapping );
 	}
 
 	/** @param Mapping[] $rows */
