@@ -4,6 +4,7 @@ declare( strict_types = 1 );
 namespace PostDomain;
 
 use PostDomain\Contracts\MappingRepository;
+use PostDomain\Contracts\RoutingContract;
 use PostDomain\Http\AdminRedirect;
 use PostDomain\Mapping\AliasResolver;
 use PostDomain\Mapping\DbRepository;
@@ -11,9 +12,13 @@ use PostDomain\Routing\Classifier;
 use PostDomain\Routing\ContentPolicy;
 use PostDomain\Routing\ContextHolder;
 use PostDomain\Routing\Disposition;
+use PostDomain\Routing\EnumerationScopeProvider;
 use PostDomain\Routing\HostContextFactory;
 use PostDomain\Routing\MappedHostGuard;
+use PostDomain\Routing\MembershipFilter;
+use PostDomain\Routing\PathNormalizer;
 use PostDomain\Routing\ServingEligibility;
+use PostDomain\Routing\Subtree;
 use PostDomain\Routing\UnknownHostGuard;
 use PostDomain\Support\AuthorityParser;
 use PostDomain\Support\HostNormalizer;
@@ -63,6 +68,8 @@ final class Plugin {
 		add_action( 'plugins_loaded', array( $plugin, 'freeze_eligibility' ), 11 );
 		add_action( 'init', array( $plugin, 'freeze_content_policy' ), 99 );
 		add_action( 'parse_request', array( $plugin, 'enforce_disposition' ), 0 );
+		add_action( 'pre_get_posts', array( $plugin, 'scope_feed_query' ) );
+		add_filter( 'the_posts', array( $plugin, 'enforce_membership' ), 10, 2 );
 
 		/**
 		 * Schema upgrades run only where a slow dbDelta() is acceptable and a
@@ -199,6 +206,50 @@ final class Plugin {
 		status_header( $status );
 		nocache_headers();
 		exit;
+	}
+
+	public function scope_feed_query( \WP_Query $query ): void {
+		$serving = $this->context->serving();
+
+		if ( null === $serving || ! $query->is_feed() ) {
+			return;
+		}
+
+		$limit = (int) apply_filters( 'pd_scope_enumeration_limit', 500 );
+		$limit = max( 0, min( 5000, $limit ) );
+
+		$scope = ( new EnumerationScopeProvider( $this->routing(), $limit ) )->scope( $serving );
+
+		if ( ! $scope->is_bounded ) {
+			// Never unbounded: an id that cannot exist yields an empty result set.
+			$query->set( 'post__in', array( 0 ) );
+
+			return;
+		}
+
+		$query->set( 'post__in', $scope->post__in );
+
+		foreach ( $scope->query_args as $key => $value ) {
+			$query->set( $key, $value );
+		}
+	}
+
+	/**
+	 * @param \WP_Post[] $posts
+	 * @return \WP_Post[]
+	 */
+	public function enforce_membership( array $posts, \WP_Query $query ): array {
+		$serving = $this->context->serving();
+
+		if ( null === $serving || ! $query->is_feed() ) {
+			return $posts;
+		}
+
+		return ( new MembershipFilter( $this->routing() ) )->keep_members( $posts, $serving );
+	}
+
+	public function routing(): RoutingContract {
+		return new Subtree( new PathNormalizer() );
 	}
 
 	private function unknown_host_policy(): string {
