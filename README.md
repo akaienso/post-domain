@@ -288,3 +288,48 @@ nothing, and freezes the last known state rather than adopting an answer from an
 account that has never heard of it.
 
 Diagnostics lists every such certificate, with the environment to restore.
+
+## 25. Releases
+
+Releases are cut by [Release Please](https://github.com/googleapis/release-please)
+from [Conventional Commits](https://www.conventionalcommits.org/) on `main`.
+
+1. **A human merges an ordinary pull request.** Every feature, fix and
+   maintenance PR is merged by a person. Nothing about the automation below
+   applies to them.
+2. **Release Please opens the release PR**, updating `CHANGELOG.md` and the
+   `Version:` header in `post-domain.php`.
+3. **GitHub merges that one PR automatically**, once the required checks pass.
+   Auto-merge is queued, not forced: `checks` and `Require conventional PR title`
+   are required on `main` and remain the authority on whether it lands.
+4. **Release Please tags the commit and publishes the GitHub release.**
+5. **`release.yml` attaches the installable ZIP**, `post-domain-VERSION.zip`,
+   to that release.
+
+Step 3 is the only automatic merge in the repository. The workflow that queues
+it, `.github/workflows/auto-merge-release-please.yml`, acts only when the
+pull request's author, head repository, head branch, base branch, label and
+draft state *all* match the Release Please release PR exactly. A branch merely
+named like the release branch, an account merely named like the bot, a PR
+without the `autorelease: pending` label, a draft, or anything from a fork is
+left for a person to merge.
+
+`tools/verify-auto-merge-guard.mjs` proves this by lifting the whole script out
+of the workflow file and running it against a fake GitHub API, so the proof
+cannot drift from the code it is proving. It covers the authorization cases
+above — each of which must reach the API not at all — and the reliability ones:
+a queue that is already in place, one queued with the wrong merge method, a
+failing query, a failing mutation, and a mutation that answers without queuing
+anything. Every one of those fails the run rather than passing quietly:
+
+```bash
+node tools/verify-auto-merge-guard.mjs
+```
+
+### Required repository configuration
+
+| Setting | Value |
+|---|---|
+| Repository | Allow auto-merge: **on** |
+| `main` protection | Required checks: `checks`, `Require conventional PR title` |
+| Secrets | `RELEASE_APP_ID`, `RELEASE_APP_PRIVATE_KEY` |

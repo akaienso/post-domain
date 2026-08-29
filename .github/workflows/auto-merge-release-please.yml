@@ -1,0 +1,185 @@
+name: Auto-merge release PR
+
+# Queues GitHub's native auto-merge on the Release Please release PR, and on
+# nothing else. Required checks stay authoritative: auto-merge waits for them,
+# so this never merges anything a human merge would not also have to wait for.
+#
+# pull_request_target runs the trusted copy of this file from the default
+# branch, with a token in scope. That is only safe because nothing below ever
+# reads the pull request's content: no checkout, no `run` step, no script, no
+# expression interpolating a title, body, branch name, or any other
+# contributor-controlled string. Every value used for authorization is read
+# from the event payload inside a JavaScript step and compared with ===.
+
+on:
+  pull_request_target:
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - labeled
+      - ready_for_review
+
+permissions:
+  contents: read
+
+concurrency:
+  group: auto-merge-release-please-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  enable-auto-merge:
+    name: Enable auto-merge for the release PR
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Create GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+
+      - name: Verify identity and enable squash auto-merge
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ steps.app-token.outputs.token }}
+          script: |
+            const pr = context.payload.pull_request;
+
+            // Exact equality on every field. A prefix or "startsWith" match on a
+            // title or branch name is not an identity, and anyone able to open a
+            // pull request can choose those.
+            const EXPECTED = {
+              repository: 'akaienso/post-domain',
+              author:     'akaienso-release-please[bot]',
+              baseRef:    'main',
+              headRef:    'release-please--branches--main',
+              label:      'autorelease: pending',
+            };
+
+            const labels = (pr.labels || []).map(l => l.name);
+
+            const guards = {
+              // The head repository, not the base: a fork can name its branch
+              // anything, including the release branch's name.
+              'head repository': pr.head.repo && pr.head.repo.full_name === EXPECTED.repository,
+              'author':          pr.user.login === EXPECTED.author,
+              'author is a bot': pr.user.type === 'Bot',
+              'base branch':     pr.base.ref === EXPECTED.baseRef,
+              'head branch':     pr.head.ref === EXPECTED.headRef,
+              'release label':   labels.includes(EXPECTED.label),
+              'not a draft':     pr.draft === false,
+            };
+
+            const failed = Object.entries(guards)
+              .filter(([, ok]) => !ok)
+              .map(([name]) => name);
+
+            if (failed.length > 0) {
+              core.info(`PR #${pr.number} is not the Release Please release PR.`);
+              core.info(`Unmet: ${failed.join(', ')}.`);
+              core.info('No auto-merge was requested. A human merges this pull request.');
+              return;
+            }
+
+            core.info(`PR #${pr.number} matched every Release Please identity check.`);
+
+            const MERGE_METHOD = 'SQUASH';
+
+            // What is already queued, if anything. Asked rather than assumed: a
+            // failure here must not be mistaken for "probably already enabled",
+            // which is how an unmerged release sits unnoticed until someone
+            // wonders where the tag went.
+            const CURRENT = `
+              query($pullRequestId: ID!) {
+                node(id: $pullRequestId) {
+                  ... on PullRequest {
+                    number
+                    autoMergeRequest { enabledAt mergeMethod }
+                  }
+                }
+              }`;
+
+            let existing;
+
+            try {
+              const state = await github.graphql(CURRENT, { pullRequestId: pr.node_id });
+              existing = state.node && state.node.autoMergeRequest;
+            } catch (error) {
+              core.setFailed(
+                `Could not read the auto-merge state of PR #${pr.number}: ${error.message}. ` +
+                'The release PR has been left for a human to merge.',
+              );
+              throw error;
+            }
+
+            if (existing) {
+              // Already queued. Idempotent, but only if it is queued the way this
+              // workflow would have queued it.
+              if (existing.mergeMethod !== MERGE_METHOD) {
+                throw new Error(
+                  `PR #${pr.number} already has auto-merge queued as ${existing.mergeMethod}, ` +
+                  `not ${MERGE_METHOD}. Refusing to release through a merge method nobody chose here.`,
+                );
+              }
+
+              core.info(
+                `Auto-merge is already queued (${existing.mergeMethod}, since ${existing.enabledAt}). Nothing to do.`,
+              );
+
+              return;
+            }
+
+            // enablePullRequestAutoMerge queues GitHub's own auto-merge; it does
+            // not merge now. Required checks decide when, and whether, it lands.
+            const ENABLE = `
+              mutation($pullRequestId: ID!, $mergeMethod: PullRequestMergeMethod!) {
+                enablePullRequestAutoMerge(input: {
+                  pullRequestId: $pullRequestId,
+                  mergeMethod: $mergeMethod
+                }) {
+                  pullRequest {
+                    number
+                    autoMergeRequest { enabledAt mergeMethod }
+                  }
+                }
+              }`;
+
+            let result;
+
+            try {
+              result = await github.graphql(ENABLE, {
+                pullRequestId: pr.node_id,
+                mergeMethod: MERGE_METHOD,
+              });
+            } catch (error) {
+              core.setFailed(
+                `Could not queue auto-merge on PR #${pr.number}: ${error.message}. ` +
+                'Check the app credentials, its permissions, and that auto-merge is enabled for this repository.',
+              );
+              throw error;
+            }
+
+            // A mutation that returns without error but without a request has not
+            // queued anything. Reporting success here is how the release quietly
+            // does not happen.
+            const queued =
+              result &&
+              result.enablePullRequestAutoMerge &&
+              result.enablePullRequestAutoMerge.pullRequest &&
+              result.enablePullRequestAutoMerge.pullRequest.autoMergeRequest;
+
+            if (!queued) {
+              throw new Error(
+                `Auto-merge was not queued on PR #${pr.number}: the mutation returned no auto-merge request.`,
+              );
+            }
+
+            if (queued.mergeMethod !== MERGE_METHOD) {
+              throw new Error(
+                `Auto-merge was queued on PR #${pr.number} as ${queued.mergeMethod}, not ${MERGE_METHOD}.`,
+              );
+            }
+
+            core.info(`Auto-merge queued (${queued.mergeMethod}) at ${queued.enabledAt}.`);
