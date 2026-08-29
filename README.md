@@ -314,9 +314,13 @@ named like the release branch, an account merely named like the bot, a PR
 without the `autorelease: pending` label, a draft, or anything from a fork is
 left for a person to merge.
 
-`tools/verify-auto-merge-guard.mjs` proves this by lifting the guard out of the
-workflow file and running it against payloads for each of those cases, so the
-proof cannot drift from the code it is proving:
+`tools/verify-auto-merge-guard.mjs` proves this by lifting the whole script out
+of the workflow file and running it against a fake GitHub API, so the proof
+cannot drift from the code it is proving. It covers the authorization cases
+above — each of which must reach the API not at all — and the reliability ones:
+a queue that is already in place, one queued with the wrong merge method, a
+failing query, a failing mutation, and a mutation that answers without queuing
+anything. Every one of those fails the run rather than passing quietly:
 
 ```bash
 node tools/verify-auto-merge-guard.mjs

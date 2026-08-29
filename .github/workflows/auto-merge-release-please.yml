@@ -85,26 +85,101 @@ jobs:
 
             core.info(`PR #${pr.number} matched every Release Please identity check.`);
 
-            // enablePullRequestAutoMerge queues GitHub's own auto-merge; it does
-            // not merge now. Required checks decide when, and whether, it lands.
-            const query = `
-              mutation($pullRequestId: ID!) {
-                enablePullRequestAutoMerge(input: {
-                  pullRequestId: $pullRequestId,
-                  mergeMethod: SQUASH
-                }) {
-                  pullRequest { number autoMergeRequest { enabledAt mergeMethod } }
+            const MERGE_METHOD = 'SQUASH';
+
+            // What is already queued, if anything. Asked rather than assumed: a
+            // failure here must not be mistaken for "probably already enabled",
+            // which is how an unmerged release sits unnoticed until someone
+            // wonders where the tag went.
+            const CURRENT = `
+              query($pullRequestId: ID!) {
+                node(id: $pullRequestId) {
+                  ... on PullRequest {
+                    number
+                    autoMergeRequest { enabledAt mergeMethod }
+                  }
                 }
               }`;
 
+            let existing;
+
             try {
-              const result = await github.graphql(query, { pullRequestId: pr.node_id });
-              const request = result.enablePullRequestAutoMerge.pullRequest.autoMergeRequest;
-              core.info(`Auto-merge queued (${request.mergeMethod}) at ${request.enabledAt}.`);
+              const state = await github.graphql(CURRENT, { pullRequestId: pr.node_id });
+              existing = state.node && state.node.autoMergeRequest;
             } catch (error) {
-              // Already queued, or the PR is in a state GitHub will not queue —
-              // for example every required check has already passed and it is
-              // mergeable now, or the repository setting is off. None of those
-              // should fail the run and none of them merges anything.
-              core.warning(`Auto-merge was not queued: ${error.message}`);
+              core.setFailed(
+                `Could not read the auto-merge state of PR #${pr.number}: ${error.message}. ` +
+                'The release PR has been left for a human to merge.',
+              );
+              throw error;
             }
+
+            if (existing) {
+              // Already queued. Idempotent, but only if it is queued the way this
+              // workflow would have queued it.
+              if (existing.mergeMethod !== MERGE_METHOD) {
+                throw new Error(
+                  `PR #${pr.number} already has auto-merge queued as ${existing.mergeMethod}, ` +
+                  `not ${MERGE_METHOD}. Refusing to release through a merge method nobody chose here.`,
+                );
+              }
+
+              core.info(
+                `Auto-merge is already queued (${existing.mergeMethod}, since ${existing.enabledAt}). Nothing to do.`,
+              );
+
+              return;
+            }
+
+            // enablePullRequestAutoMerge queues GitHub's own auto-merge; it does
+            // not merge now. Required checks decide when, and whether, it lands.
+            const ENABLE = `
+              mutation($pullRequestId: ID!, $mergeMethod: PullRequestMergeMethod!) {
+                enablePullRequestAutoMerge(input: {
+                  pullRequestId: $pullRequestId,
+                  mergeMethod: $mergeMethod
+                }) {
+                  pullRequest {
+                    number
+                    autoMergeRequest { enabledAt mergeMethod }
+                  }
+                }
+              }`;
+
+            let result;
+
+            try {
+              result = await github.graphql(ENABLE, {
+                pullRequestId: pr.node_id,
+                mergeMethod: MERGE_METHOD,
+              });
+            } catch (error) {
+              core.setFailed(
+                `Could not queue auto-merge on PR #${pr.number}: ${error.message}. ` +
+                'Check the app credentials, its permissions, and that auto-merge is enabled for this repository.',
+              );
+              throw error;
+            }
+
+            // A mutation that returns without error but without a request has not
+            // queued anything. Reporting success here is how the release quietly
+            // does not happen.
+            const queued =
+              result &&
+              result.enablePullRequestAutoMerge &&
+              result.enablePullRequestAutoMerge.pullRequest &&
+              result.enablePullRequestAutoMerge.pullRequest.autoMergeRequest;
+
+            if (!queued) {
+              throw new Error(
+                `Auto-merge was not queued on PR #${pr.number}: the mutation returned no auto-merge request.`,
+              );
+            }
+
+            if (queued.mergeMethod !== MERGE_METHOD) {
+              throw new Error(
+                `Auto-merge was queued on PR #${pr.number} as ${queued.mergeMethod}, not ${MERGE_METHOD}.`,
+              );
+            }
+
+            core.info(`Auto-merge queued (${queued.mergeMethod}) at ${queued.enabledAt}.`);
