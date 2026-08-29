@@ -39,7 +39,8 @@ final class Mapping {
 		public readonly ?string $ssl_error = null,
 		public readonly ?string $ssl_checked_at = null,
 		public readonly ?string $deletion_requested_at = null,
-		public readonly int $deletion_attempts = 0
+		public readonly int $deletion_attempts = 0,
+		public readonly ?string $ssl_removal_scope = null
 	) {}
 
 	/**
@@ -77,7 +78,8 @@ final class Mapping {
 			$row['ssl_error'],
 			$row['ssl_checked_at'],
 			$row['deletion_requested_at'],
-			(int) ( $row['deletion_attempts'] ?? 0 )
+			(int) ( $row['deletion_attempts'] ?? 0 ),
+			$row['ssl_removal_scope'] ?? null
 		);
 	}
 

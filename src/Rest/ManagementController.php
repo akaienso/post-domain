@@ -573,6 +573,14 @@ final class ManagementController {
 			);
 		}
 
+		if ( 'scope_conflict' === $outcome ) {
+			return self::error(
+				Errors::CONFLICT,
+				'This mapping is already awaiting deletion; its certificate goes with it.',
+				409
+			);
+		}
+
 		if ( 'refused' === $outcome ) {
 			return self::error( Errors::MUTATION_UNAUTHORIZED, 'The removal was refused before any provider call.', 409 );
 		}

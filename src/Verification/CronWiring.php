@@ -29,6 +29,9 @@ final class CronWiring {
 		add_action( 'pd_verify_established', array( self::class, 'sweep_established' ) );
 		add_action( 'pd_maintenance', array( self::class, 'maintenance' ) );
 		add_action( 'pd_verify_now', array( self::class, 'verify_one' ) );
+
+		// One-off continuations for unfinished batches, on hooks of their own.
+		Schedule::register_continuations();
 	}
 
 	public static function register_cron(): void {

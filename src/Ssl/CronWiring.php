@@ -31,9 +31,13 @@ final class CronWiring {
 	}
 
 	/**
-	 * Rows whose provider resource still has to be removed before the mapping
-	 * can go. Each one goes through the full §14.15 workflow — authorizer, gate,
-	 * permit, finalize CAS — and no shortcut exists from here to a driver.
+	 * Rows with an outstanding provider removal, of either scope.
+	 *
+	 * Each row goes through the full §14.15 workflow — authorizer, gate, permit,
+	 * finalize CAS — and no shortcut exists from here to a driver. Which of the
+	 * two services runs is decided by the row's own persisted scope, never
+	 * inferred: handing an SSL-only removal to mapping deletion would hard-delete
+	 * a domain whose operator asked only for its certificate to go.
 	 */
 	public static function sweep_deletions(): void {
 		$clock = new SystemClock();
@@ -46,15 +50,16 @@ final class CronWiring {
 		$budget = (int) apply_filters( 'pd_sweep_budget_seconds', 20 );
 		$budget = max( 1, min( 300, $budget ) );
 
-		$lease   = new MutationLease( $clock );
-		$repo    = new DbRepository();
-		$proof   = new FreshProof( ResolverFactory::from_filters() );
-		$service = new DeletionService(
-			new DeletionAuthorizer( $repo, $proof, $lease, $clock ),
-			$lease,
-			new MutationGate( $lease, $clock ),
-			$clock
-		);
+		$lease      = new MutationLease( $clock );
+		$repo       = new DbRepository();
+		$proof      = new FreshProof( ResolverFactory::from_filters() );
+		$authorizer = new DeletionAuthorizer( $repo, $proof, $lease, $clock );
+		$gate       = new MutationGate( $lease, $clock );
+
+		// Both services share the same authorizer, lease and gate instances, so
+		// there is one authorization path however a removal was requested.
+		$mapping_deletion = new DeletionService( $authorizer, $lease, $gate, $clock );
+		$resource_removal = new SslResourceRemoval( $authorizer, $lease, $gate, $clock );
 
 		// The batch, the time budget, and the single bounded continuation event
 		// are the verification sweep's, unchanged: one scheduler, one set of
@@ -62,8 +67,14 @@ final class CronWiring {
 		Schedule::run_sweep(
 			$due,
 			$budget,
-			static function ( Mapping $mapping ) use ( $service ): void {
-				$service->process( $mapping );
+			static function ( Mapping $mapping ) use ( $mapping_deletion, $resource_removal ): void {
+				if ( RemovalScope::RESOURCE === RemovalScope::from_row( $mapping->ssl_removal_scope ) ) {
+					$resource_removal->process( $mapping );
+
+					return;
+				}
+
+				$mapping_deletion->process( $mapping );
 			},
 			'pd_ssl_sweep'
 		);

@@ -16,6 +16,9 @@ use PostDomain\Rest\ManagementController;
 use PostDomain\Rest\SslServices;
 use PostDomain\Ssl\CronWiring;
 use PostDomain\Ssl\DriverFactory;
+use PostDomain\Routing\EndpointClass;
+use PostDomain\Routing\HostContext;
+use PostDomain\Routing\HostKind;
 use PostDomain\Ssl\Environment;
 use PostDomain\Ssl\MutationKind;
 use PostDomain\Ssl\RemovalOutcome;
@@ -61,6 +64,12 @@ final class DeletionSweepTest extends OwnedSessionTestCase {
 		global $wp_rest_server;
 		$wp_rest_server = null;
 
+		// The plugin instance is a singleton, so the primary host this class
+		// pinned must not outlive it and decide another class's routes.
+		Plugin::instance()->context()->set_host(
+			new HostContext( 'mapped.test', null, 'mapped.test', HostKind::MAPPED, null, EndpointClass::ROUTED, true, 'GET' )
+		);
+
 		remove_all_filters( 'pd_ssl_drivers' );
 		remove_all_filters( 'pd_dns_resolver' );
 		delete_option( 'pd_settings' );
@@ -100,10 +109,17 @@ final class DeletionSweepTest extends OwnedSessionTestCase {
 
 		Plugin::boot();
 
-		// The one line `Plugin::boot()` gains (see tmp/trackA-plugin-wiring.md).
-		// `add_action` is keyed on the callback, so calling this after boot has
-		// already registered it is a no-op rather than a second registration.
+		// The one line `Plugin::boot()` gains. `add_action` is keyed on the
+		// callback, so calling this after boot has already registered it is a
+		// no-op rather than a second registration.
 		CronWiring::register();
+
+		// The management routes exist only on the primary host, by design. The
+		// plugin instance is a singleton, so a host context left behind by an
+		// earlier test would otherwise decide whether these routes exist at all.
+		Plugin::instance()->context()->set_host(
+			new HostContext( 'primary.test', null, 'primary.test', HostKind::PRIMARY, null, EndpointClass::ROUTED, true, 'GET' )
+		);
 
 		( new ManagementController( $this->repo, SslServices::production() ) )->register();
 	}

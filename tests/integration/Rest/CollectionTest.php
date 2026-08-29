@@ -5,7 +5,11 @@ namespace PostDomain\Tests\Integration\Rest;
 
 use PostDomain\Mapping\DbRepository;
 use PostDomain\Rest\Errors;
+use PostDomain\Plugin;
 use PostDomain\Rest\ManagementController;
+use PostDomain\Routing\EndpointClass;
+use PostDomain\Routing\HostContext;
+use PostDomain\Routing\HostKind;
 use PostDomain\Rest\SslServices;
 use PostDomain\Support\Schema;
 use WP_REST_Request;
@@ -62,6 +66,18 @@ final class CollectionTest extends WP_UnitTestCase {
 	}
 
 	public function test_the_namespace_is_absent_from_discovery_when_not_registered(): void {
+		// The premise has to be established, not assumed. Under the test harness
+		// the site's own host *is* the primary host, so without this the plugin
+		// registers its routes legitimately and the test asserts nothing about a
+		// mapped host at all.
+		Plugin::instance()->context()->set_host(
+			new HostContext( 'mapped.test', null, 'mapped.test', HostKind::MAPPED, null, EndpointClass::ROUTED, true, 'GET' )
+		);
+
+		global $wp_rest_server;
+		$wp_rest_server = new \WP_REST_Server();
+		do_action( 'rest_api_init', $wp_rest_server );
+
 		$data = rest_do_request( new WP_REST_Request( 'GET', '/' ) )->get_data();
 
 		$this->assertNotContains(

@@ -269,11 +269,23 @@ final class ScheduleTest extends WP_UnitTestCase {
 		$this->assertSame( 1, $count );
 	}
 
-	public function test_an_unfinished_batch_schedules_one_bounded_continuation(): void {
-		wp_clear_scheduled_hook( 'pd_verify_pending' );
+	/**
+	 * The recurring event stays installed throughout. Clearing it first — which
+	 * the earlier version of this test did — hid the defect completely: with a
+	 * recurring event present, `wp_next_scheduled()` on the sweep's own hook
+	 * always answers with a timestamp, so a continuation keyed on that hook was
+	 * never scheduled on a real site.
+	 */
+	public function test_an_unfinished_batch_continues_while_its_recurring_event_stands(): void {
+		Schedule::register_cron();
 
-		$rows = array_fill( 0, 3, $this->mapping() );
+		$recurring = wp_next_scheduled( 'pd_verify_pending' );
+		$this->assertNotFalse( $recurring, 'the ordinary schedule is installed' );
 
+		$continuation = Schedule::continuation_hook( 'pd_verify_pending' );
+		$this->assertFalse( wp_next_scheduled( $continuation ), 'nothing outstanding yet' );
+
+		$rows      = array_fill( 0, 3, $this->mapping() );
 		$processed = Schedule::run_sweep(
 			$rows,
 			0,
@@ -284,9 +296,46 @@ final class ScheduleTest extends WP_UnitTestCase {
 		);
 
 		$this->assertSame( 1, $processed, 'the budget stops the batch after the first row' );
-		$this->assertNotFalse( wp_next_scheduled( 'pd_verify_pending' ), 'one continuation is scheduled' );
 
-		// Running again must not stack a second continuation on top of the first.
+		$due = wp_next_scheduled( $continuation );
+
+		$this->assertNotFalse( $due, 'an unfinished batch is carried forward' );
+		$this->assertSame(
+			$recurring,
+			wp_next_scheduled( 'pd_verify_pending' ),
+			'and the recurring event is untouched'
+		);
+		$this->assertLessThanOrEqual( time() + 61, $due, 'roughly a minute later' );
+		$this->assertGreaterThan( time(), $due );
+
+		// A separate hook, not a separate timestamp — the two can legitimately
+		// coincide. What matters is that the continuation is one-off and the
+		// ordinary schedule is still recurring at its declared interval.
+		$this->assertNotSame( $continuation, 'pd_verify_pending' );
+		$this->assertFalse(
+			wp_get_schedule( $continuation ),
+			'a continuation is a single event, never a recurrence'
+		);
+		$this->assertSame(
+			Schedule::schedule_name( Schedule::HOOKS['pd_verify_pending'] ),
+			wp_get_schedule( 'pd_verify_pending' ),
+			'and the ordinary schedule keeps its cadence'
+		);
+	}
+
+	public function test_a_second_unfinished_run_does_not_stack_a_continuation(): void {
+		Schedule::register_cron();
+
+		$rows = array_fill( 0, 3, $this->mapping() );
+
+		Schedule::run_sweep(
+			$rows,
+			0,
+			static function ( Mapping $mapping ): void {
+				unset( $mapping );
+			},
+			'pd_verify_pending'
+		);
 		Schedule::run_sweep(
 			$rows,
 			0,
@@ -296,14 +345,74 @@ final class ScheduleTest extends WP_UnitTestCase {
 			'pd_verify_pending'
 		);
 
-		$cron  = _get_cron_array();
+		$this->assertSame(
+			1,
+			$this->scheduled_count( Schedule::continuation_hook( 'pd_verify_pending' ) ),
+			'one continuation, not a loop'
+		);
+	}
+
+	public function test_a_completed_batch_schedules_no_continuation(): void {
+		Schedule::register_cron();
+
+		$rows = array( $this->mapping() );
+
+		$processed = Schedule::run_sweep(
+			$rows,
+			300,
+			static function ( Mapping $mapping ): void {
+				unset( $mapping );
+			},
+			'pd_verify_pending'
+		);
+
+		$this->assertSame( 1, $processed );
+		$this->assertFalse(
+			wp_next_scheduled( Schedule::continuation_hook( 'pd_verify_pending' ) ),
+			'nothing was left over to carry'
+		);
+	}
+
+	/**
+	 * The continuation re-fires the sweep hook itself, so every listener runs
+	 * again in its registered order rather than only the one the continuation
+	 * happened to know about.
+	 */
+	public function test_the_continuation_re_fires_the_whole_sweep_hook(): void {
+		Schedule::register_continuations();
+
+		$order = array();
+
+		add_action(
+			'pd_ssl_sweep',
+			static function () use ( &$order ): void {
+				$order[] = 'recovery';
+			},
+			10
+		);
+		add_action(
+			'pd_ssl_sweep',
+			static function () use ( &$order ): void {
+				$order[] = 'ordinary';
+			},
+			20
+		);
+
+		do_action( Schedule::continuation_hook( 'pd_ssl_sweep' ) );
+
+		$this->assertSame( array( 'recovery', 'ordinary' ), $order );
+
+		remove_all_actions( 'pd_ssl_sweep' );
+	}
+
+	private function scheduled_count( string $hook ): int {
 		$count = 0;
 
-		foreach ( (array) $cron as $events ) {
-			$count += count( $events['pd_verify_pending'] ?? array() );
+		foreach ( (array) _get_cron_array() as $events ) {
+			$count += count( $events[ $hook ] ?? array() );
 		}
 
-		$this->assertSame( 1, $count, 'one continuation, not a loop' );
+		return $count;
 	}
 
 	private function mapping(): Mapping {

@@ -37,9 +37,18 @@ final class SslResourceRemoval {
 
 	/**
 	 * @return string One of: removed, pending, transient, failed, refused,
-	 *                fenced, deferred.
+	 *                scope_conflict, fenced, deferred.
 	 */
 	public function process( Mapping $mapping ): string {
+		// A mapping already on its way out is not a certificate to strip. Letting
+		// this run would quietly downgrade a requested deletion into a keep, and
+		// the operator who asked for the domain to go would never learn that it
+		// stayed. The lease CAS covers the in-flight case; this covers the
+		// requested-but-not-yet-started one.
+		if ( RemovalScope::MAPPING === RemovalScope::from_row( $mapping->ssl_removal_scope ) ) {
+			return 'scope_conflict';
+		}
+
 		$gated = $this->workflow->attempt( $mapping );
 
 		if ( $gated instanceof MutationRefusal ) {
@@ -63,10 +72,15 @@ final class SslResourceRemoval {
 
 		// Nothing is cleared while the provider still holds, or may still hold,
 		// the resource: an unbound row cannot be asked about it again.
+		//
+		// The scope is claimed here, inside the owner-pinned finalize CAS, so an
+		// unfinished SSL-only removal becomes selectable by the sweep and is
+		// resumed through this service rather than through mapping deletion.
 		$applied = $this->workflow->finalize(
 			$mapping,
 			$gated,
-			$this->workflow->retry_schedule( $mapping, $result ),
+			$this->workflow->retry_schedule( $mapping, $result )
+				->with( array( 'ssl_removal_scope' => RemovalScope::RESOURCE->value ) ),
 			'removal_' . $result->outcome->value,
 			$result->outcome->value
 		);
@@ -106,6 +120,8 @@ final class SslResourceRemoval {
 				'ssl_provider_state'        => null,
 				'deletion_attempts'         => 0,
 				'deletion_next_attempt_at'  => null,
+				// Nothing is outstanding any more, so nothing selects this row.
+				'ssl_removal_scope'         => null,
 				'ssl_checked_at'            => gmdate( 'Y-m-d H:i:s' ),
 			)
 		);

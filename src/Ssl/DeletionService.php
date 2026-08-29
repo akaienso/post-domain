@@ -71,13 +71,19 @@ final class DeletionService {
 		// phpcs:disable WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- $table is Schema::domains_table(), never caller input.
 		$affected = $wpdb->query(
 			$wpdb->prepare(
+				// The scope is claimed in the same CAS that requests the deletion.
+				// A row can only be claimed while it carries no lease, so an
+				// SSL-only removal already in flight cannot have the mapping
+				// scope written underneath it.
 				"UPDATE {$table}
 				    SET deletion_requested_at = %s, activation_state = %s, ssl_state = %s,
+				        ssl_removal_scope = %s,
 				        deletion_next_attempt_at = %s, revision = revision + 1, updated_at = %s
 				  WHERE id = %d AND revision = %d AND ssl_mutation_token IS NULL",
 				$this->clock->mysql(),
 				ActivationState::INACTIVE->value,
 				SslState::PENDING_REMOVAL->value,
+				RemovalScope::MAPPING->value,
 				$this->clock->mysql(),
 				$this->clock->mysql(),
 				$mapping->id,
@@ -147,7 +153,10 @@ final class DeletionService {
 		$applied = $this->workflow->finalize(
 			$mapping,
 			$gated,
-			$this->workflow->retry_schedule( $mapping, $result ),
+			// Restated rather than assumed: a row this workflow is still working
+			// on stays claimed by it, whatever the column happened to hold.
+			$this->workflow->retry_schedule( $mapping, $result )
+				->with( array( 'ssl_removal_scope' => RemovalScope::MAPPING->value ) ),
 			'removal_' . $result->outcome->value,
 			$result->outcome->value
 		);

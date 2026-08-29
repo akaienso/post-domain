@@ -12,7 +12,10 @@ use PostDomain\Contracts\HttpClient;
  * A hard outcome requires two independent endpoints to agree — and "two
  * independent endpoints" is enforced, not assumed. Unanimity among one answer is
  * not agreement, and a list that names the same resolver twice is one resolver.
- * Below two distinct usable endpoints the only outcome is TRANSIENT, so a
+ * Independence is keyed by the authority (normalized host plus effective port),
+ * not by the URL: https://dns.google/resolve and https://dns.google/dns-query
+ * are two doors into one resolver and cannot corroborate each other.
+ * Below two distinct usable authorities the only outcome is TRANSIENT, so a
  * misconfigured or filtered-down endpoint list can never deactivate a live
  * mapping on a single opinion.
  */
@@ -32,9 +35,12 @@ final class DohResolver implements DnsResolver {
 		$usable = $this->usable_endpoints();
 
 		// Below two, there is nothing to agree with. An endpoint that is missing,
-		// non-HTTPS, unparseable, or a duplicate of another is disqualified here
-		// rather than allowed to cast a TRANSIENT vote, because a vote it cannot
-		// cast honestly is not the same as a vote against.
+		// non-HTTPS, unparseable, or a second door onto an authority already
+		// represented is disqualified here rather than allowed to cast a TRANSIENT
+		// vote, because a vote it cannot cast honestly is not the same as a vote
+		// against. Disqualification happens before any request is made: an endpoint
+		// that cannot contribute to quorum is never asked, so no caller can
+		// manufacture quorum by watching the requests go out.
 		if ( count( $usable ) < 2 ) {
 			return new DnsResult(
 				DnsOutcome::TRANSIENT,
@@ -68,8 +74,9 @@ final class DohResolver implements DnsResolver {
 	private function query( string $endpoint, string $name, string $expected ): DnsResult {
 		// No scheme check here: usable_endpoints() has already rejected anything
 		// that is not HTTPS, so a non-HTTPS endpoint never reaches a vote.
-		// A normalized endpoint may legitimately carry a query of its own, which is
-		// part of what makes it distinct from another on the same host.
+		// A normalized endpoint may legitimately carry a query of its own, so the
+		// name/type parameters are appended with the correct separator. That query
+		// is preserved but is not part of the endpoint's identity for quorum.
 		$separator = str_contains( $endpoint, '?' ) ? '&' : '?';
 		$url       = $endpoint . $separator . 'name=' . rawurlencode( $name ) . '&type=TXT';
 
@@ -143,7 +150,7 @@ final class DohResolver implements DnsResolver {
 
 	/**
 	 * The configured endpoints, normalized, filtered to the usable ones, and
-	 * deduplicated — in configuration order.
+	 * deduplicated by authority — in configuration order.
 	 *
 	 * @return string[]
 	 */
@@ -161,9 +168,16 @@ final class DohResolver implements DnsResolver {
 				continue;
 			}
 
-			// Keyed by the normalized form: two spellings of one resolver collapse
-			// into one entry rather than counting as independent corroboration.
-			$seen[ $normalized ] = $normalized;
+			// Keyed by the authority, not the whole URL: independence is a property
+			// of the server being asked, and two paths or two query strings on one
+			// host reach one resolver holding one opinion. First spelling in
+			// configuration order is the one that votes — later endpoints on an
+			// authority already represented are dropped and never requested.
+			if ( isset( $seen[ $normalized['authority'] ] ) ) {
+				continue;
+			}
+
+			$seen[ $normalized['authority'] ] = $normalized['url'];
 		}
 
 		return array_values( $seen );
@@ -172,25 +186,28 @@ final class DohResolver implements DnsResolver {
 	/**
 	 * Normalizes an endpoint, or returns null if it cannot be used at all.
 	 *
-	 * "Trivially equivalent" means: written differently in a way that cannot
-	 * change which server is asked or what is asked of it. That is exactly —
+	 * Two values are returned. `url` is the request target, which keeps the
+	 * endpoint's own path and query — those change what is asked, so they are
+	 * preserved verbatim. `authority` is the identity used for quorum: the
+	 * lowercased host plus the effective port, written only when it is not the
+	 * https default. Path and query are deliberately absent from it, because they
+	 * do not change *which server* answers, and a second path on a host already
+	 * counted is the same resolver corroborating itself.
 	 *
-	 * - surrounding whitespace;
-	 * - the case of the scheme and of the host, both case-insensitive per
-	 *   RFC 3986 §3.1 and §3.2.2;
-	 * - an explicitly written default port (`:443` under https);
-	 * - a trailing slash on the path.
-	 *
-	 * Everything else is left alone and stays distinguishing: a different host,
-	 * a non-default port, a different path, or a query string all describe
-	 * genuinely different endpoints, so they are kept apart.
+	 * So the authority is unchanged by: surrounding whitespace; the case of the
+	 * scheme and of the host, both case-insensitive per RFC 3986 §3.1 and
+	 * §3.2.2; an explicitly written default port (`:443` under https); a
+	 * trailing slash; the path; the query. It *is* changed by a different host
+	 * or a non-default port, which do name a different server.
 	 *
 	 * Unusable: anything that is not HTTPS (the transport hardening in §13.2 is
 	 * not optional), anything `parse_url()` cannot read, anything with no host,
 	 * and anything carrying userinfo — credentials on a public DoH endpoint are
 	 * never meaningful and dropping them silently would change the request.
+	 *
+	 * @return array{authority: string, url: string}|null
 	 */
-	private static function normalize( string $endpoint ): ?string {
+	private static function normalize( string $endpoint ): ?array {
 		// parse_url(), not wp_parse_url(): this class is exercised by the unit
 		// suite, which boots no WordPress. The inconsistency wp_parse_url() papers
 		// over is in relative URLs, and a relative endpoint has no scheme and is
@@ -217,7 +234,10 @@ final class DohResolver implements DnsResolver {
 		$path      = rtrim( (string) ( $parts['path'] ?? '' ), '/' );
 		$query     = isset( $parts['query'] ) ? '?' . (string) $parts['query'] : '';
 
-		return 'https://' . $authority . $path . $query;
+		return array(
+			'authority' => $authority,
+			'url'       => 'https://' . $authority . $path . $query,
+		);
 	}
 
 	/** Concatenates the character-strings of one TXT record, per RFC 1035. */

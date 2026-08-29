@@ -142,7 +142,7 @@ final class SchemaTest extends WP_UnitTestCase {
 		Schema::install();
 		Schema::install();
 
-		$this->assertCount( 51, $this->columns( Schema::domains_table() ) );
+		$this->assertCount( 52, $this->columns( Schema::domains_table() ) );
 	}
 
 	public function test_the_schema_version_is_recorded(): void {

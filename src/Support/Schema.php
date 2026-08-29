@@ -5,7 +5,7 @@ namespace PostDomain\Support;
 
 final class Schema {
 
-	public const VERSION = 1;
+	public const VERSION = 2;
 
 	public static function domains_table(): string {
 		global $wpdb;
@@ -74,6 +74,7 @@ final class Schema {
 				ssl_mutation_driver varchar(60) NULL,
 				ssl_mutation_environment varchar(190) NULL,
 				deletion_requested_at datetime NULL,
+				ssl_removal_scope varchar(20) NULL,
 				deletion_attempts smallint(5) unsigned NOT NULL DEFAULT 0,
 				deletion_next_attempt_at datetime NULL,
 				title varchar(255) NULL,

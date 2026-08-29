@@ -357,4 +357,35 @@ flakiness; run serially it is deterministic.
 
 No unresolved blocker.
 
+---
+
+## Final runtime correction — 2026-08-29
+
+| # | Defect | Fix |
+|---|---|---|
+| 1 | An unfinished `DELETE /ssl` could never be resumed; the only selector keyed on `ssl_state` and always dispatched mapping deletion | New persisted `ssl_removal_scope` column (schema VERSION 2) distinguishes the two removals; the sweep selects on it and dispatches to one of two services sharing a single authorizer, lease and gate |
+| 2 | `run_sweep()` asked about the sweep's own hook, which always has a recurring event, so a bounded continuation was never scheduled | Continuations have hooks of their own, `<hook>_continue`, each re-firing its sweep hook so priority order is preserved |
+| 3 | Two endpoints on one DoH host counted as two independent resolvers | Independence is keyed by authority — normalized host plus effective port — and an impossible quorum sends no request at all |
+
+### Verification, every command executed and observed
+
+| Command | Result |
+|---|---|
+| `composer lint` | exit 0 |
+| `composer analyse` | `[OK] No errors`, level 8 |
+| `composer test` | OK — 336 tests, 602 assertions |
+| `composer test:integration` | OK — 743 tests, 1696 assertions, three identical consecutive runs |
+| `composer lint:plans` | exit 0 |
+| `composer generate:status-map` + `git diff --exit-code` | byte-identical |
+| `git diff --check` | clean |
+| Focused, all three findings | OK — 33 integration tests, 182 assertions, plus 20 DoH unit cases |
+
+### Upgrade note
+
+Schema `VERSION` is 2. `maybe_upgrade()` adds `ssl_removal_scope` to an existing
+installation through `dbDelta`; no data migration is required, because a null
+scope correctly means "no removal outstanding".
+
+No unresolved blocker.
+
 IMPLEMENTATION SESSION COMPLETE

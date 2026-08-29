@@ -576,3 +576,114 @@ mutating driver call outside `MutationGate`, no secrets, no attribution.
 `CteSubtreeAdapter` remains disabled and unwired, both as instructed.
 
 No unresolved blocker.
+
+---
+
+## 2026-08-29 — final runtime correction, three verified defects
+
+### 1. An unfinished SSL-only removal could never be resumed
+
+`DELETE /domains/{id}/ssl` on a `PENDING` or `TRANSIENT` provider answer wrote a
+future `deletion_next_attempt_at` and left `ssl_state` alone. The only selector,
+`DeletionSchedule::due()`, required `ssl_state = pending_removal` and always
+dispatched `DeletionService`. So an SSL-only removal was either invisible to cron
+forever, or — had it been visible — would have been finished by the wrong
+workflow and hard-deleted a domain whose operator asked only for its certificate
+to go.
+
+The two removals are now distinguished by a persisted column,
+`ssl_removal_scope`, with the values `mapping` and `resource` (`RemovalScope`).
+It is a column rather than an inference: both removals legitimately pass through
+the same `ssl_state` values, so the state cannot carry the answer, and the event
+log is a record of what happened, never an input to what happens next (§12.3).
+Schema `VERSION` is 2, so `maybe_upgrade()` adds the column on an existing site.
+
+- `DeletionService::request()` claims `mapping` in the same CAS that requests the
+  deletion — a CAS that only matches an unleased row, so an SSL-only removal in
+  flight cannot have the scope rewritten underneath it.
+- `SslResourceRemoval` claims `resource` inside its owner-pinned finalize CAS on
+  every unconfirmed outcome, and clears it along with the binding on `REMOVED`.
+- `DeletionSchedule::due()` selects on `ssl_removal_scope IS NOT NULL`, still
+  skipping every leased row, and `Ssl\CronWiring` dispatches on the row's own
+  scope to one of two services that share a single authorizer, lease and gate.
+- `SslResourceRemoval` refuses outright, `409`, on a row already claimed for
+  mapping deletion. Without that, a `DELETE /ssl` could quietly downgrade a
+  requested deletion into a keep and the operator would never learn the domain
+  stayed.
+
+Stale scope is handled by the machinery already in place rather than by a new
+check: the lease acquisition CAS pins the revision the sweep selected, so a row
+that moved since selection loses the CAS and no provider call is made.
+
+`Ssl\SslRemovalResumptionTest` — 9 tests, 37 assertions. Confirmed to be testing
+the fix: pointing the selector back at `ssl_state` makes 4 of them fail.
+
+### 2. A bounded continuation could never be scheduled
+
+`run_sweep()` asked `wp_next_scheduled( $continuation )` about the sweep's *own*
+hook. Once that hook carried a recurring event — which it has since the previous
+pass — the answer was always a timestamp, so the continuation was never
+scheduled and an over-budget batch simply waited for the next ordinary run, which
+is the thing a continuation exists to avoid. The old test cleared the recurring
+event first and therefore could not see this.
+
+Continuations now have hooks of their own, `<hook>_continue`. Each re-fires its
+sweep hook rather than calling a worker directly, so every listener runs again in
+its registered order — load-bearing for `pd_ssl_sweep`, where recovery holds the
+default priority and ordinary due work follows at 20.
+
+A bug was found while testing this: registering the continuations with a closure
+stacked a second listener on a second call, because `add_action` deduplicates on
+callback identity and every closure is a fresh identity. One continuation would
+then have fired the sweep twice. The handler is a named static method that
+derives its sweep hook from `current_action()`.
+
+The tests now leave the recurring event installed and assert the recurring event
+survives, exactly one one-off continuation appears about a minute out, a second
+unfinished run does not stack another, a completed batch schedules none, and the
+continuation re-fires the whole hook in priority order.
+
+### 3. Two endpoints on one resolver could corroborate each other
+
+`DohResolver` deduplicated by complete normalized URL, so
+`https://dns.google/resolve` and `https://dns.google/dns-query` counted as two
+independent resolvers. Independence is now keyed by **authority** — normalized
+host plus effective port — with path and query preserved in the request but not
+identity-bearing. The first spelling of a repeated authority is the one that
+votes; the rest are never requested. Below two distinct usable authorities the
+resolver returns `TRANSIENT` without sending any request, so quorum cannot be
+manufactured by observing side effects. 20 unit cases, asserting the number and
+targets of requests where the requirement is about not sending them.
+
+### Two test-isolation defects found and fixed along the way
+
+Neither is a production defect; both were tests that passed for the wrong reason.
+
+- `Rest\CollectionTest::test_the_namespace_is_absent_from_discovery_when_not_registered`
+  failed when run alone, at `84a95cf` as well as here. Under the harness the
+  site's own host *is* the primary host, so the plugin registered its routes
+  legitimately and the test never established the mapped host its premise
+  depends on. It now sets that host before firing `rest_api_init`. Full-suite
+  ordering had been masking it.
+- The two sweep test classes pin a primary host so their routes exist at all —
+  `Plugin` is a singleton, so an earlier class's host context would otherwise
+  decide whether the routes under test exist. Both restore a mapped host in
+  `tear_down` so the pin does not leak the other way.
+
+### Verification — every command executed, every result observed
+
+- `composer lint` — exit 0
+- `composer analyse` — `[OK] No errors`, PHPStan level 8
+- `composer test` — OK, 336 tests, 602 assertions
+- `composer test:integration` — OK, 743 tests, 1696 assertions, three identical consecutive runs
+- `composer lint:plans` — exit 0
+- `composer generate:status-map` then `git diff --exit-code` — byte-identical
+- `git diff --check` — clean
+- Focused: `SslRemovalResumptionTest|DeletionSweepTest|ScheduleTest` — OK, 33 tests, 182 assertions; `DohEndpointQuorumTest` — OK, 20 tests, 26 assertions
+- The `Rest|Ssl|Routing` subset, which was order-sensitive at `84a95cf`, is now green
+
+Invariants intact: one `DriverFactory::for_mapping()` caller, no mutating driver
+call outside `MutationGate`, no attribution in history. `GET /environment` is
+unchanged and `CteSubtreeAdapter` remains disabled and unwired.
+
+No unresolved blocker.

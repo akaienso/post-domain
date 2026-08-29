@@ -9,6 +9,8 @@ use PostDomain\Support\Schema;
 
 final class Schedule {
 
+	private const CONTINUATION_SUFFIX = '_continue';
+
 	public const HOOKS = array(
 		'pd_verify_pending'     => 900,
 		'pd_verify_established' => 3600,
@@ -124,6 +126,49 @@ final class Schedule {
 	}
 
 	/**
+	 * The one-off hook that carries an unfinished batch forward.
+	 *
+	 * A continuation must have a schedule identity of its own. Asking
+	 * `wp_next_scheduled()` about the sweep's own hook cannot work once that hook
+	 * carries a recurring event, because the answer is then always a timestamp
+	 * and the continuation is never scheduled — the batch simply waits for the
+	 * next ordinary run, which is exactly what the continuation exists to avoid.
+	 */
+	public static function continuation_hook( string $hook ): string {
+		return $hook . self::CONTINUATION_SUFFIX;
+	}
+
+	/**
+	 * Each continuation re-fires its own sweep hook rather than calling a worker
+	 * directly, so everything listening to that hook runs again in its registered
+	 * order. For `pd_ssl_sweep` that ordering is load-bearing: recovery holds the
+	 * default priority and ordinary due work follows at 20, and a continuation
+	 * that called only the second half would act on rows whose outcome recovery
+	 * has not established.
+	 */
+	public static function register_continuations(): void {
+		foreach ( array_keys( self::HOOKS ) as $hook ) {
+			// A named callback, not a closure: `add_action` deduplicates on the
+			// callback's identity, and every closure is a fresh identity. A second
+			// registration would otherwise stack a second listener and make one
+			// continuation fire the sweep twice.
+			add_action( self::continuation_hook( $hook ), array( self::class, 'run_continuation' ) );
+		}
+	}
+
+	/** Fires the sweep this continuation belongs to, derived from its own hook. */
+	public static function run_continuation(): void {
+		$hook  = (string) current_action();
+		$sweep = substr( $hook, 0, -strlen( self::CONTINUATION_SUFFIX ) );
+
+		if ( ! isset( self::HOOKS[ $sweep ] ) ) {
+			return;
+		}
+
+		do_action( $sweep );
+	}
+
+	/**
 	 * @param Mapping[]               $rows
 	 * @param callable(Mapping): void $work
 	 * @return int Rows processed.
@@ -141,9 +186,11 @@ final class Schedule {
 			}
 		}
 
-		if ( $processed < count( $rows ) && false === wp_next_scheduled( $continuation ) ) {
-			// One continuation, not a loop.
-			wp_schedule_single_event( time() + 60, $continuation );
+		$hook = self::continuation_hook( $continuation );
+
+		// One continuation, not a loop, and never for a batch that finished.
+		if ( $processed < count( $rows ) && false === wp_next_scheduled( $hook ) ) {
+			wp_schedule_single_event( time() + 60, $hook );
 		}
 
 		return $processed;

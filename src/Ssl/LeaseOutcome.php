@@ -31,6 +31,7 @@ final class LeaseOutcome {
 		'ssl_error',
 		'deletion_attempts',
 		'deletion_next_attempt_at',
+		'ssl_removal_scope',
 	);
 
 	/** @param array<string, string|int|null> $columns */
@@ -45,6 +46,17 @@ final class LeaseOutcome {
 	/** @param array<string, string|int|null> $columns */
 	public static function raw( array $columns ): self {
 		return new self( $columns );
+	}
+
+	/**
+	 * The same outcome with extra columns folded in, so a caller can add what
+	 * only it knows without rebuilding what a shared helper already decided.
+	 * The added columns go through the same allowlist.
+	 *
+	 * @param array<string, string|int|null> $columns
+	 */
+	public function with( array $columns ): self {
+		return new self( array_merge( $this->columns, $columns ) );
 	}
 
 	public static function state( SslState $state ): self {
