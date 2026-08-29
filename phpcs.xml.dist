@@ -1,0 +1,55 @@
+<?xml version="1.0"?>
+<ruleset name="post-domain">
+	<file>src</file>
+	<file>post-domain.php</file>
+	<file>tests</file>
+	<exclude-pattern>*/vendor/*</exclude-pattern>
+	<exclude-pattern>*/node_modules/*</exclude-pattern>
+	<!--
+		A generated artifact: its bytes must equal `composer generate:status-map`
+		output exactly, which a formatter would silently break.
+	-->
+	<exclude-pattern>references/cloudflare-status-map.php</exclude-pattern>
+	<rule ref="WordPress-Extra">
+		<!--
+			The project is PSR-4 (composer.json "autoload"), so class files are
+			StudlyCase and directories mirror namespaces. WordPress's own
+			hyphenated-lowercase file naming cannot coexist with that; the
+			autoloader, not a filename convention, is what finds a class here.
+		-->
+		<exclude name="WordPress.Files.FileName"/>
+	</rule>
+	<!--
+		Tests and developer tools read local fixture files with file_get_contents().
+		wp_remote_get() is for remote URLs and is not available in the unit suite,
+		which bootstraps Composer only.
+	-->
+	<rule ref="WordPress.WP.AlternativeFunctions.file_get_contents_file_get_contents">
+		<exclude-pattern>tests/*</exclude-pattern>
+		<exclude-pattern>bin/*</exclude-pattern>
+	</rule>
+	<!--
+		The same applies to writing and to shelling out: developer tools and tests
+		run under PHP directly, never inside a request, and WP_Filesystem is not
+		loaded there. Neither exclusion reaches src/.
+	-->
+	<rule ref="WordPress.WP.AlternativeFunctions.file_system_operations_file_put_contents">
+		<exclude-pattern>tests/*</exclude-pattern>
+		<exclude-pattern>bin/*</exclude-pattern>
+	</rule>
+	<rule ref="WordPress.PHP.DiscouragedPHPFunctions.system_calls_shell_exec">
+		<exclude-pattern>tests/*</exclude-pattern>
+		<exclude-pattern>bin/*</exclude-pattern>
+	</rule>
+
+	<!--
+		An exception message is not output. It reaches a log or a developer, never
+		a page, and escaping it would corrupt the diagnostic.
+	-->
+	<rule ref="WordPress-Extra">
+		<exclude name="WordPress.Security.EscapeOutput.ExceptionNotEscaped"/>
+	</rule>
+
+	<config name="minimum_supported_wp_version" value="6.4"/>
+	<config name="testVersion" value="8.1-"/>
+</ruleset>

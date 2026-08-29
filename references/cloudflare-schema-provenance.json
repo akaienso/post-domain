@@ -1,0 +1,8 @@
+{
+  "api_version": "4.0.0",
+  "extraction": "jq .paths[\"/zones/{zone_id}/custom_hostnames\"].get.parameters[] | select(.name==\"hostname_status\" or .name==\"ssl_status\") | .schema.enum",
+  "file": "cloudflare-api-schema.2026-08-27.json",
+  "retrieved_at": "2026-08-28T10:28:15Z",
+  "sha256": "5593002e5363b81469715d815e4dd04005aa3700f0b08baf8de9cd09f927b22a",
+  "source_url": "https://raw.githubusercontent.com/cloudflare/api-schemas/main/openapi.json"
+}

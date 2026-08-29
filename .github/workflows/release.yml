@@ -1,0 +1,150 @@
+name: Release plugin
+
+on:
+  release:
+    types:
+      - published
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to package, such as v0.1.0
+        required: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build downloadable plugin release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.event.release.tag_name || github.ref }}
+
+      - name: Set up PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.1'
+          coverage: none
+
+      - name: Read plugin version
+        id: plugin
+        shell: bash
+        run: |
+          if [[ -n "${{ inputs.tag }}" ]]; then
+            TAG="${{ inputs.tag }}"
+            VERSION="${TAG#v}"
+          elif [[ "${{ github.event_name }}" == "release" ]]; then
+            TAG="${{ github.event.release.tag_name }}"
+            VERSION="${TAG#v}"
+          else
+            VERSION="$(grep -m1 '^[[:space:]]*\* Version:' post-domain.php | sed -E 's/.*Version:[[:space:]]*//')"
+            TAG="v$VERSION"
+          fi
+
+          if [[ -z "$VERSION" ]]; then
+            echo "Could not determine plugin version" >&2
+            exit 1
+          fi
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "zip=post-domain-$VERSION.zip" >> "$GITHUB_OUTPUT"
+          echo "Building release $TAG."
+
+      - name: Verify the plugin header matches the tag
+        shell: bash
+        env:
+          VERSION: ${{ steps.plugin.outputs.version }}
+        run: |
+          HEADER="$(grep -m1 '^[[:space:]]*\* Version:' post-domain.php | sed -E 's/.*Version:[[:space:]]*//')"
+
+          if [[ "$HEADER" != "$VERSION" ]]; then
+            echo "Plugin header is $HEADER but the tag says $VERSION." >&2
+            echo "Release Please updates the header; a mismatch means the tag was not built from its own release commit." >&2
+            exit 1
+          fi
+
+          echo "Plugin header and tag agree on $VERSION."
+
+      - name: Build plugin ZIP
+        shell: bash
+        env:
+          VERSION: ${{ steps.plugin.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          PLUGIN_SLUG="post-domain"
+          BUILD_DIR="$RUNNER_TEMP/plugin-release"
+          PACKAGE_DIR="$BUILD_DIR/$PLUGIN_SLUG"
+
+          rm -rf "$BUILD_DIR"
+          mkdir -p "$PACKAGE_DIR"
+
+          # Runtime only. Everything not copied here is development material:
+          # tests/, docs/, bin/, tools/, .github/, node_modules/, tmp/, and the
+          # PHPUnit, PHPStan, PHPCS and wp-env configuration.
+          cp post-domain.php uninstall.php README.md LICENSE composer.json composer.lock "$PACKAGE_DIR/"
+          cp -R src assets references "$PACKAGE_DIR/"
+
+          # Production dependencies only, resolved from the committed lock file
+          # so the archive matches what was tested.
+          composer install \
+            --working-dir="$PACKAGE_DIR" \
+            --no-dev \
+            --optimize-autoloader \
+            --no-interaction \
+            --no-progress
+
+          if [[ ! -f "$PACKAGE_DIR/vendor/autoload.php" ]]; then
+            echo "vendor/autoload.php is missing; the package would fatal on activation." >&2
+            exit 1
+          fi
+
+          # A development dependency in the archive means --no-dev did not take.
+          for DEV in phpunit phpstan squizlabs wp-coding-standards yoast dealerdirect; do
+            if compgen -G "$PACKAGE_DIR/vendor/*$DEV*" > /dev/null; then
+              echo "Development dependency '$DEV' leaked into the package." >&2
+              exit 1
+            fi
+          done
+
+          find "$PACKAGE_DIR" -name '.DS_Store' -delete
+
+          cd "$BUILD_DIR"
+          zip -rq "$GITHUB_WORKSPACE/$PLUGIN_SLUG-$VERSION.zip" "$PLUGIN_SLUG"
+
+          cd "$GITHUB_WORKSPACE"
+          echo "Archive contents, top level:"
+          unzip -Z1 "$PLUGIN_SLUG-$VERSION.zip" | cut -d/ -f1 | sort -u
+
+          # Exactly one top-level directory, and it must be the plugin slug.
+          TOP_LEVEL="$(unzip -Z1 "$PLUGIN_SLUG-$VERSION.zip" | cut -d/ -f1 | sort -u)"
+
+          if [[ "$TOP_LEVEL" != "$PLUGIN_SLUG" ]]; then
+            echo "Archive must contain exactly one top-level directory named $PLUGIN_SLUG." >&2
+            exit 1
+          fi
+
+      - name: Upload release ZIP
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.plugin.outputs.tag }}
+          ZIP_FILE: ${{ steps.plugin.outputs.zip }}
+        shell: bash
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            if gh release view "$TAG" --json assets --jq ".assets[].name" | grep -Fx "$ZIP_FILE" >/dev/null; then
+              echo "Release $TAG already has $ZIP_FILE; existing release assets are never replaced."
+              exit 0
+            fi
+
+            echo "Release $TAG exists but $ZIP_FILE is missing; uploading without replacing existing assets."
+            gh release upload "$TAG" "$ZIP_FILE"
+          else
+            echo "Release $TAG does not exist. Let Release Please create the release before packaging assets." >&2
+            exit 1
+          fi

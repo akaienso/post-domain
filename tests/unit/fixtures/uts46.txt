@@ -1,0 +1,9 @@
+# Fixed UTS-46 vectors. A change here is a deliberate behaviour change.
+münchen.example;xn--mnchen-3ya.example
+xn--mnchen-3ya.example;xn--mnchen-3ya.example
+Bücher.example;xn--bcher-kva.example
+example.com;example.com
+EXAMPLE.COM;example.com
+faß.example;xn--fa-hia.example
+日本.example;xn--wgv71a.example
+xn--wgv71a.example;xn--wgv71a.example

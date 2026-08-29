@@ -1,0 +1,12 @@
+includes:
+	- vendor/szepeviktor/phpstan-wordpress/extension.neon
+
+parameters:
+	level: 8
+	# Analyse against the version floor the plugin declares, not the version the
+	# developer happens to run. Without this, an 8.2-only construct passes on a
+	# newer local PHP and fails on a supported one.
+	phpVersion: 80100
+	paths:
+		- src
+		- post-domain.php

@@ -1,0 +1,3075 @@
+# post-domain 02 — Data model and repository Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Two tables, every row invariant enforced at one write path, compare-and-swap
+writes, the three independent state machines, alias rules, and an uninstall that
+leaves posts untouched.
+
+**Architecture:** `Schema` owns DDL and the schema-version option. `DbRepository`
+is the only code that touches `pd_domains`, so PHP enforces the invariants that
+`CHECK` constraints cannot express portably across MySQL 5.7, 8, and MariaDB.
+Ownership provenance is first-class column state; the event log is written but
+never read by a decision.
+
+**Tech Stack:** As Plan 01, plus `dbDelta()` and `$wpdb`.
+
+**Spec:** `docs/superpowers/specs/2026-08-27-post-domain-design.md`
+
+## Global Constraints
+
+Inherit every constraint from Plan 01, and add:
+
+- **UTC everywhere.** Every `DATETIME` is written with `gmdate( 'Y-m-d H:i:s' )`.
+  `current_time()` is never called (spec §12.4).
+- **`DbRepository::save()` is the only write path to `pd_domains`** (spec §12.1).
+- **Events are audit-only.** No authorization, routing, or state transition ever
+  reads `pd_domain_events` (spec §12.3).
+- **The durable provider binding moves as one:** `ssl_provider`,
+  `ssl_provider_environment`, `ssl_ref`, `ssl_ownership_origin`, and
+  `ssl_owner_installation_id` are all null or all populated. A row keeping a
+  provider without the rest is exactly the shape that lets a later read resolve
+  from current configuration (spec §12.6).
+- **Ownership authority is `ssl_ownership_origin IS NOT NULL` AND
+  `ssl_owner_installation_id === pd_installation_id`.** There is no boolean
+  duplicating it (spec §12.2).
+- **`host` is `VARCHAR(230)`** — `253 − 22 − 1`, the TXT-name constraint made
+  structural (spec §12.1).
+- `host` and `challenge` are `CHARACTER SET ascii COLLATE ascii_bin` (spec §12.1).
+
+---
+
+## File map
+
+| File | Responsibility |
+|---|---|
+| `src/Support/Schema.php` | DDL, schema version, engine probe, install and upgrade |
+| `src/Mapping/VerificationState.php` | Enum plus its legal transitions |
+| `src/Mapping/ActivationState.php` | Enum plus its legal transitions |
+| `src/Mapping/SslState.php` | Enum plus its legal transitions |
+| `src/Mapping/OwnershipOrigin.php` | `created` / `adopted` |
+| `src/Ssl/MutationKind.php` | `create` / `adopt` / `method` / `remove` |
+| `src/Ssl/MutationPhase.php` | `reserved` / `in_flight` / `recovering` |
+| `src/Mapping/Mapping.php` | Readonly row value object |
+| `src/Contracts/MappingRepository.php` | The repository interface everything else depends on |
+| `src/Mapping/DbRepository.php` | The single write path; CAS; invariant enforcement |
+| `src/Mapping/AliasResolver.php` | Alias rules and canonical-host derivation |
+| `src/Mapping/EventLog.php` | Append-only audit writer |
+| `src/Contracts/Clock.php` | `now(): DateTimeImmutable` |
+| `src/Contracts/Scheduler.php` | Cron scheduling, injected for testability |
+| `src/Contracts/HttpClient.php` | Outbound HTTP, injected for testability |
+| `uninstall.php` | Drops both tables and the plugin's own options only |
+| `tests/integration/Mapping/*Test.php` | Repository behaviour against real MySQL |
+| `tests/unit/Mapping/*Test.php` | Enums and transition tables |
+
+---
+
+### Task 1: State enums and their transition tables
+
+**Files:**
+- Create: `src/Mapping/VerificationState.php`, `src/Mapping/ActivationState.php`, `src/Mapping/SslState.php`, `src/Mapping/OwnershipOrigin.php`, `src/Ssl/MutationKind.php`, `src/Ssl/MutationPhase.php`
+- Test: `tests/unit/Mapping/StateTransitionTest.php`
+
+**Interfaces:**
+- Consumes: nothing.
+- Produces: six backed string enums, each with `::from( string )` from PHP, plus
+  `VerificationState::can_transition_to( self $to ): bool`,
+  `ActivationState::can_transition_to( self $to ): bool`,
+  `SslState::can_transition_to( self $to ): bool`.
+
+The three states are independent. Only verification and activation gate serving,
+and only by AND (spec §12.7).
+
+- [ ] **Step 1: Write the failing test**
+
+Create `tests/unit/Mapping/StateTransitionTest.php`:
+
+```php
+<?php
+declare( strict_types = 1 );
+
+namespace PostDomain\Tests\Unit\Mapping;
+
+use PHPUnit\Framework\TestCase;
+use PostDomain\Mapping\ActivationState;
+use PostDomain\Mapping\OwnershipOrigin;
+use PostDomain\Mapping\SslState;
+use PostDomain\Mapping\VerificationState;
+use PostDomain\Ssl\MutationKind;
+use PostDomain\Ssl\MutationPhase;
+
+final class StateTransitionTest extends TestCase {
+
+	public function test_verification_values(): void {
+		$this->assertSame(
+			array( 'unverified', 'pending', 'verified', 'failed' ),
+			array_map( static fn( VerificationState $s ): string => $s->value, VerificationState::cases() )
+		);
+	}
+
+	public function test_verification_legal_transitions(): void {
+		$this->assertTrue( VerificationState::UNVERIFIED->can_transition_to( VerificationState::PENDING ) );
+		$this->assertTrue( VerificationState::PENDING->can_transition_to( VerificationState::VERIFIED ) );
+		$this->assertTrue( VerificationState::PENDING->can_transition_to( VerificationState::FAILED ) );
+		$this->assertTrue( VerificationState::VERIFIED->can_transition_to( VerificationState::FAILED ) );
+		$this->assertTrue( VerificationState::FAILED->can_transition_to( VerificationState::PENDING ) );
+	}
+
+	public function test_rotation_can_reach_unverified_from_anywhere(): void {
+		foreach ( VerificationState::cases() as $state ) {
+			$this->assertTrue(
+				$state->can_transition_to( VerificationState::UNVERIFIED ),
+				"rotation must reset {$state->value} to unverified"
+			);
+		}
+	}
+
+	public function test_verification_illegal_transitions(): void {
+		$this->assertFalse( VerificationState::UNVERIFIED->can_transition_to( VerificationState::VERIFIED ) );
+		$this->assertFalse( VerificationState::FAILED->can_transition_to( VerificationState::VERIFIED ) );
+	}
+
+	public function test_activation_toggles_both_ways(): void {
+		$this->assertTrue( ActivationState::INACTIVE->can_transition_to( ActivationState::ACTIVE ) );
+		$this->assertTrue( ActivationState::ACTIVE->can_transition_to( ActivationState::INACTIVE ) );
+	}
+
+	public function test_ssl_states_include_pending_removal(): void {
+		$this->assertSame(
+			array( 'none', 'requested', 'pending_validation', 'active', 'failed', 'pending_removal', 'revoked' ),
+			array_map( static fn( SslState $s ): string => $s->value, SslState::cases() )
+		);
+	}
+
+	public function test_ssl_legal_transitions(): void {
+		$this->assertTrue( SslState::NONE->can_transition_to( SslState::REQUESTED ) );
+		$this->assertTrue( SslState::NONE->can_transition_to( SslState::ACTIVE ) );
+		$this->assertTrue( SslState::REQUESTED->can_transition_to( SslState::PENDING_VALIDATION ) );
+		$this->assertTrue( SslState::PENDING_VALIDATION->can_transition_to( SslState::ACTIVE ) );
+		$this->assertTrue( SslState::ACTIVE->can_transition_to( SslState::PENDING_REMOVAL ) );
+		$this->assertTrue( SslState::PENDING_REMOVAL->can_transition_to( SslState::REVOKED ) );
+		$this->assertTrue( SslState::REVOKED->can_transition_to( SslState::REQUESTED ) );
+	}
+
+	public function test_revoked_is_only_reachable_from_pending_removal(): void {
+		foreach ( SslState::cases() as $state ) {
+			if ( SslState::PENDING_REMOVAL === $state || SslState::REVOKED === $state ) {
+				continue;
+			}
+
+			$this->assertFalse(
+				$state->can_transition_to( SslState::REVOKED ),
+				"{$state->value} must not reach revoked directly"
+			);
+		}
+	}
+
+	public function test_supporting_enum_values(): void {
+		$this->assertSame( array( 'created', 'adopted' ), array_map(
+			static fn( OwnershipOrigin $o ): string => $o->value,
+			OwnershipOrigin::cases()
+		) );
+		$this->assertSame( array( 'create', 'adopt', 'method', 'remove' ), array_map(
+			static fn( MutationKind $k ): string => $k->value,
+			MutationKind::cases()
+		) );
+		$this->assertSame( array( 'reserved', 'in_flight', 'recovering' ), array_map(
+			static fn( MutationPhase $p ): string => $p->value,
+			MutationPhase::cases()
+		) );
+	}
+}
+```
+
+- [ ] **Step 2: Run the test to verify it fails**
+
+Run: `vendor/bin/phpunit --testsuite unit --filter StateTransitionTest`
+Expected: FAIL — `Error: Enum "PostDomain\Mapping\VerificationState" not found`
+
+- [ ] **Step 3: Write minimal implementation**
+
+Create `src/Mapping/VerificationState.php`:
+
+```php
+<?php
+declare( strict_types = 1 );
+
+namespace PostDomain\Mapping;
+
+enum VerificationState: string {
+	case UNVERIFIED = 'unverified';
+	case PENDING    = 'pending';
+	case VERIFIED   = 'verified';
+	case FAILED     = 'failed';
+
+	public function can_transition_to( self $to ): bool {
+		// Rotating the challenge resets any state to unverified.
+		if ( self::UNVERIFIED === $to ) {
+			return true;
+		}
+
+		return match ( $this ) {
+			self::UNVERIFIED => self::PENDING === $to,
+			self::PENDING    => in_array( $to, array( self::PENDING, self::VERIFIED, self::FAILED ), true ),
+			self::VERIFIED   => in_array( $to, array( self::VERIFIED, self::FAILED ), true ),
+			self::FAILED     => self::PENDING === $to,
+		};
+	}
+}
+```
+
+Create `src/Mapping/ActivationState.php`:
+
+```php
+<?php
+declare( strict_types = 1 );
+
+namespace PostDomain\Mapping;
+
+enum ActivationState: string {
+	case INACTIVE = 'inactive';
+	case ACTIVE   = 'active';
+
+	public function can_transition_to( self $to ): bool {
+		unset( $to );
+
+		return true;
+	}
+}
+```
+
+Create `src/Mapping/SslState.php`:
+
+```php
+<?php
+declare( strict_types = 1 );
+
+namespace PostDomain\Mapping;
+
+enum SslState: string {
+	case NONE               = 'none';
+	case REQUESTED          = 'requested';
+	case PENDING_VALIDATION = 'pending_validation';
+	case ACTIVE             = 'active';
+	case FAILED             = 'failed';
+	case PENDING_REMOVAL    = 'pending_removal';
+	case REVOKED            = 'revoked';
+
+	public function can_transition_to( self $to ): bool {
+		if ( self::REVOKED === $to ) {
+			return self::PENDING_REMOVAL === $this || self::REVOKED === $this;
+		}
+
+		if ( self::PENDING_REMOVAL === $to ) {
+			return in_array(
+				$this,
+				array( self::REQUESTED, self::PENDING_VALIDATION, self::ACTIVE, self::FAILED, self::PENDING_REMOVAL ),
+				true
+			);
+		}
+
+		if ( self::FAILED === $to ) {
+			return true;
+		}
+
+		return match ( $this ) {
+			self::NONE               => in_array( $to, array( self::NONE, self::REQUESTED, self::ACTIVE ), true ),
+			self::REQUESTED          => in_array( $to, array( self::REQUESTED, self::PENDING_VALIDATION, self::ACTIVE ), true ),
+			self::PENDING_VALIDATION => in_array( $to, array( self::PENDING_VALIDATION, self::ACTIVE ), true ),
+			self::ACTIVE             => self::ACTIVE === $to,
+			self::PENDING_REMOVAL    => false,
+			self::REVOKED            => self::REQUESTED === $to,
+		};
+	}
+}
+```
+
+Create `src/Mapping/OwnershipOrigin.php`:
+
+```php
+<?php
+declare( strict_types = 1 );
+
+namespace PostDomain\Mapping;
+
+enum OwnershipOrigin: string {
+	case CREATED = 'created';
+	case ADOPTED = 'adopted';
+}
+```
+
+Create `src/Ssl/MutationKind.php`:
+
+```php
+<?php
+declare( strict_types = 1 );
+
+namespace PostDomain\Ssl;
+
+enum MutationKind: string {
+	case CREATE = 'create';
+	case ADOPT  = 'adopt';
+	case METHOD = 'method';
+	case REMOVE = 'remove';
+}
+```
+
+Create `src/Ssl/MutationPhase.php`:
+
+```php
+<?php
+declare( strict_types = 1 );
+
+namespace PostDomain\Ssl;
+
+enum MutationPhase: string {
+	case RESERVED   = 'reserved';
+	case IN_FLIGHT  = 'in_flight';
+	case RECOVERING = 'recovering';
+}
+```
+
+- [ ] **Step 4: Run the test to verify it passes**
+
+Run: `vendor/bin/phpunit --testsuite unit --filter StateTransitionTest`
+Expected: PASS — 9 tests
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/Mapping/VerificationState.php src/Mapping/ActivationState.php src/Mapping/SslState.php src/Mapping/OwnershipOrigin.php src/Ssl/MutationKind.php src/Ssl/MutationPhase.php tests/unit/Mapping/StateTransitionTest.php
+git commit -m "Model the three independent states and their legal transitions
+
+Revoked is reachable only from pending_removal: revoked means a removal we asked
+for, and a resource that simply vanished at the provider is a failure with its
+own code, not a revocation."
+```
+
+---
+
+### Task 2: Schema install and upgrade
+
+**Files:**
+- Create: `src/Support/Schema.php`
+- Test: `tests/integration/Support/SchemaTest.php`
+
+**Interfaces:**
+- Consumes: nothing.
+- Produces: `PostDomain\Support\Schema::VERSION` (int), `::install(): void`,
+  `::maybe_upgrade(): void`, `::domains_table(): string`, `::events_table(): string`,
+  `::engine(): string`.
+
+- [ ] **Step 1: Write the failing test**
+
+Create `tests/integration/Support/SchemaTest.php`:
+
+```php
+<?php
+declare( strict_types = 1 );
+
+namespace PostDomain\Tests\Integration\Support;
+
+use PostDomain\Support\Schema;
+use WP_UnitTestCase;
+
+final class SchemaTest extends WP_UnitTestCase {
+
+	public function set_up(): void {
+		parent::set_up();
+		Schema::install();
+	}
+
+	/** @return string[] */
+	private function columns( string $table ): array {
+		global $wpdb;
+
+		/** @var string[] $names */
+		$names = $wpdb->get_col( "SHOW COLUMNS FROM {$table}" ); // phpcs:ignore WordPress.DB
+
+		return $names;
+	}
+
+	public function test_both_tables_exist(): void {
+		global $wpdb;
+
+		foreach ( array( Schema::domains_table(), Schema::events_table() ) as $table ) {
+			$this->assertSame(
+				$table,
+				$wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $table ) )
+			);
+		}
+	}
+
+	public function test_the_domains_table_carries_every_specified_column(): void {
+		$columns = $this->columns( Schema::domains_table() );
+
+		foreach (
+			array(
+				'id', 'host', 'alias_of', 'post_id', 'revision',
+				'verification_state', 'activation_state', 'ssl_state', 'integrity_error',
+				'challenge', 'challenge_label', 'challenge_rotated_at', 'verified_at',
+				'last_checked_at', 'last_outcome', 'hard_failure_count', 'transient_failure_count',
+				'verification_deadline', 'verify_next_attempt_at', 'verify_lease_token',
+				'verify_lease_expires_at', 'resolver_class',
+				'ssl_provider', 'ssl_ref', 'ssl_ownership_origin', 'ssl_owner_installation_id',
+				'ssl_adopted_at', 'ssl_adopted_by', 'ssl_method', 'ssl_method_requested_at',
+				'ssl_provider_environment', 'ssl_marker_support', 'ssl_checked_at', 'ssl_next_attempt_at',
+				'ssl_transient_count', 'ssl_provider_state', 'ssl_error',
+				'ssl_mutation_token', 'ssl_mutation_kind', 'ssl_mutation_phase',
+				'ssl_mutation_expires_at', 'ssl_mutation_driver', 'ssl_mutation_environment',
+				'deletion_requested_at', 'deletion_attempts', 'deletion_next_attempt_at',
+				'title', 'favicon_attachment_id', 'created_at', 'updated_at', 'created_by',
+			) as $column
+		) {
+			$this->assertContains( $column, $columns, "missing column {$column}" );
+		}
+	}
+
+	public function test_host_is_230_bytes_of_ascii_bin(): void {
+		global $wpdb;
+
+		$row = $wpdb->get_row(
+			$wpdb->prepare(
+				'SELECT CHARACTER_MAXIMUM_LENGTH AS len, COLLATION_NAME AS collation
+				 FROM INFORMATION_SCHEMA.COLUMNS
+				 WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s AND COLUMN_NAME = %s',
+				Schema::domains_table(),
+				'host'
+			),
+			ARRAY_A
+		);
+
+		$this->assertSame( '230', (string) $row['len'] );
+		$this->assertSame( 'ascii_bin', $row['collation'] );
+	}
+
+	public function test_host_and_challenge_are_unique(): void {
+		global $wpdb;
+
+		/** @var array<int, array<string, string>> $indexes */
+		$indexes = $wpdb->get_results( 'SHOW INDEX FROM ' . Schema::domains_table(), ARRAY_A ); // phpcs:ignore WordPress.DB
+		$unique  = array();
+
+		foreach ( $indexes as $index ) {
+			if ( '0' === (string) $index['Non_unique'] ) {
+				$unique[] = $index['Key_name'];
+			}
+		}
+
+		$this->assertContains( 'host', $unique );
+		$this->assertContains( 'challenge', $unique );
+	}
+
+	public function test_installing_twice_is_idempotent(): void {
+		Schema::install();
+		Schema::install();
+
+		$this->assertCount( 49, $this->columns( Schema::domains_table() ) );
+	}
+
+	public function test_the_schema_version_is_recorded(): void {
+		$this->assertSame( Schema::VERSION, (int) get_option( 'pd_schema_version' ) );
+	}
+
+	public function test_the_engine_is_recorded(): void {
+		$this->assertNotSame( '', Schema::engine() );
+	}
+}
+```
+
+- [ ] **Step 2: Run the test to verify it fails**
+
+Run: `composer test:integration -- --filter SchemaTest`
+Expected: FAIL — `Error: Class "PostDomain\Support\Schema" not found`
+
+- [ ] **Step 3: Write minimal implementation**
+
+Create `src/Support/Schema.php`:
+
+```php
+<?php
+declare( strict_types = 1 );
+
+namespace PostDomain\Support;
+
+final class Schema {
+
+	public const VERSION = 1;
+
+	public static function domains_table(): string {
+		global $wpdb;
+
+		return $wpdb->prefix . 'pd_domains';
+	}
+
+	public static function events_table(): string {
+		global $wpdb;
+
+		return $wpdb->prefix . 'pd_domain_events';
+	}
+
+	public static function install(): void {
+		global $wpdb;
+
+		require_once ABSPATH . 'wp-admin/includes/upgrade.php';
+
+		$charset = $wpdb->get_charset_collate();
+		$domains = self::domains_table();
+		$events  = self::events_table();
+
+		dbDelta(
+			"CREATE TABLE {$domains} (
+				id bigint(20) unsigned NOT NULL AUTO_INCREMENT,
+				host varchar(230) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+				alias_of bigint(20) unsigned NULL,
+				post_id bigint(20) unsigned NULL,
+				revision int(10) unsigned NOT NULL DEFAULT 1,
+				verification_state varchar(20) NOT NULL DEFAULT 'unverified',
+				activation_state varchar(20) NOT NULL DEFAULT 'inactive',
+				ssl_state varchar(20) NOT NULL DEFAULT 'none',
+				integrity_error varchar(60) NULL,
+				challenge char(32) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+				challenge_label varchar(63) NOT NULL,
+				challenge_rotated_at datetime NULL,
+				verified_at datetime NULL,
+				last_checked_at datetime NULL,
+				last_outcome varchar(20) NULL,
+				hard_failure_count smallint(5) unsigned NOT NULL DEFAULT 0,
+				transient_failure_count smallint(5) unsigned NOT NULL DEFAULT 0,
+				verification_deadline datetime NULL,
+				verify_next_attempt_at datetime NULL,
+				verify_lease_token char(32) NULL,
+				verify_lease_expires_at datetime NULL,
+				resolver_class varchar(191) NULL,
+				ssl_provider varchar(60) NULL,
+				ssl_ref varchar(191) NULL,
+				ssl_ownership_origin varchar(10) NULL,
+				ssl_owner_installation_id char(36) NULL,
+				ssl_adopted_at datetime NULL,
+				ssl_adopted_by bigint(20) unsigned NULL,
+				ssl_method varchar(10) NULL,
+				ssl_method_requested_at datetime NULL,
+				ssl_marker_support varchar(20) NULL,
+				ssl_checked_at datetime NULL,
+				ssl_next_attempt_at datetime NULL,
+				ssl_transient_count smallint(5) unsigned NOT NULL DEFAULT 0,
+				ssl_provider_state text NULL,
+				ssl_error text NULL,
+				ssl_mutation_token char(32) NULL,
+				ssl_mutation_kind varchar(20) NULL,
+				ssl_mutation_phase varchar(20) NULL,
+				ssl_mutation_expires_at datetime NULL,
+				ssl_provider_environment varchar(190) NULL,
+				ssl_mutation_driver varchar(60) NULL,
+				ssl_mutation_environment varchar(190) NULL,
+				deletion_requested_at datetime NULL,
+				deletion_attempts smallint(5) unsigned NOT NULL DEFAULT 0,
+				deletion_next_attempt_at datetime NULL,
+				title varchar(255) NULL,
+				favicon_attachment_id bigint(20) unsigned NULL,
+				created_at datetime NOT NULL,
+				updated_at datetime NOT NULL,
+				created_by bigint(20) unsigned NULL,
+				PRIMARY KEY  (id),
+				UNIQUE KEY host (host),
+				UNIQUE KEY challenge (challenge),
+				KEY post_id (post_id),
+				KEY alias_of (alias_of),
+				KEY verify_due (verification_state, verify_next_attempt_at),
+				KEY ssl_due (ssl_state, ssl_next_attempt_at),
+				KEY deletion_due (deletion_next_attempt_at),
+				KEY ssl_lease (ssl_mutation_expires_at)
+			) {$charset} ENGINE=InnoDB"
+		);
+
+		dbDelta(
+			"CREATE TABLE {$events} (
+				id bigint(20) unsigned NOT NULL AUTO_INCREMENT,
+				domain_id bigint(20) unsigned NOT NULL,
+				host varchar(230) NOT NULL,
+				type varchar(40) NOT NULL,
+				from_state varchar(20) NULL,
+				to_state varchar(20) NULL,
+				actor varchar(60) NULL,
+				detail longtext NULL,
+				created_at datetime NOT NULL,
+				PRIMARY KEY  (id),
+				KEY domain_created (domain_id, created_at)
+			) {$charset} ENGINE=InnoDB"
+		);
+
+		update_option( 'pd_schema_version', self::VERSION, false );
+		update_option( 'pd_schema_engine', self::probe_engine(), false );
+	}
+
+	public static function maybe_upgrade(): void {
+		if ( (int) get_option( 'pd_schema_version', 0 ) === self::VERSION ) {
+			return;
+		}
+
+		self::install();
+	}
+
+	public static function engine(): string {
+		return (string) get_option( 'pd_schema_engine', '' );
+	}
+
+	private static function probe_engine(): string {
+		global $wpdb;
+
+		$engine = $wpdb->get_var(
+			$wpdb->prepare(
+				'SELECT ENGINE FROM INFORMATION_SCHEMA.TABLES
+				 WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s',
+				self::domains_table()
+			)
+		);
+
+		return null === $engine ? 'unknown' : (string) $engine;
+	}
+}
+```
+
+- [ ] **Step 4: Run the test to verify it passes**
+
+Run: `composer test:integration -- --filter SchemaTest`
+Expected: PASS — 7 tests
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/Support/Schema.php tests/integration/Support/SchemaTest.php
+git commit -m "Create the domains and events tables
+
+host is 230 bytes because the composed TXT record name must fit 253 and the
+default label costs 23. The limit is structural rather than a runtime check."
+```
+
+---
+
+### Task 3: The mapping value object and repository reads
+
+**Files:**
+- Create: `src/Mapping/Mapping.php`, `src/Contracts/MappingRepository.php`, `src/Mapping/DbRepository.php`
+- Test: `tests/integration/Mapping/RepositoryReadTest.php`
+
+**Interfaces:**
+- Consumes: `Schema` (Task 2), the enums (Task 1).
+- Produces:
+  - `PostDomain\Mapping\Mapping` — readonly, with `int $id`, `string $host`, `?int $alias_of`, `?int $post_id`, `int $revision`, `VerificationState $verification_state`, `ActivationState $activation_state`, `SslState $ssl_state`, `?string $integrity_error`, `string $challenge`, `string $challenge_label`, `?OwnershipOrigin $ssl_ownership_origin`, `?string $ssl_owner_installation_id`, `?string $ssl_provider`, `?string $ssl_provider_environment`, `?string $ssl_ref`, `?string $ssl_method`, `?string $ssl_mutation_token`, `?MutationKind $ssl_mutation_kind`, `?MutationPhase $ssl_mutation_phase`, `?string $ssl_mutation_expires_at`, `?string $ssl_mutation_driver`, `?string $ssl_mutation_environment`, `?string $ssl_next_attempt_at`, `int $ssl_transient_count`, `?string $ssl_adopted_at`, `?int $ssl_adopted_by`.
+
+  `ssl_next_attempt_at` and `ssl_transient_count` are **readable but not
+  writable through `save()`** — they are scheduling state owned by the
+  verification and lease CAS writers. A `save()` that carried them would let an
+  ordinary update silently reset a backoff someone else is honouring.
+  - `PostDomain\Contracts\MappingRepository` with `by_host( string $ascii_host ): ?Mapping`, `by_id( int $id ): ?Mapping`, `all( array $args = array() ): array`, `save( Mapping $m ): Mapping`, `delete( int $id ): void`.
+  - `PostDomain\Mapping\DbRepository` implementing it.
+
+- [ ] **Step 1: Write the failing test**
+
+Create `tests/integration/Mapping/RepositoryReadTest.php`:
+
+```php
+<?php
+declare( strict_types = 1 );
+
+namespace PostDomain\Tests\Integration\Mapping;
+
+use PostDomain\Mapping\ActivationState;
+use PostDomain\Mapping\DbRepository;
+use PostDomain\Mapping\VerificationState;
+use PostDomain\Support\Schema;
+use WP_UnitTestCase;
+
+final class RepositoryReadTest extends WP_UnitTestCase {
+
+	private DbRepository $repo;
+
+	public function set_up(): void {
+		parent::set_up();
+		Schema::install();
+		$this->repo = new DbRepository();
+	}
+
+	private function seed( string $host, int $post_id ): int {
+		global $wpdb;
+
+		$wpdb->insert( // phpcs:ignore WordPress.DB
+			Schema::domains_table(),
+			array(
+				'host'            => $host,
+				'post_id'         => $post_id,
+				'challenge'       => str_repeat( substr( md5( $host ), 0, 1 ), 32 ),
+				'challenge_label' => '_post-domain-challenge',
+				'created_at'      => gmdate( 'Y-m-d H:i:s' ),
+				'updated_at'      => gmdate( 'Y-m-d H:i:s' ),
+			)
+		);
+
+		return (int) $wpdb->insert_id;
+	}
+
+	public function test_by_host_finds_a_row(): void {
+		$id      = $this->seed( 'example.test', 42 );
+		$mapping = $this->repo->by_host( 'example.test' );
+
+		$this->assertNotNull( $mapping );
+		$this->assertSame( $id, $mapping->id );
+		$this->assertSame( 42, $mapping->post_id );
+		$this->assertSame( VerificationState::UNVERIFIED, $mapping->verification_state );
+		$this->assertSame( ActivationState::INACTIVE, $mapping->activation_state );
+		$this->assertSame( 1, $mapping->revision );
+	}
+
+	public function test_by_host_is_exact_and_case_sensitive(): void {
+		$this->seed( 'example.test', 42 );
+
+		$this->assertNull( $this->repo->by_host( 'EXAMPLE.TEST' ) );
+		$this->assertNull( $this->repo->by_host( 'sub.example.test' ) );
+	}
+
+	public function test_by_id_finds_a_row(): void {
+		$id = $this->seed( 'example.test', 42 );
+
+		$this->assertSame( $id, $this->repo->by_id( $id )?->id );
+	}
+
+	public function test_a_missing_row_is_null(): void {
+		$this->assertNull( $this->repo->by_host( 'absent.test' ) );
+		$this->assertNull( $this->repo->by_id( 999999 ) );
+	}
+
+	public function test_all_returns_every_row(): void {
+		$this->seed( 'one.test', 1 );
+		$this->seed( 'two.test', 2 );
+
+		$this->assertCount( 2, $this->repo->all() );
+	}
+}
+```
+
+- [ ] **Step 2: Run the test to verify it fails**
+
+Run: `composer test:integration -- --filter RepositoryReadTest`
+Expected: FAIL — `Error: Class "PostDomain\Mapping\DbRepository" not found`
+
+- [ ] **Step 3: Write minimal implementation**
+
+Create `src/Mapping/Mapping.php`:
+
+```php
+<?php
+declare( strict_types = 1 );
+
+namespace PostDomain\Mapping;
+
+use PostDomain\Ssl\MutationKind;
+use PostDomain\Ssl\MutationPhase;
+
+final class Mapping {
+
+	public function __construct(
+		public readonly int $id,
+		public readonly string $host,
+		public readonly ?int $alias_of,
+		public readonly ?int $post_id,
+		public readonly int $revision,
+		public readonly VerificationState $verification_state,
+		public readonly ActivationState $activation_state,
+		public readonly SslState $ssl_state,
+		public readonly ?string $integrity_error,
+		public readonly string $challenge,
+		public readonly string $challenge_label,
+		public readonly ?OwnershipOrigin $ssl_ownership_origin = null,
+		public readonly ?string $ssl_owner_installation_id = null,
+		public readonly ?string $ssl_provider = null,
+		public readonly ?string $ssl_provider_environment = null,
+		public readonly ?string $ssl_ref = null,
+		public readonly ?string $ssl_method = null,
+		public readonly ?string $ssl_mutation_token = null,
+		public readonly ?MutationKind $ssl_mutation_kind = null,
+		public readonly ?MutationPhase $ssl_mutation_phase = null,
+		public readonly ?string $ssl_mutation_expires_at = null,
+		public readonly ?string $ssl_mutation_driver = null,
+		public readonly ?string $ssl_mutation_environment = null,
+		public readonly ?string $ssl_next_attempt_at = null,
+		public readonly int $ssl_transient_count = 0,
+		public readonly ?string $ssl_adopted_at = null,
+		public readonly ?int $ssl_adopted_by = null
+	) {}
+
+	/**
+	 * @param array<string, string|null> $row
+	 */
+	public static function from_row( array $row ): self {
+		return new self(
+			(int) $row['id'],
+			(string) $row['host'],
+			null === $row['alias_of'] ? null : (int) $row['alias_of'],
+			null === $row['post_id'] ? null : (int) $row['post_id'],
+			(int) $row['revision'],
+			VerificationState::from( (string) $row['verification_state'] ),
+			ActivationState::from( (string) $row['activation_state'] ),
+			SslState::from( (string) $row['ssl_state'] ),
+			$row['integrity_error'],
+			(string) $row['challenge'],
+			(string) $row['challenge_label'],
+			null === $row['ssl_ownership_origin'] ? null : OwnershipOrigin::from( (string) $row['ssl_ownership_origin'] ),
+			$row['ssl_owner_installation_id'],
+			$row['ssl_provider'],
+			$row['ssl_provider_environment'],
+			$row['ssl_ref'],
+			$row['ssl_method'],
+			$row['ssl_mutation_token'],
+			null === $row['ssl_mutation_kind'] ? null : MutationKind::from( (string) $row['ssl_mutation_kind'] ),
+			null === $row['ssl_mutation_phase'] ? null : MutationPhase::from( (string) $row['ssl_mutation_phase'] ),
+			$row['ssl_mutation_expires_at'],
+			$row['ssl_mutation_driver'],
+			$row['ssl_mutation_environment'],
+			$row['ssl_next_attempt_at'],
+			(int) ( $row['ssl_transient_count'] ?? 0 ),
+			$row['ssl_adopted_at'],
+			null === $row['ssl_adopted_by'] ? null : (int) $row['ssl_adopted_by']
+		);
+	}
+
+	public function is_alias(): bool {
+		return null !== $this->alias_of;
+	}
+}
+```
+
+Create `src/Contracts/MappingRepository.php`:
+
+```php
+<?php
+declare( strict_types = 1 );
+
+namespace PostDomain\Contracts;
+
+use PostDomain\Mapping\Mapping;
+
+interface MappingRepository {
+
+	public function by_host( string $ascii_host ): ?Mapping;
+
+	public function by_id( int $id ): ?Mapping;
+
+	/**
+	 * @param array<string, mixed> $args
+	 * @return Mapping[]
+	 */
+	public function all( array $args = array() ): array;
+
+	public function save( Mapping $m ): Mapping;
+
+	public function delete( int $id ): void;
+}
+```
+
+Create `src/Mapping/DbRepository.php` with the read half only for now:
+
+```php
+<?php
+declare( strict_types = 1 );
+
+namespace PostDomain\Mapping;
+
+use PostDomain\Contracts\MappingRepository;
+use PostDomain\Support\Schema;
+
+final class DbRepository implements MappingRepository {
+
+	public function by_host( string $ascii_host ): ?Mapping {
+		global $wpdb;
+
+		$table = Schema::domains_table();
+		$row   = $wpdb->get_row( // phpcs:ignore WordPress.DB
+			$wpdb->prepare( "SELECT * FROM {$table} WHERE host = %s", $ascii_host ), // phpcs:ignore WordPress.DB
+			ARRAY_A
+		);
+
+		return null === $row ? null : Mapping::from_row( $row );
+	}
+
+	public function by_id( int $id ): ?Mapping {
+		global $wpdb;
+
+		$table = Schema::domains_table();
+		$row   = $wpdb->get_row( // phpcs:ignore WordPress.DB
+			$wpdb->prepare( "SELECT * FROM {$table} WHERE id = %d", $id ), // phpcs:ignore WordPress.DB
+			ARRAY_A
+		);
+
+		return null === $row ? null : Mapping::from_row( $row );
+	}
+
+	/**
+	 * @param array<string, mixed> $args
+	 * @return Mapping[]
+	 */
+	public function all( array $args = array() ): array {
+		global $wpdb;
+
+		unset( $args );
+		$table = Schema::domains_table();
+
+		/** @var array<int, array<string, string|null>> $rows */
+		$rows = $wpdb->get_results( "SELECT * FROM {$table} ORDER BY id ASC", ARRAY_A ); // phpcs:ignore WordPress.DB
+
+		return array_map( static fn( array $row ): Mapping => Mapping::from_row( $row ), $rows );
+	}
+
+	public function save( Mapping $m ): Mapping {
+		throw new \RuntimeException( 'save() lands in Task 4.' );
+	}
+
+	public function delete( int $id ): void {
+		throw new \RuntimeException( 'delete() lands in Task 6.' );
+	}
+}
+```
+
+- [ ] **Step 4: Run the test to verify it passes**
+
+Run: `composer test:integration -- --filter RepositoryReadTest`
+Expected: PASS — 5 tests
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/Mapping/Mapping.php src/Contracts/MappingRepository.php src/Mapping/DbRepository.php tests/integration/Mapping/RepositoryReadTest.php
+git commit -m "Read mappings through one repository
+
+Host lookup is exact and case sensitive because normalization already lowercased
+it. A case-insensitive collation would let EXAMPLE.COM match a row it was never
+normalized into."
+```
+
+---
+
+### Task 4: Row invariants and compare-and-swap writes
+
+**Files:**
+- Modify: `src/Mapping/DbRepository.php` (implement `save()`)
+- Create: `src/Mapping/InvalidMapping.php`
+- Test: `tests/integration/Mapping/RepositoryWriteTest.php`
+
+**Interfaces:**
+- Consumes: Task 3's `Mapping` and `DbRepository`.
+- Produces: `DbRepository::save( Mapping $m ): Mapping` — inserts when `id === 0`, otherwise updates under CAS on `(id, revision)` and returns the row with its incremented revision. Throws `PostDomain\Mapping\InvalidMapping` on any invariant breach and `PostDomain\Mapping\StaleRevision` when the CAS matches nothing.
+
+- [ ] **Step 1: Write the failing test**
+
+Create `tests/integration/Mapping/RepositoryWriteTest.php`:
+
+```php
+<?php
+declare( strict_types = 1 );
+
+namespace PostDomain\Tests\Integration\Mapping;
+
+use PostDomain\Mapping\ActivationState;
+use PostDomain\Mapping\DbRepository;
+use PostDomain\Mapping\InvalidMapping;
+use PostDomain\Mapping\Mapping;
+use PostDomain\Mapping\SslState;
+use PostDomain\Mapping\StaleRevision;
+use PostDomain\Mapping\VerificationState;
+use PostDomain\Ssl\MutationKind;
+use PostDomain\Ssl\MutationPhase;
+use PostDomain\Support\Schema;
+use WP_UnitTestCase;
+
+final class RepositoryWriteTest extends WP_UnitTestCase {
+
+	private DbRepository $repo;
+
+	public function set_up(): void {
+		parent::set_up();
+		Schema::install();
+		$this->repo = new DbRepository();
+	}
+
+	private function canonical( string $host, int $post_id = 42 ): Mapping {
+		return new Mapping(
+			0, $host, null, $post_id, 1,
+			VerificationState::UNVERIFIED, ActivationState::INACTIVE, SslState::NONE,
+			null, str_repeat( 'a', 32 ), '_post-domain-challenge'
+		);
+	}
+
+	public function test_a_canonical_row_saves_and_reads_back(): void {
+		$saved = $this->repo->save( $this->canonical( 'example.test' ) );
+
+		$this->assertGreaterThan( 0, $saved->id );
+		$this->assertSame( 1, $saved->revision );
+		$this->assertSame( 'example.test', $this->repo->by_id( $saved->id )?->host );
+	}
+
+	public function test_an_update_bumps_the_revision(): void {
+		$saved   = $this->repo->save( $this->canonical( 'example.test' ) );
+		$updated = $this->repo->save(
+			new Mapping(
+				$saved->id, $saved->host, null, 43, $saved->revision,
+				VerificationState::PENDING, ActivationState::INACTIVE, SslState::NONE,
+				null, $saved->challenge, $saved->challenge_label
+			)
+		);
+
+		$this->assertSame( 2, $updated->revision );
+		$this->assertSame( 43, $this->repo->by_id( $saved->id )?->post_id );
+	}
+
+	public function test_a_stale_revision_is_rejected(): void {
+		$saved = $this->repo->save( $this->canonical( 'example.test' ) );
+		$this->repo->save(
+			new Mapping(
+				$saved->id, $saved->host, null, 43, 1,
+				VerificationState::UNVERIFIED, ActivationState::INACTIVE, SslState::NONE,
+				null, $saved->challenge, $saved->challenge_label
+			)
+		);
+
+		$this->expectException( StaleRevision::class );
+		$this->repo->save(
+			new Mapping(
+				$saved->id, $saved->host, null, 44, 1,
+				VerificationState::UNVERIFIED, ActivationState::INACTIVE, SslState::NONE,
+				null, $saved->challenge, $saved->challenge_label
+			)
+		);
+	}
+
+	public function test_a_canonical_row_without_a_post_is_rejected(): void {
+		$this->expectException( InvalidMapping::class );
+		$this->repo->save(
+			new Mapping(
+				0, 'example.test', null, null, 1,
+				VerificationState::UNVERIFIED, ActivationState::INACTIVE, SslState::NONE,
+				null, str_repeat( 'b', 32 ), '_post-domain-challenge'
+			)
+		);
+	}
+
+	public function test_an_alias_carrying_a_post_is_rejected(): void {
+		$parent = $this->repo->save( $this->canonical( 'example.test' ) );
+
+		$this->expectException( InvalidMapping::class );
+		$this->repo->save(
+			new Mapping(
+				0, 'www.example.test', $parent->id, 42, 1,
+				VerificationState::UNVERIFIED, ActivationState::INACTIVE, SslState::NONE,
+				null, str_repeat( 'c', 32 ), '_post-domain-challenge'
+			)
+		);
+	}
+
+	public function test_an_alias_of_an_alias_is_rejected(): void {
+		$parent = $this->repo->save( $this->canonical( 'example.test' ) );
+		$alias  = $this->repo->save(
+			new Mapping(
+				0, 'www.example.test', $parent->id, null, 1,
+				VerificationState::UNVERIFIED, ActivationState::INACTIVE, SslState::NONE,
+				null, str_repeat( 'd', 32 ), '_post-domain-challenge'
+			)
+		);
+
+		$this->expectException( InvalidMapping::class );
+		$this->repo->save(
+			new Mapping(
+				0, 'deep.example.test', $alias->id, null, 1,
+				VerificationState::UNVERIFIED, ActivationState::INACTIVE, SslState::NONE,
+				null, str_repeat( 'e', 32 ), '_post-domain-challenge'
+			)
+		);
+	}
+
+	public function test_a_partial_lease_is_rejected(): void {
+		$this->expectException( InvalidMapping::class );
+		$this->repo->save(
+			new Mapping(
+				0, 'example.test', null, 42, 1,
+				VerificationState::UNVERIFIED, ActivationState::INACTIVE, SslState::NONE,
+				null, str_repeat( 'f', 32 ), '_post-domain-challenge',
+				null, null, null, null, null,
+				str_repeat( '9', 32 ), MutationKind::CREATE, null, null
+			)
+		);
+	}
+
+	public function test_a_lease_without_its_provider_binding_is_rejected(): void {
+		// The binding is what recovery reads to decide which environment it may
+		// question at all, so a lease without it is not a lease.
+		$this->expectException( InvalidMapping::class );
+		$this->repo->save(
+			new Mapping(
+				0, 'example.test', null, 42, 1,
+				VerificationState::UNVERIFIED, ActivationState::INACTIVE, SslState::NONE,
+				null, str_repeat( 'i', 32 ), '_post-domain-challenge',
+				null, null, null, null, null,
+				str_repeat( '9', 32 ), MutationKind::CREATE, MutationPhase::RESERVED,
+				gmdate( 'Y-m-d H:i:s', time() + 120 ), null, null
+			)
+		);
+	}
+
+	public function test_a_complete_lease_is_accepted(): void {
+		$saved = $this->repo->save(
+			new Mapping(
+				0, 'example.test', null, 42, 1,
+				VerificationState::UNVERIFIED, ActivationState::INACTIVE, SslState::NONE,
+				null, str_repeat( 'g', 32 ), '_post-domain-challenge',
+				null, null, null, null, null,
+				str_repeat( '9', 32 ), MutationKind::CREATE, MutationPhase::RESERVED,
+				gmdate( 'Y-m-d H:i:s', time() + 120 ), 'cloudflare-saas', 'zone:abc123'
+			)
+		);
+
+		$after = $this->repo->by_id( $saved->id );
+
+		$this->assertSame( MutationPhase::RESERVED, $after?->ssl_mutation_phase );
+		$this->assertSame( 'cloudflare-saas', $after?->ssl_mutation_driver );
+		$this->assertSame( 'zone:abc123', $after?->ssl_mutation_environment );
+	}
+
+	public function test_the_completely_unbound_state_is_valid(): void {
+		$saved = $this->repo->save(
+			new Mapping(
+				0, 'unbound.test', null, 42, 1,
+				VerificationState::UNVERIFIED, ActivationState::INACTIVE, SslState::NONE,
+				null, str_repeat( 'n', 32 ), '_post-domain-challenge'
+			)
+		);
+
+		$this->assertNull( $this->repo->by_id( $saved->id )?->ssl_provider );
+	}
+
+	/**
+	 * The binding is one fact in five columns, so every proper subset is a lie
+	 * about the row. Thirty of the thirty-two combinations are rejected; the two
+	 * that are not are covered above and below.
+	 *
+	 * @dataProvider partial_bindings
+	 */
+	public function test_every_partial_durable_binding_is_rejected( array $present ): void {
+		$this->expectException( InvalidMapping::class );
+
+		$this->repo->save(
+			new Mapping(
+				0, 'partial.test', null, 42, 1,
+				VerificationState::UNVERIFIED, ActivationState::INACTIVE, SslState::NONE,
+				null, str_repeat( 'p', 32 ), '_post-domain-challenge',
+				in_array( 'origin', $present, true ) ? \PostDomain\Mapping\OwnershipOrigin::CREATED : null,
+				in_array( 'owner', $present, true ) ? 'install-a' : null,
+				in_array( 'provider', $present, true ) ? 'cloudflare-saas' : null,
+				in_array( 'environment', $present, true ) ? 'cf-zone:a' : null,
+				in_array( 'ref', $present, true ) ? 'ref-1' : null
+			)
+		);
+	}
+
+	/** @return array<string, array{0: string[]}> */
+	public static function partial_bindings(): array {
+		$fields = array( 'provider', 'environment', 'ref', 'origin', 'owner' );
+		$cases  = array();
+
+		// Every subset except the empty one and the complete one.
+		for ( $mask = 1; $mask < ( 1 << count( $fields ) ) - 1; $mask++ ) {
+			$present = array();
+
+			foreach ( $fields as $bit => $field ) {
+				if ( $mask & ( 1 << $bit ) ) {
+					$present[] = $field;
+				}
+			}
+
+			$cases[ implode( '+', $present ) ] = array( $present );
+		}
+
+		return $cases;
+	}
+
+	public function test_an_adopted_binding_records_when_it_was_adopted(): void {
+		global $wpdb;
+
+		// Adoption goes through MutationGate, so the timestamp is written by the
+		// lease CAS rather than by save(). A row claiming ADOPTED without it is
+		// the forgery the invariant exists to catch (spec §12.2).
+		$saved = $this->repo->save(
+			new Mapping(
+				0, 'adopted.test', null, 42, 1,
+				VerificationState::UNVERIFIED, ActivationState::INACTIVE, SslState::NONE,
+				null, str_repeat( 'q', 32 ), '_post-domain-challenge',
+				\PostDomain\Mapping\OwnershipOrigin::CREATED, 'install-a', 'cloudflare-saas', 'cf-zone:a', 'ref-1'
+			)
+		);
+
+		$wpdb->update( // phpcs:ignore WordPress.DB
+			Schema::domains_table(),
+			array( 'ssl_ownership_origin' => 'adopted', 'ssl_adopted_at' => gmdate( 'Y-m-d H:i:s' ), 'ssl_adopted_by' => 1 ),
+			array( 'id' => $saved->id )
+		);
+
+		$adopted = $this->repo->by_id( $saved->id );
+
+		$this->assertSame( \PostDomain\Mapping\OwnershipOrigin::ADOPTED, $adopted?->ssl_ownership_origin );
+		$this->assertNotNull( $adopted?->ssl_adopted_at );
+
+		// And it round-trips through the repository, which the invariant accepts.
+		$this->assertNotNull( $this->repo->save( $adopted ) );
+	}
+
+	public function test_an_adopted_origin_without_an_adoption_timestamp_is_rejected(): void {
+		$this->expectException( InvalidMapping::class );
+		$this->repo->save(
+			new Mapping(
+				0, 'forged.test', null, 42, 1,
+				VerificationState::UNVERIFIED, ActivationState::INACTIVE, SslState::NONE,
+				null, str_repeat( 'r', 32 ), '_post-domain-challenge',
+				\PostDomain\Mapping\OwnershipOrigin::ADOPTED, 'install-a', 'cloudflare-saas', 'cf-zone:a', 'ref-1'
+			)
+		);
+	}
+
+	public function test_saving_writes_every_column_it_claims_to(): void {
+		// A prepared statement whose values drift from its columns fails silently
+		// in the direction of writing the wrong thing, so the round trip is the
+		// assertion: everything set comes back.
+		$saved = $this->repo->save(
+			new Mapping(
+				0, 'roundtrip.test', null, 42, 1,
+				VerificationState::UNVERIFIED, ActivationState::INACTIVE, SslState::ACTIVE,
+				null, str_repeat( 'm', 32 ), '_pd',
+				\PostDomain\Mapping\OwnershipOrigin::CREATED, 'install-z',
+				'cloudflare-saas', 'cf-zone:z', 'ref-z', 'http'
+			)
+		);
+
+		$after = $this->repo->by_id( $saved->id );
+
+		$this->assertSame( 'roundtrip.test', $after?->host );
+		$this->assertSame( \PostDomain\Mapping\OwnershipOrigin::CREATED, $after?->ssl_ownership_origin );
+		$this->assertSame( 'install-z', $after?->ssl_owner_installation_id );
+		$this->assertSame( 'cloudflare-saas', $after?->ssl_provider );
+		$this->assertSame( 'cf-zone:z', $after?->ssl_provider_environment );
+		$this->assertSame( 'ref-z', $after?->ssl_ref );
+		$this->assertSame( 'http', $after?->ssl_method );
+		$this->assertSame( SslState::ACTIVE, $after?->ssl_state );
+	}
+
+	public function test_a_complete_created_binding_is_valid(): void {
+		$saved = $this->repo->save(
+			new Mapping(
+				0, 'example.test', null, 42, 1,
+				VerificationState::UNVERIFIED, ActivationState::INACTIVE, SslState::NONE,
+				null, str_repeat( 'l', 32 ), '_post-domain-challenge',
+				\PostDomain\Mapping\OwnershipOrigin::CREATED, 'install-a', 'cloudflare-saas', 'cf-zone:a', 'ref-1'
+			)
+		);
+
+		$after = $this->repo->by_id( $saved->id );
+
+		$this->assertSame( 'cloudflare-saas', $after?->ssl_provider );
+		$this->assertSame( 'cf-zone:a', $after?->ssl_provider_environment );
+		$this->assertSame( 'ref-1', $after?->ssl_ref );
+		$this->assertSame( \PostDomain\Mapping\OwnershipOrigin::CREATED, $after?->ssl_ownership_origin );
+		$this->assertSame( 'install-a', $after?->ssl_owner_installation_id );
+		$this->assertNull( $after?->ssl_adopted_at );
+	}
+
+	public function test_an_illegal_state_transition_is_rejected(): void {
+		$saved = $this->repo->save( $this->canonical( 'example.test' ) );
+
+		$this->expectException( InvalidMapping::class );
+		$this->repo->save(
+			new Mapping(
+				$saved->id, $saved->host, null, 42, $saved->revision,
+				VerificationState::VERIFIED, ActivationState::INACTIVE, SslState::NONE,
+				null, $saved->challenge, $saved->challenge_label
+			)
+		);
+	}
+}
+```
+
+- [ ] **Step 2: Run the test to verify it fails**
+
+Run: `composer test:integration -- --filter RepositoryWriteTest`
+Expected: FAIL — `RuntimeException: save() lands in Task 4.`
+
+- [ ] **Step 3: Write minimal implementation**
+
+Create `src/Mapping/InvalidMapping.php`:
+
+```php
+<?php
+declare( strict_types = 1 );
+
+namespace PostDomain\Mapping;
+
+final class InvalidMapping extends \InvalidArgumentException {}
+```
+
+Create `src/Mapping/StaleRevision.php`:
+
+```php
+<?php
+declare( strict_types = 1 );
+
+namespace PostDomain\Mapping;
+
+final class StaleRevision extends \RuntimeException {}
+```
+
+Replace `DbRepository::save()` with:
+
+<!-- covered-by: RepositoryWriteTest, InvariantTest -->
+
+```php
+	public function save( Mapping $m ): Mapping {
+		global $wpdb;
+
+		$this->assert_valid( $m );
+
+		$table = Schema::domains_table();
+		$now   = gmdate( 'Y-m-d H:i:s' );
+
+		$data = array(
+			'host'                      => $m->host,
+			'alias_of'                  => $m->alias_of,
+			'post_id'                   => $m->post_id,
+			'verification_state'        => $m->verification_state->value,
+			'activation_state'          => $m->activation_state->value,
+			'ssl_state'                 => $m->ssl_state->value,
+			'integrity_error'           => $m->integrity_error,
+			'challenge'                 => $m->challenge,
+			'challenge_label'           => $m->challenge_label,
+			'ssl_ownership_origin'      => $m->ssl_ownership_origin?->value,
+			'ssl_owner_installation_id' => $m->ssl_owner_installation_id,
+			'ssl_provider'              => $m->ssl_provider,
+			'ssl_provider_environment'  => $m->ssl_provider_environment,
+			'ssl_ref'                   => $m->ssl_ref,
+			'ssl_method'                => $m->ssl_method,
+			'ssl_mutation_token'        => $m->ssl_mutation_token,
+			'ssl_mutation_kind'         => $m->ssl_mutation_kind?->value,
+			'ssl_mutation_phase'        => $m->ssl_mutation_phase?->value,
+			'ssl_mutation_expires_at'   => $m->ssl_mutation_expires_at,
+			'ssl_mutation_driver'       => $m->ssl_mutation_driver,
+			'ssl_mutation_environment'  => $m->ssl_mutation_environment,
+			'updated_at'                => $now,
+		);
+
+		// ssl_next_attempt_at, ssl_transient_count, ssl_adopted_at, and
+		// ssl_adopted_by are deliberately absent: they are written only by the CAS
+		// that owns them. An adoption in particular is not something save() may
+		// mint — it happens through MutationGate or not at all.
+
+		if ( 0 === $m->id ) {
+			$data['revision']   = 1;
+			$data['created_at'] = $now;
+
+			$wpdb->insert( $table, $data ); // phpcs:ignore WordPress.DB
+
+			$saved = $this->by_id( (int) $wpdb->insert_id );
+
+			if ( null === $saved ) {
+				throw new \RuntimeException( 'The inserted mapping could not be read back.' );
+			}
+
+			return $saved;
+		}
+
+		$existing = $this->by_id( $m->id );
+
+		if ( null === $existing ) {
+			throw new InvalidMapping( 'Cannot update a mapping that does not exist.' );
+		}
+
+		$this->assert_transitions( $existing, $m );
+
+		$sets   = array();
+		$values = array();
+
+		foreach ( $data as $column => $value ) {
+			$sets[]   = "{$column} = %s";
+			$values[] = $value;
+		}
+
+		$sql = "UPDATE {$table} SET " . implode( ', ', $sets )
+			. ', revision = revision + 1 WHERE id = %d AND revision = %d';
+
+		$values[] = $m->id;
+		$values[] = $m->revision;
+
+		$affected = $wpdb->query( $wpdb->prepare( $sql, $values ) ); // phpcs:ignore WordPress.DB
+
+		if ( 1 !== $affected ) {
+			throw new StaleRevision(
+				sprintf( 'Mapping %d changed underneath revision %d.', $m->id, $m->revision )
+			);
+		}
+
+		$saved = $this->by_id( $m->id );
+
+		if ( null === $saved ) {
+			throw new \RuntimeException( 'The updated mapping could not be read back.' );
+		}
+
+		return $saved;
+	}
+
+	private function assert_valid( Mapping $m ): void {
+		if ( null === $m->alias_of && null === $m->post_id ) {
+			throw new InvalidMapping( 'A canonical mapping must carry a post_id.' );
+		}
+
+		if ( null !== $m->alias_of && null !== $m->post_id ) {
+			throw new InvalidMapping( 'An alias mapping must not carry a post_id.' );
+		}
+
+		if ( null !== $m->alias_of ) {
+			$parent = $this->by_id( $m->alias_of );
+
+			if ( null === $parent ) {
+				throw new InvalidMapping( 'An alias must point at an existing mapping.' );
+			}
+
+			if ( $parent->is_alias() ) {
+				throw new InvalidMapping( 'Aliases may not chain.' );
+			}
+		}
+
+		// Every lease column moves together, including the durable binding to the
+		// driver and provider environment the mutation began against (spec §12.6).
+		$lease = array(
+			null !== $m->ssl_mutation_token,
+			null !== $m->ssl_mutation_kind,
+			null !== $m->ssl_mutation_phase,
+			null !== $m->ssl_mutation_expires_at,
+			null !== $m->ssl_mutation_driver,
+			null !== $m->ssl_mutation_environment,
+		);
+
+		if ( count( array_unique( $lease ) ) > 1 ) {
+			throw new InvalidMapping( 'The six lease columns move together.' );
+		}
+
+		// The durable resource binding is one fact in five columns: which driver,
+		// which environment, which reference, and on whose authority. A row that
+		// keeps ssl_provider without the rest is the shape that lets an ordinary
+		// read fall back to current configuration and ask the wrong account about
+		// somebody else's certificate (spec §12.6).
+		$bound = array(
+			null !== $m->ssl_provider,
+			null !== $m->ssl_provider_environment,
+			null !== $m->ssl_ref,
+			null !== $m->ssl_ownership_origin,
+			null !== $m->ssl_owner_installation_id,
+		);
+
+		if ( count( array_unique( $bound ) ) > 1 ) {
+			throw new InvalidMapping(
+				'The durable provider binding moves as one: provider, provider environment, ref, ownership origin, and owner installation.'
+			);
+		}
+
+		// Spec §12.2: adopted => ssl_adopted_at IS NOT NULL; created => it is NULL.
+		if ( OwnershipOrigin::ADOPTED === $m->ssl_ownership_origin && null === $m->ssl_adopted_at ) {
+			throw new InvalidMapping( 'An adopted binding records when it was adopted.' );
+		}
+
+		if ( OwnershipOrigin::CREATED === $m->ssl_ownership_origin && null !== $m->ssl_adopted_at ) {
+			throw new InvalidMapping( 'A created binding was never adopted.' );
+		}
+	}
+
+	private function assert_transitions( Mapping $from, Mapping $to ): void {
+		if ( ! $from->verification_state->can_transition_to( $to->verification_state ) ) {
+			throw new InvalidMapping(
+				sprintf(
+					'Illegal verification transition %s -> %s.',
+					$from->verification_state->value,
+					$to->verification_state->value
+				)
+			);
+		}
+
+		if ( ! $from->ssl_state->can_transition_to( $to->ssl_state ) ) {
+			throw new InvalidMapping(
+				sprintf( 'Illegal SSL transition %s -> %s.', $from->ssl_state->value, $to->ssl_state->value )
+			);
+		}
+	}
+```
+
+- [ ] **Step 4: Run the test to verify it passes**
+
+Run: `composer test:integration -- --filter RepositoryWriteTest`
+Expected: PASS — 11 tests
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/Mapping/DbRepository.php src/Mapping/InvalidMapping.php src/Mapping/StaleRevision.php tests/integration/Mapping/RepositoryWriteTest.php
+git commit -m "Enforce every row invariant at the single write path
+
+CHECK constraints are unreliable across MySQL 5.7, 8, and MariaDB, so the
+invariants live in PHP at the only code that touches the table."
+```
+
+---
+
+### Task 5: The audit event log and atomic state transitions
+
+**Files:**
+- Create: `src/Mapping/EventLog.php`, `src/Support/AtomicTransition.php`, `src/Support/TransitionOutcome.php`, `src/Support/TransitionResult.php`
+- Test: `tests/integration/Mapping/EventLogTest.php`, `tests/integration/Support/AtomicTransitionTest.php`
+
+**Interfaces:**
+- Consumes: `Schema` (Task 2).
+- Produces:
+  - `PostDomain\Mapping\EventLog::record( int $domain_id, string $host, string $type, ?string $from, ?string $to, ?string $actor, array $detail = array() ): bool` — **true only when the row was inserted** — plus `::for_domain( int $domain_id ): array` and `::prune( int $retention_days ): int`.
+  - `PostDomain\Support\AtomicTransition::is_transactional(): bool`, `::in_ambient_transaction(): ?bool`, and `::commit( callable $transition, callable $event ): TransitionResult`, where `$transition` is the owner-pinned CAS returning `true` on exactly one affected row and `$event` is a `callable(): bool` recording the event.
+  - `PostDomain\Support\TransitionOutcome` enum — `COMMITTED`, `CAS_LOST`, `EVENT_FAILED`, `TRANSACTION_UNAVAILABLE`, `COMMIT_UNCERTAIN`.
+  - `PostDomain\Support\TransitionResult` — readonly `TransitionOutcome $outcome`, `string $detail`, with `::committed(): bool` and `::cas_lost(): bool`.
+
+Events are a support artifact. Nothing in authorization, routing, or state
+transition reads this table, which is what makes pruning always safe (spec §12.3).
+
+**Atomicity (spec §12.3).** When `pd_schema_engine` is InnoDB, a state change and
+its event row are written in **one transaction**: the CAS runs first, the event
+is inserted second, and the pair commits or rolls back together. On any other
+engine the transaction is skipped and the event is best-effort — attempted only
+**after** the CAS has already succeeded, never before, so a failed or fenced
+transition can never leave a success event behind.
+
+`AtomicTransition::commit()` is the single mechanism every later plan uses for
+this. Nothing in Plans 07–10 may pair a CAS with an event any other way.
+
+**It never touches a transaction it did not open.** WordPress core opens none, but
+another plugin may, and on MySQL and MariaDB a `START TRANSACTION` inside an
+existing transaction implicitly commits it. Before starting one, `commit()` probes
+the session with `SAVEPOINT` / `RELEASE SAVEPOINT` — privilege-free, identical on
+both engines, and side-effect-free in either state. If a transaction is already
+open, or if the probe itself cannot be trusted, the transition **never runs** and
+the result is `TRANSACTION_UNAVAILABLE`. Savepoint nesting was rejected: a
+savepoint released inside somebody else's transaction leaves the write undurable
+until that owner commits, so calling it committed would be false (spec §12.3).
+
+**It returns a result, not a boolean, because "not committed" has five causes and
+callers need different answers to them.** A CAS that lost means another owner has
+the row — discard and move on. A transaction that could not be started and an
+event that could not be inserted both mean the write definitely did not land. A
+`COMMIT` that was not confirmed means **nobody here knows** whether it landed —
+and this connection cannot find out, because while the transaction is unresolved
+it sees its own uncommitted writes. The only honest next step is to claim nothing
+and let a later pass decide. Collapsing these into `false` would let a
+caller report a fenced worker, a failed database write, and an unknown outcome
+identically, which is exactly the confusion the fencing rules exist to prevent. `START TRANSACTION`, `COMMIT`, and `ROLLBACK` results are
+therefore checked rather than assumed, and a transition never begins when the
+required transaction could not be established.
+
+- [ ] **Step 1: Write the failing test**
+
+Create `tests/integration/Mapping/EventLogTest.php`:
+
+```php
+<?php
+declare( strict_types = 1 );
+
+namespace PostDomain\Tests\Integration\Mapping;
+
+use PostDomain\Mapping\EventLog;
+use PostDomain\Support\Schema;
+use WP_UnitTestCase;
+
+final class EventLogTest extends WP_UnitTestCase {
+
+	public function set_up(): void {
+		parent::set_up();
+		Schema::install();
+	}
+
+	public function test_an_event_records_and_reads_back(): void {
+		EventLog::record( 7, 'example.test', 'verification', 'pending', 'verified', 'cron', array( 'outcome' => 'match' ) );
+
+		$events = EventLog::for_domain( 7 );
+
+		$this->assertCount( 1, $events );
+		$this->assertSame( 'verification', $events[0]['type'] );
+		$this->assertSame( 'example.test', $events[0]['host'] );
+		$this->assertSame( 'match', json_decode( (string) $events[0]['detail'], true )['outcome'] );
+	}
+
+	public function test_recording_reports_whether_the_row_was_inserted(): void {
+		$this->assertTrue( EventLog::record( 7, 'example.test', 'ssl', null, 'active', 'cron' ) );
+	}
+
+	public function test_the_host_snapshot_survives_the_row_it_describes(): void {
+		EventLog::record( 8, 'gone.test', 'ssl', 'pending_removal', 'revoked', 'cron' );
+
+		$this->assertSame( 'gone.test', EventLog::for_domain( 8 )[0]['host'] );
+	}
+
+	public function test_pruning_removes_only_events_past_retention(): void {
+		global $wpdb;
+
+		EventLog::record( 9, 'example.test', 'admin', null, null, 'admin:1' );
+
+		$wpdb->query( // phpcs:ignore WordPress.DB
+			$wpdb->prepare(
+				'UPDATE ' . Schema::events_table() . ' SET created_at = %s WHERE domain_id = 9',
+				gmdate( 'Y-m-d H:i:s', time() - 100 * DAY_IN_SECONDS )
+			)
+		);
+
+		EventLog::record( 10, 'fresh.test', 'admin', null, null, 'admin:1' );
+
+		$this->assertSame( 1, EventLog::prune( 90 ) );
+		$this->assertCount( 0, EventLog::for_domain( 9 ) );
+		$this->assertCount( 1, EventLog::for_domain( 10 ) );
+	}
+
+	public function test_no_source_file_outside_the_event_log_reads_the_events_table(): void {
+		$offenders = array();
+
+		/** @var \SplFileInfo $file */
+		foreach ( new \RecursiveIteratorIterator(
+			new \RecursiveDirectoryIterator( dirname( __DIR__, 3 ) . '/src' )
+		) as $file ) {
+			if ( 'php' !== $file->getExtension() || 'EventLog.php' === $file->getFilename() ) {
+				continue;
+			}
+
+			$source = (string) file_get_contents( $file->getPathname() );
+
+			if ( str_contains( $source, 'events_table()' ) ) {
+				$offenders[] = $file->getFilename();
+			}
+		}
+
+		$this->assertSame(
+			array(),
+			$offenders,
+			'events are audit-only: no decision may read them'
+		);
+	}
+}
+```
+
+- [ ] **Step 2: Run the test to verify it fails**
+
+Run: `composer test:integration -- --filter EventLogTest`
+Expected: FAIL — `Error: Class "PostDomain\Mapping\EventLog" not found`
+
+- [ ] **Step 3: Write minimal implementation**
+
+Create `src/Mapping/EventLog.php`:
+
+```php
+<?php
+declare( strict_types = 1 );
+
+namespace PostDomain\Mapping;
+
+use PostDomain\Support\Schema;
+
+/**
+ * Append-only support artifact. Nothing reads this to make a decision, which is
+ * why pruning it is always safe.
+ */
+final class EventLog {
+
+	/**
+	 * @param array<string, mixed> $detail
+	 */
+	public static function record(
+		int $domain_id,
+		string $host,
+		string $type,
+		?string $from = null,
+		?string $to = null,
+		?string $actor = null,
+		array $detail = array()
+	): bool {
+		global $wpdb;
+
+		$inserted = $wpdb->insert( // phpcs:ignore WordPress.DB
+			Schema::events_table(),
+			array(
+				'domain_id'  => $domain_id,
+				'host'       => $host,
+				'type'       => $type,
+				'from_state' => $from,
+				'to_state'   => $to,
+				'actor'      => $actor,
+				'detail'     => array() === $detail ? null : (string) wp_json_encode( $detail ),
+				'created_at' => gmdate( 'Y-m-d H:i:s' ),
+			)
+		);
+
+		return false !== $inserted;
+	}
+
+	/**
+	 * @return array<int, array<string, string|null>>
+	 */
+	public static function for_domain( int $domain_id ): array {
+		global $wpdb;
+
+		$table = Schema::events_table();
+
+		/** @var array<int, array<string, string|null>> $rows */
+		$rows = $wpdb->get_results( // phpcs:ignore WordPress.DB
+			$wpdb->prepare( "SELECT * FROM {$table} WHERE domain_id = %d ORDER BY created_at ASC", $domain_id ), // phpcs:ignore WordPress.DB
+			ARRAY_A
+		);
+
+		return $rows;
+	}
+
+	public static function prune( int $retention_days ): int {
+		global $wpdb;
+
+		$table  = Schema::events_table();
+		$cutoff = gmdate( 'Y-m-d H:i:s', time() - $retention_days * DAY_IN_SECONDS );
+
+		return (int) $wpdb->query( // phpcs:ignore WordPress.DB
+			$wpdb->prepare( "DELETE FROM {$table} WHERE created_at < %s", $cutoff ) // phpcs:ignore WordPress.DB
+		);
+	}
+}
+```
+
+Create `src/Support/AtomicTransition.php`:
+
+```php
+<?php
+declare( strict_types = 1 );
+
+namespace PostDomain\Support;
+
+/**
+ * Pairs one state-changing CAS with its event row.
+ *
+ * On InnoDB the pair is one transaction: the CAS runs first, the event second,
+ * and either both land or neither does. On any other engine there is no
+ * transaction and the event is best-effort — but it is still attempted only
+ * after the CAS has succeeded, so a zero-row CAS never produces a success event.
+ *
+ * This is the only sanctioned way to write a transition and its event.
+ */
+final class AtomicTransition {
+
+	private static bool $in_progress = false;
+
+	public static function is_transactional(): bool {
+		return 0 === strcasecmp( Schema::engine(), 'InnoDB' );
+	}
+
+	/**
+	 * Is a transaction already open on this connection?
+	 *
+	 * SAVEPOINT succeeds in both states. RELEASE SAVEPOINT succeeds only inside a
+	 * transaction; outside one, autocommit has already ended the statement's own
+	 * transaction and the savepoint no longer exists. The probe needs no
+	 * privilege, works the same on MySQL and MariaDB, and — this is the point —
+	 * neither commits nor rolls back anything in either state.
+	 *
+	 * `$wpdb->last_error` is the signal, so errors are suppressed and the previous
+	 * suppression state and error text are restored: a probe must not look like a
+	 * failure to whatever ran before it.
+	 *
+	 * @return bool|null True inside a transaction, false outside one, null when
+	 *                   the probe itself could not be trusted.
+	 */
+	public static function in_ambient_transaction(): ?bool {
+		global $wpdb;
+
+		$name       = 'pd_probe_' . bin2hex( random_bytes( 4 ) );
+		$suppressed = $wpdb->suppress_errors( true );
+		$prior      = $wpdb->last_error;
+
+		$set = $wpdb->query( "SAVEPOINT {$name}" ); // phpcs:ignore WordPress.DB
+
+		if ( false === $set ) {
+			$wpdb->suppress_errors( $suppressed );
+			$wpdb->last_error = $prior;
+
+			return null;
+		}
+
+		$released = $wpdb->query( "RELEASE SAVEPOINT {$name}" ); // phpcs:ignore WordPress.DB
+
+		$wpdb->suppress_errors( $suppressed );
+		$wpdb->last_error = $prior;
+
+		// Released cleanly => the savepoint outlived its statement => a
+		// transaction is open. Refused => there was none.
+		return false !== $released;
+	}
+
+	/**
+	 * @param callable(): bool $transition The owner-pinned CAS. True ⇒ exactly one row changed.
+	 * @param callable(): bool $event      Records the event. True ⇒ the row was inserted.
+	 */
+	public static function commit( callable $transition, callable $event ): TransitionResult {
+		global $wpdb;
+
+		// Nesting would make the inner COMMIT close the outer transaction, so the
+		// outer caller would be told its work committed when it had not.
+		if ( self::$in_progress ) {
+			throw new \LogicException( 'AtomicTransition::commit() may not be nested.' );
+		}
+
+		if ( ! self::is_transactional() ) {
+			if ( ! $transition() ) {
+				return new TransitionResult( TransitionOutcome::CAS_LOST, 'the CAS affected no rows' );
+			}
+
+			// Best-effort, and only ever after the fact. A missing event on a
+			// nontransactional engine is tolerable: nothing reads the log.
+			return $event()
+				? new TransitionResult( TransitionOutcome::COMMITTED, 'committed without a transaction' )
+				: new TransitionResult( TransitionOutcome::COMMITTED, 'committed; the best-effort event was not recorded' );
+		}
+
+		// START TRANSACTION inside somebody else's transaction implicitly commits
+		// it. Refuse rather than take a write we do not own with us (spec §12.3).
+		$ambient = self::in_ambient_transaction();
+
+		if ( null === $ambient ) {
+			return new TransitionResult(
+				TransitionOutcome::TRANSACTION_UNAVAILABLE,
+				'the session transaction state could not be determined'
+			);
+		}
+
+		if ( true === $ambient ) {
+			return new TransitionResult(
+				TransitionOutcome::TRANSACTION_UNAVAILABLE,
+				'a transaction opened elsewhere is already active on this connection'
+			);
+		}
+
+		if ( false === $wpdb->query( 'START TRANSACTION' ) ) { // phpcs:ignore WordPress.DB
+			// The transition is never attempted: without the transaction there is
+			// no way to keep it and its event together.
+			return new TransitionResult( TransitionOutcome::TRANSACTION_UNAVAILABLE, 'START TRANSACTION failed' );
+		}
+
+		self::$in_progress = true;
+
+		try {
+			if ( ! $transition() ) {
+				return self::undo( TransitionOutcome::CAS_LOST, 'the CAS affected no rows' );
+			}
+
+			if ( ! $event() ) {
+				return self::undo( TransitionOutcome::EVENT_FAILED, 'the event row could not be inserted' );
+			}
+
+			if ( false === $wpdb->query( 'COMMIT' ) ) { // phpcs:ignore WordPress.DB
+				// The client did not get confirmation. That is NOT the same as
+				// knowing the server discarded it — the transaction may well have
+				// committed. No rollback is attempted, because rolling back a
+				// transaction that already committed is meaningless and rolling
+				// back one that did not is what the connection will do anyway.
+				//
+				// Callers must NOT re-read this connection to decide what happened:
+				// while the transaction is unresolved it shows them their own
+				// uncommitted writes. A later request, cron pass, or reconciliation
+				// — each with its own committed view — is what settles it.
+				return new TransitionResult( TransitionOutcome::COMMIT_UNCERTAIN, 'COMMIT was not confirmed; the outcome is unknown' );
+			}
+
+			return new TransitionResult( TransitionOutcome::COMMITTED, 'committed' );
+		} catch ( \Throwable $e ) {
+			self::undo( TransitionOutcome::CAS_LOST, 'rolled back after an exception' );
+
+			throw $e;
+		} finally {
+			self::$in_progress = false;
+		}
+	}
+
+	private static function undo( TransitionOutcome $outcome, string $detail ): TransitionResult {
+		global $wpdb;
+
+		if ( false === $wpdb->query( 'ROLLBACK' ) ) { // phpcs:ignore WordPress.DB
+			// The transition may or may not still stand. That is not a CAS loss.
+			return new TransitionResult( TransitionOutcome::COMMIT_UNCERTAIN, $detail . '; ROLLBACK also failed' );
+		}
+
+		return new TransitionResult( $outcome, $detail );
+	}
+}
+```
+
+Create `src/Support/TransitionOutcome.php`:
+
+```php
+<?php
+declare( strict_types = 1 );
+
+namespace PostDomain\Support;
+
+enum TransitionOutcome: string {
+
+	/** The transition is applied and, on InnoDB, its event committed with it. */
+	case COMMITTED = 'committed';
+
+	/** The CAS matched nothing: someone else owns the row. Nothing was written. */
+	case CAS_LOST = 'cas_lost';
+
+	/** The event could not be inserted, so the transition was rolled back. */
+	case EVENT_FAILED = 'event_failed';
+
+	/** No transaction could be started, so the transition was never attempted. */
+	case TRANSACTION_UNAVAILABLE = 'transaction_unavailable';
+
+	/**
+	 * The commit was not confirmed, or a rollback failed. The transition may or
+	 * may not have landed and this process cannot tell — and cannot find out by
+	 * reading its own connection, which may be showing it its own uncommitted
+	 * work. Never success, never fencing, and never a reason to repeat a provider
+	 * call. A later pass, on a connection with a committed view, decides.
+	 */
+	case COMMIT_UNCERTAIN = 'commit_uncertain';
+}
+```
+
+Create `src/Support/TransitionResult.php`:
+
+```php
+<?php
+declare( strict_types = 1 );
+
+namespace PostDomain\Support;
+
+final class TransitionResult {
+
+	public function __construct(
+		public readonly TransitionOutcome $outcome,
+		public readonly string $detail
+	) {}
+
+	public function committed(): bool {
+		return TransitionOutcome::COMMITTED === $this->outcome;
+	}
+
+	/** True only for the one cause that means another owner holds the row. */
+	public function cas_lost(): bool {
+		return TransitionOutcome::CAS_LOST === $this->outcome;
+	}
+}
+```
+
+- [ ] **Step 4: Run the test to verify it passes**
+
+Run: `composer test:integration -- --filter EventLogTest`
+Expected: PASS — 5 tests
+
+- [ ] **Step 5: Write the failing test for atomicity**
+
+Create `tests/integration/Support/AtomicTransitionTest.php`:
+
+```php
+<?php
+declare( strict_types = 1 );
+
+namespace PostDomain\Tests\Integration\Support;
+
+use PostDomain\Mapping\EventLog;
+use PostDomain\Support\AtomicTransition;
+use PostDomain\Support\Schema;
+use PostDomain\Support\TransitionOutcome;
+use WP_UnitTestCase;
+
+final class AtomicTransitionTest extends WP_UnitTestCase {
+
+	public function set_up(): void {
+		parent::set_up();
+		Schema::install();
+	}
+
+	public function tear_down(): void {
+		// Re-probe and restore the real engine after the overrides below, and
+		// drop any query filter a failed assertion left installed.
+		remove_all_filters( 'query' );
+		delete_option( 'pd_schema_engine' );
+		Schema::install();
+		parent::tear_down();
+	}
+
+	private function as_engine( string $engine ): void {
+		update_option( 'pd_schema_engine', $engine, false );
+	}
+
+	private function event( int $id ): callable {
+		return static fn(): bool => EventLog::record( $id, 'example.test', 'ssl', null, 'active', 'cron' );
+	}
+
+	public function test_innodb_is_detected_as_transactional(): void {
+		$this->as_engine( 'InnoDB' );
+
+		$this->assertTrue( AtomicTransition::is_transactional() );
+	}
+
+	public function test_myisam_is_not_transactional(): void {
+		$this->as_engine( 'MyISAM' );
+
+		$this->assertFalse( AtomicTransition::is_transactional() );
+	}
+
+	public function test_on_innodb_a_zero_row_cas_records_no_event(): void {
+		$this->as_engine( 'InnoDB' );
+
+		$result = AtomicTransition::commit( static fn(): bool => false, $this->event( 101 ) );
+
+		$this->assertSame( TransitionOutcome::CAS_LOST, $result->outcome );
+		$this->assertTrue( $result->cas_lost() );
+		$this->assertFalse( $result->committed() );
+		$this->assertCount( 0, EventLog::for_domain( 101 ) );
+	}
+
+	public function test_on_innodb_a_successful_pair_commits_together(): void {
+		$this->as_engine( 'InnoDB' );
+
+		$result = AtomicTransition::commit( static fn(): bool => true, $this->event( 102 ) );
+
+		$this->assertTrue( $result->committed() );
+		$this->assertCount( 1, EventLog::for_domain( 102 ) );
+	}
+
+	public function test_on_innodb_a_failed_event_rolls_the_transition_back(): void {
+		global $wpdb;
+
+		$this->as_engine( 'InnoDB' );
+
+		$result = AtomicTransition::commit(
+			static function () use ( $wpdb ): bool {
+				$wpdb->insert( // phpcs:ignore WordPress.DB
+					Schema::events_table(),
+					array(
+						'domain_id'  => 103,
+						'host'       => 'rolled-back.test',
+						'type'       => 'ssl',
+						'created_at' => gmdate( 'Y-m-d H:i:s' ),
+					)
+				);
+
+				return true;
+			},
+			static fn(): bool => false
+		);
+
+		$this->assertSame( TransitionOutcome::EVENT_FAILED, $result->outcome );
+		$this->assertFalse( $result->cas_lost(), 'the CAS succeeded; the event did not' );
+		$this->assertCount( 0, EventLog::for_domain( 103 ), 'the transition rolled back with its event' );
+	}
+
+	public function test_a_transaction_that_cannot_start_never_runs_the_transition(): void {
+		$this->as_engine( 'InnoDB' );
+
+		$ran = false;
+
+		add_filter( 'query', $fail = static fn( string $q ): string => 'START TRANSACTION' === $q ? 'SELECT bad_syntax FROM' : $q );
+
+		$result = AtomicTransition::commit(
+			static function () use ( &$ran ): bool {
+				$ran = true;
+
+				return true;
+			},
+			$this->event( 106 )
+		);
+
+		remove_filter( 'query', $fail );
+
+		$this->assertSame( TransitionOutcome::TRANSACTION_UNAVAILABLE, $result->outcome );
+		$this->assertFalse( $ran, 'nothing may be written without the transaction that keeps it whole' );
+		$this->assertCount( 0, EventLog::for_domain( 106 ) );
+	}
+
+	public function test_a_failed_commit_is_never_reported_as_committed(): void {
+		$this->as_engine( 'InnoDB' );
+
+		add_filter( 'query', $fail = static fn( string $q ): string => 'COMMIT' === $q ? 'SELECT bad_syntax FROM' : $q );
+
+		$result = AtomicTransition::commit( static fn(): bool => true, $this->event( 107 ) );
+
+		remove_filter( 'query', $fail );
+
+		$this->assertSame( TransitionOutcome::COMMIT_UNCERTAIN, $result->outcome );
+		$this->assertFalse( $result->committed() );
+		$this->assertFalse( $result->cas_lost(), 'an uncertain commit is not a lost CAS' );
+		$this->assertStringContainsString( 'unknown', $result->detail, 'the wording must not claim a rollback' );
+	}
+
+	public function test_an_uncertain_commit_attempts_no_rollback(): void {
+		$this->as_engine( 'InnoDB' );
+
+		$issued = array();
+
+		add_filter(
+			'query',
+			$spy = static function ( string $q ) use ( &$issued ): string {
+				$issued[] = $q;
+
+				return 'COMMIT' === $q ? 'SELECT bad_syntax FROM' : $q;
+			}
+		);
+
+		AtomicTransition::commit( static fn(): bool => true, $this->event( 115 ) );
+
+		remove_filter( 'query', $spy );
+
+		$this->assertNotContains(
+			'ROLLBACK',
+			$issued,
+			'rolling back a transaction that may already have committed decides nothing'
+		);
+	}
+
+	public function test_a_failed_rollback_is_reported_as_uncertain_not_as_a_lost_cas(): void {
+		$this->as_engine( 'InnoDB' );
+
+		add_filter( 'query', $fail = static fn( string $q ): string => 'ROLLBACK' === $q ? 'SELECT bad_syntax FROM' : $q );
+
+		$result = AtomicTransition::commit( static fn(): bool => false, $this->event( 108 ) );
+
+		remove_filter( 'query', $fail );
+
+		$this->assertSame( TransitionOutcome::COMMIT_UNCERTAIN, $result->outcome );
+		$this->assertStringContainsString( 'ROLLBACK', $result->detail );
+	}
+
+	public function test_on_innodb_a_throwing_transition_rolls_back_and_rethrows(): void {
+		$this->as_engine( 'InnoDB' );
+
+		$this->expectException( \RuntimeException::class );
+
+		try {
+			AtomicTransition::commit(
+				static function (): bool {
+					throw new \RuntimeException( 'boom' );
+				},
+				$this->event( 104 )
+			);
+		} finally {
+			$this->assertCount( 0, EventLog::for_domain( 104 ) );
+		}
+	}
+
+	public function test_a_throwing_event_also_rolls_back_and_rethrows(): void {
+		$this->as_engine( 'InnoDB' );
+
+		$this->expectException( \RuntimeException::class );
+
+		AtomicTransition::commit(
+			static fn(): bool => true,
+			static function (): bool {
+				throw new \RuntimeException( 'boom' );
+			}
+		);
+	}
+
+	public function test_nesting_is_refused_rather_than_silently_flattened(): void {
+		$this->as_engine( 'InnoDB' );
+
+		$this->expectException( \LogicException::class );
+
+		AtomicTransition::commit(
+			static function (): bool {
+				AtomicTransition::commit( static fn(): bool => true, static fn(): bool => true );
+
+				return true;
+			},
+			static fn(): bool => true
+		);
+	}
+
+	public function test_a_refused_nesting_leaves_the_outer_transaction_usable(): void {
+		$this->as_engine( 'InnoDB' );
+
+		try {
+			AtomicTransition::commit(
+				static function (): bool {
+					AtomicTransition::commit( static fn(): bool => true, static fn(): bool => true );
+
+					return true;
+				},
+				static fn(): bool => true
+			);
+		} catch ( \LogicException $e ) {
+			unset( $e );
+		}
+
+		$this->assertTrue(
+			AtomicTransition::commit( static fn(): bool => true, $this->event( 109 ) )->committed(),
+			'the guard must reset itself'
+		);
+	}
+
+	public function test_a_top_level_transition_owns_its_own_transaction(): void {
+		$this->as_engine( 'InnoDB' );
+
+		$this->assertFalse( AtomicTransition::in_ambient_transaction(), 'the probe sees a clean session' );
+		$this->assertTrue( AtomicTransition::commit( static fn(): bool => true, $this->event( 110 ) )->committed() );
+		$this->assertFalse( AtomicTransition::in_ambient_transaction(), 'and leaves it clean' );
+	}
+
+	public function test_an_ambient_transaction_is_detected(): void {
+		global $wpdb;
+
+		$this->as_engine( 'InnoDB' );
+
+		$wpdb->query( 'START TRANSACTION' ); // phpcs:ignore WordPress.DB
+
+		$this->assertTrue( AtomicTransition::in_ambient_transaction() );
+
+		$wpdb->query( 'ROLLBACK' ); // phpcs:ignore WordPress.DB
+	}
+
+	public function test_an_ambient_transaction_refuses_before_the_transition_runs(): void {
+		global $wpdb;
+
+		$this->as_engine( 'InnoDB' );
+		$ran = false;
+
+		$wpdb->query( 'START TRANSACTION' ); // phpcs:ignore WordPress.DB
+
+		$result = AtomicTransition::commit(
+			static function () use ( &$ran ): bool {
+				$ran = true;
+
+				return true;
+			},
+			$this->event( 111 )
+		);
+
+		$still_open = AtomicTransition::in_ambient_transaction();
+
+		$wpdb->query( 'ROLLBACK' ); // phpcs:ignore WordPress.DB
+
+		$this->assertSame( TransitionOutcome::TRANSACTION_UNAVAILABLE, $result->outcome );
+		$this->assertFalse( $ran, 'nothing is written into a transaction this plugin does not own' );
+		$this->assertTrue( $still_open, 'and the ambient transaction is neither committed nor rolled back' );
+		$this->assertCount( 0, EventLog::for_domain( 111 ) );
+	}
+
+	public function test_an_ambient_transaction_keeps_its_own_unrelated_writes(): void {
+		global $wpdb;
+
+		$this->as_engine( 'InnoDB' );
+
+		$wpdb->query( 'START TRANSACTION' ); // phpcs:ignore WordPress.DB
+		EventLog::record( 112, 'callers-own.test', 'admin', null, null, 'someone-else' );
+
+		AtomicTransition::commit( static fn(): bool => true, $this->event( 113 ) );
+
+		// Still the caller's to decide, and still uncommitted.
+		$this->assertCount( 1, EventLog::for_domain( 112 ) );
+
+		$wpdb->query( 'ROLLBACK' ); // phpcs:ignore WordPress.DB
+
+		$this->assertCount( 0, EventLog::for_domain( 112 ), 'the caller rolled back its own work' );
+		$this->assertCount( 0, EventLog::for_domain( 113 ) );
+	}
+
+	public function test_a_probe_that_cannot_be_trusted_stops_the_transition(): void {
+		$this->as_engine( 'InnoDB' );
+		$ran = false;
+
+		add_filter( 'query', $fail = static fn( string $q ): string => str_starts_with( $q, 'SAVEPOINT' ) ? 'SELECT bad_syntax FROM' : $q );
+
+		$result = AtomicTransition::commit(
+			static function () use ( &$ran ): bool {
+				$ran = true;
+
+				return true;
+			},
+			$this->event( 114 )
+		);
+
+		remove_filter( 'query', $fail );
+
+		$this->assertSame( TransitionOutcome::TRANSACTION_UNAVAILABLE, $result->outcome );
+		$this->assertFalse( $ran );
+	}
+
+	public function test_the_probe_leaves_no_error_behind(): void {
+		global $wpdb;
+
+		$this->as_engine( 'InnoDB' );
+		$wpdb->last_error = '';
+
+		AtomicTransition::in_ambient_transaction();
+
+		$this->assertSame( '', $wpdb->last_error, 'a probe must not look like a failure to the next caller' );
+	}
+
+	public function test_on_a_nontransactional_engine_a_zero_row_cas_still_records_no_event(): void {
+		$this->as_engine( 'MyISAM' );
+
+		$result = AtomicTransition::commit( static fn(): bool => false, $this->event( 105 ) );
+
+		$this->assertSame( TransitionOutcome::CAS_LOST, $result->outcome );
+		$this->assertCount( 0, EventLog::for_domain( 105 ), 'the event is best-effort, never speculative' );
+	}
+
+	public function test_on_a_nontransactional_engine_a_failed_event_does_not_undo_the_transition(): void {
+		$this->as_engine( 'MyISAM' );
+
+		$result = AtomicTransition::commit( static fn(): bool => true, static fn(): bool => false );
+
+		$this->assertTrue( $result->committed(), 'the log may lag or miss rows; the state change still stands' );
+		$this->assertStringContainsString( 'not recorded', $result->detail );
+	}
+}
+```
+
+- [ ] **Step 6: Run it and verify it passes**
+
+Run: `composer test:integration -- --filter AtomicTransitionTest`
+Expected: PASS — 20 tests
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add src/Mapping/EventLog.php src/Support/AtomicTransition.php src/Support/TransitionOutcome.php src/Support/TransitionResult.php tests/integration/Mapping/EventLogTest.php tests/integration/Support/AtomicTransitionTest.php
+git commit -m "Write a state change and its event as one transaction on InnoDB
+
+The host snapshot exists because rows are eventually hard-deleted and the
+history has to stay readable afterwards. On engines without transactions the
+event stays best-effort, but it is attempted only after the CAS succeeds, so a
+fenced worker can never leave a success event behind.
+
+The result is typed rather than boolean: a lost CAS means someone else owns the
+row, while an unavailable transaction, a failed event, or an uncertain commit are
+each a different kind of not-knowing. Those need different answers, so they are
+not collapsed. And a transaction opened elsewhere on the connection is never
+committed or rolled back here — the transition simply does not run."
+```
+
+---
+
+### Task 6: Alias resolution and delete
+
+**Files:**
+- Create: `src/Mapping/AliasResolver.php`
+- Modify: `src/Mapping/DbRepository.php` (implement `delete()`)
+- Test: `tests/integration/Mapping/AliasTest.php`
+
+**Interfaces:**
+- Consumes: `MappingRepository` (Task 3), `Mapping` (Task 3).
+- Produces:
+  - `PostDomain\Mapping\AliasResolver::__construct( MappingRepository $repo )`
+  - `::canonical_for( Mapping $m ): ?Mapping` — the alias's parent, or the mapping itself.
+  - `::canonical_host( Mapping $m ): string`
+  - `::effective_post_id( Mapping $m ): ?int`
+  - `::aliases_of( int $canonical_id ): Mapping[]`
+  - `DbRepository::delete( int $id ): void` — throws `PostDomain\Mapping\AliasInUse` while aliases point at the row.
+
+- [ ] **Step 1: Write the failing test**
+
+Create `tests/integration/Mapping/AliasTest.php`:
+
+```php
+<?php
+declare( strict_types = 1 );
+
+namespace PostDomain\Tests\Integration\Mapping;
+
+use PostDomain\Mapping\ActivationState;
+use PostDomain\Mapping\AliasInUse;
+use PostDomain\Mapping\AliasResolver;
+use PostDomain\Mapping\DbRepository;
+use PostDomain\Mapping\Mapping;
+use PostDomain\Mapping\SslState;
+use PostDomain\Mapping\VerificationState;
+use PostDomain\Support\Schema;
+use WP_UnitTestCase;
+
+final class AliasTest extends WP_UnitTestCase {
+
+	private DbRepository $repo;
+	private AliasResolver $aliases;
+
+	public function set_up(): void {
+		parent::set_up();
+		Schema::install();
+		$this->repo    = new DbRepository();
+		$this->aliases = new AliasResolver( $this->repo );
+	}
+
+	private function make( string $host, ?int $alias_of, ?int $post_id, string $challenge ): Mapping {
+		return $this->repo->save(
+			new Mapping(
+				0, $host, $alias_of, $post_id, 1,
+				VerificationState::UNVERIFIED, ActivationState::INACTIVE, SslState::NONE,
+				null, str_repeat( $challenge, 32 ), '_post-domain-challenge'
+			)
+		);
+	}
+
+	public function test_an_alias_derives_its_target_from_the_canonical_row(): void {
+		$canonical = $this->make( 'example.test', null, 42, 'a' );
+		$alias     = $this->make( 'www.example.test', $canonical->id, null, 'b' );
+
+		$this->assertSame( 42, $this->aliases->effective_post_id( $alias ) );
+		$this->assertSame( 'example.test', $this->aliases->canonical_host( $alias ) );
+	}
+
+	public function test_a_canonical_row_is_its_own_canonical(): void {
+		$canonical = $this->make( 'example.test', null, 42, 'c' );
+
+		$this->assertSame( $canonical->id, $this->aliases->canonical_for( $canonical )?->id );
+		$this->assertSame( 'example.test', $this->aliases->canonical_host( $canonical ) );
+	}
+
+	public function test_aliases_carry_their_own_challenge(): void {
+		$canonical = $this->make( 'example.test', null, 42, 'd' );
+		$alias     = $this->make( 'www.example.test', $canonical->id, null, 'e' );
+
+		$this->assertNotSame(
+			$canonical->challenge,
+			$alias->challenge,
+			'ownership proof is per host and cannot be inherited'
+		);
+	}
+
+	public function test_aliases_of_lists_the_children(): void {
+		$canonical = $this->make( 'example.test', null, 42, 'f' );
+		$this->make( 'www.example.test', $canonical->id, null, 'g' );
+		$this->make( 'shop.example.test', $canonical->id, null, 'h' );
+
+		$this->assertCount( 2, $this->aliases->aliases_of( $canonical->id ) );
+	}
+
+	public function test_deleting_a_canonical_row_with_aliases_is_refused(): void {
+		$canonical = $this->make( 'example.test', null, 42, 'i' );
+		$this->make( 'www.example.test', $canonical->id, null, 'j' );
+
+		$this->expectException( AliasInUse::class );
+		$this->repo->delete( $canonical->id );
+	}
+
+	public function test_deleting_an_alias_then_its_canonical_succeeds(): void {
+		$canonical = $this->make( 'example.test', null, 42, 'k' );
+		$alias     = $this->make( 'www.example.test', $canonical->id, null, 'l' );
+
+		$this->repo->delete( $alias->id );
+		$this->repo->delete( $canonical->id );
+
+		$this->assertNull( $this->repo->by_id( $canonical->id ) );
+	}
+}
+```
+
+- [ ] **Step 2: Run the test to verify it fails**
+
+Run: `composer test:integration -- --filter AliasTest`
+Expected: FAIL — `Error: Class "PostDomain\Mapping\AliasResolver" not found`
+
+- [ ] **Step 3: Write minimal implementation**
+
+Create `src/Mapping/AliasInUse.php`:
+
+```php
+<?php
+declare( strict_types = 1 );
+
+namespace PostDomain\Mapping;
+
+final class AliasInUse extends \RuntimeException {}
+```
+
+Create `src/Mapping/AliasResolver.php`:
+
+```php
+<?php
+declare( strict_types = 1 );
+
+namespace PostDomain\Mapping;
+
+use PostDomain\Contracts\MappingRepository;
+
+final class AliasResolver {
+
+	public function __construct( private readonly MappingRepository $repo ) {}
+
+	public function canonical_for( Mapping $m ): ?Mapping {
+		return $m->is_alias() ? $this->repo->by_id( (int) $m->alias_of ) : $m;
+	}
+
+	public function canonical_host( Mapping $m ): string {
+		return $this->canonical_for( $m )?->host ?? $m->host;
+	}
+
+	public function effective_post_id( Mapping $m ): ?int {
+		return $this->canonical_for( $m )?->post_id;
+	}
+
+	/** @return Mapping[] */
+	public function aliases_of( int $canonical_id ): array {
+		return array_values(
+			array_filter(
+				$this->repo->all(),
+				static fn( Mapping $m ): bool => $m->alias_of === $canonical_id
+			)
+		);
+	}
+}
+```
+
+Replace `DbRepository::delete()` with:
+
+<!-- covered-by: AliasTest -->
+
+```php
+	public function delete( int $id ): void {
+		global $wpdb;
+
+		foreach ( $this->all() as $mapping ) {
+			if ( $mapping->alias_of === $id ) {
+				throw new AliasInUse(
+					sprintf( 'Mapping %d still has aliases pointing at it.', $id )
+				);
+			}
+		}
+
+		$wpdb->delete( Schema::domains_table(), array( 'id' => $id ), array( '%d' ) ); // phpcs:ignore WordPress.DB
+	}
+```
+
+- [ ] **Step 4: Run the test to verify it passes**
+
+Run: `composer test:integration -- --filter AliasTest`
+Expected: PASS — 6 tests
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/Mapping/AliasResolver.php src/Mapping/AliasInUse.php src/Mapping/DbRepository.php tests/integration/Mapping/AliasTest.php
+git commit -m "Resolve aliases and refuse to orphan them
+
+An alias derives its target and content policy from the canonical row but keeps
+its own challenge, because DNS ownership is proved per host and cannot be
+inherited."
+```
+
+---
+
+### Task 7: Injected clock, scheduler, and HTTP client
+
+**Files:**
+- Create: `src/Contracts/Clock.php`, `src/Contracts/Scheduler.php`, `src/Contracts/HttpClient.php`, `src/Support/SystemClock.php`, `src/Support/WpCronScheduler.php`, `src/Support/WpHttpClient.php`, `src/Support/HttpResponse.php`, `tests/Fixtures/FrozenClock.php`
+- Modify: `composer.json` (`autoload-dev` PSR-4 entry for `PostDomain\Tests\Fixtures\`)
+- Test: `tests/unit/Support/SystemClockTest.php`, `tests/integration/Support/WpCronSchedulerTest.php`
+
+**Interfaces:**
+- Consumes: nothing.
+- Produces:
+  - `PostDomain\Contracts\Clock::now(): \DateTimeImmutable` and `::mysql(): string` (UTC `Y-m-d H:i:s`).
+  - `PostDomain\Tests\Fixtures\FrozenClock` — a `Clock` the test moves deliberately, with `::set( \DateTimeImmutable $now ): void` and `::advance( int $seconds ): void`. Any plan that needs to make a backoff or a lease expiry come due uses this rather than sleeping.
+  - `PostDomain\Contracts\Scheduler::schedule( string $hook, \DateTimeImmutable $at, array $args = array() ): void`, `::unschedule( string $hook, array $args = array() ): void`, `::next( string $hook, array $args = array() ): ?\DateTimeImmutable`.
+  - `PostDomain\Contracts\HttpClient::request( string $method, string $url, array $opts = array() ): HttpResponse` where `HttpResponse` is readonly `int $status`, `array $headers`, `string $body`, `?string $error`.
+
+The clock and scheduler exist so grace logic and reconciliation are testable
+without `sleep()` or real cron (spec §2.2).
+
+- [ ] **Step 1: Write the failing test**
+
+Create `tests/unit/Support/SystemClockTest.php`:
+
+```php
+<?php
+declare( strict_types = 1 );
+
+namespace PostDomain\Tests\Unit\Support;
+
+use PHPUnit\Framework\TestCase;
+use PostDomain\Support\SystemClock;
+
+final class SystemClockTest extends TestCase {
+
+	public function test_now_is_utc(): void {
+		$this->assertSame( 'UTC', ( new SystemClock() )->now()->getTimezone()->getName() );
+	}
+
+	public function test_mysql_format_matches_the_stored_shape(): void {
+		$this->assertMatchesRegularExpression(
+			'/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/',
+			( new SystemClock() )->mysql()
+		);
+	}
+
+	public function test_no_source_file_calls_current_time(): void {
+		$offenders = array();
+
+		/** @var \SplFileInfo $file */
+		foreach ( new \RecursiveIteratorIterator(
+			new \RecursiveDirectoryIterator( dirname( __DIR__, 3 ) . '/src' )
+		) as $file ) {
+			if ( 'php' !== $file->getExtension() ) {
+				continue;
+			}
+
+			if ( str_contains( (string) file_get_contents( $file->getPathname() ), 'current_time(' ) ) {
+				$offenders[] = $file->getFilename();
+			}
+		}
+
+		$this->assertSame(
+			array(),
+			$offenders,
+			'a site-local timestamp in a scheduling column drifts by hours across DST'
+		);
+	}
+}
+```
+
+Create `tests/integration/Support/WpCronSchedulerTest.php`:
+
+```php
+<?php
+declare( strict_types = 1 );
+
+namespace PostDomain\Tests\Integration\Support;
+
+use PostDomain\Support\WpCronScheduler;
+use WP_UnitTestCase;
+
+final class WpCronSchedulerTest extends WP_UnitTestCase {
+
+	public function test_scheduling_and_reading_back_a_single_event(): void {
+		$scheduler = new WpCronScheduler();
+		$at        = new \DateTimeImmutable( '+10 minutes', new \DateTimeZone( 'UTC' ) );
+
+		$scheduler->schedule( 'pd_test_hook', $at, array( 7 ) );
+
+		$this->assertSame(
+			$at->getTimestamp(),
+			$scheduler->next( 'pd_test_hook', array( 7 ) )?->getTimestamp()
+		);
+	}
+
+	public function test_unscheduling_removes_the_event(): void {
+		$scheduler = new WpCronScheduler();
+		$scheduler->schedule( 'pd_test_hook', new \DateTimeImmutable( '+5 minutes', new \DateTimeZone( 'UTC' ) ), array( 8 ) );
+		$scheduler->unschedule( 'pd_test_hook', array( 8 ) );
+
+		$this->assertNull( $scheduler->next( 'pd_test_hook', array( 8 ) ) );
+	}
+}
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `vendor/bin/phpunit --testsuite unit --filter SystemClockTest`
+Expected: FAIL — `Error: Class "PostDomain\Support\SystemClock" not found`
+
+- [ ] **Step 3: Write minimal implementation**
+
+Create `src/Contracts/Clock.php`:
+
+```php
+<?php
+declare( strict_types = 1 );
+
+namespace PostDomain\Contracts;
+
+interface Clock {
+
+	public function now(): \DateTimeImmutable;
+
+	/** UTC, in the shape every DATETIME column stores. */
+	public function mysql(): string;
+}
+```
+
+Create `src/Support/SystemClock.php`:
+
+```php
+<?php
+declare( strict_types = 1 );
+
+namespace PostDomain\Support;
+
+use PostDomain\Contracts\Clock;
+
+final class SystemClock implements Clock {
+
+	public function now(): \DateTimeImmutable {
+		return new \DateTimeImmutable( 'now', new \DateTimeZone( 'UTC' ) );
+	}
+
+	public function mysql(): string {
+		return gmdate( 'Y-m-d H:i:s' );
+	}
+}
+```
+
+Create `tests/Fixtures/FrozenClock.php`, the shared test double every plan uses
+when it needs to move time deliberately:
+
+```php
+<?php
+declare( strict_types = 1 );
+
+namespace PostDomain\Tests\Fixtures;
+
+use PostDomain\Contracts\Clock;
+
+/** A clock the test moves on purpose. Never autoloaded into production code. */
+final class FrozenClock implements Clock {
+
+	private \DateTimeImmutable $now;
+
+	public function __construct( ?\DateTimeImmutable $now = null ) {
+		$this->now = $now ?? new \DateTimeImmutable( 'now', new \DateTimeZone( 'UTC' ) );
+	}
+
+	public function now(): \DateTimeImmutable {
+		return $this->now;
+	}
+
+	public function mysql(): string {
+		return $this->now->format( 'Y-m-d H:i:s' );
+	}
+
+	public function set( \DateTimeImmutable $now ): void {
+		$this->now = $now->setTimezone( new \DateTimeZone( 'UTC' ) );
+	}
+
+	public function advance( int $seconds ): void {
+		$this->set( $this->now->modify( "+{$seconds} seconds" ) );
+	}
+}
+```
+
+Register it in `composer.json`'s `autoload-dev`:
+
+```json
+		"psr-4": {
+			"PostDomain\\Tests\\Fixtures\\": "tests/Fixtures/"
+		}
+```
+
+Create `src/Contracts/Scheduler.php`:
+
+```php
+<?php
+declare( strict_types = 1 );
+
+namespace PostDomain\Contracts;
+
+interface Scheduler {
+
+	/** @param array<int, mixed> $args */
+	public function schedule( string $hook, \DateTimeImmutable $at, array $args = array() ): void;
+
+	/** @param array<int, mixed> $args */
+	public function unschedule( string $hook, array $args = array() ): void;
+
+	/** @param array<int, mixed> $args */
+	public function next( string $hook, array $args = array() ): ?\DateTimeImmutable;
+}
+```
+
+Create `src/Support/WpCronScheduler.php`:
+
+```php
+<?php
+declare( strict_types = 1 );
+
+namespace PostDomain\Support;
+
+use PostDomain\Contracts\Scheduler;
+
+final class WpCronScheduler implements Scheduler {
+
+	/** @param array<int, mixed> $args */
+	public function schedule( string $hook, \DateTimeImmutable $at, array $args = array() ): void {
+		$this->unschedule( $hook, $args );
+		wp_schedule_single_event( $at->getTimestamp(), $hook, $args );
+	}
+
+	/** @param array<int, mixed> $args */
+	public function unschedule( string $hook, array $args = array() ): void {
+		$timestamp = wp_next_scheduled( $hook, $args );
+
+		while ( false !== $timestamp ) {
+			wp_unschedule_event( $timestamp, $hook, $args );
+			$timestamp = wp_next_scheduled( $hook, $args );
+		}
+	}
+
+	/** @param array<int, mixed> $args */
+	public function next( string $hook, array $args = array() ): ?\DateTimeImmutable {
+		$timestamp = wp_next_scheduled( $hook, $args );
+
+		if ( false === $timestamp ) {
+			return null;
+		}
+
+		return ( new \DateTimeImmutable( '@' . $timestamp ) )->setTimezone( new \DateTimeZone( 'UTC' ) );
+	}
+}
+```
+
+Create `src/Support/HttpResponse.php`:
+
+```php
+<?php
+declare( strict_types = 1 );
+
+namespace PostDomain\Support;
+
+final class HttpResponse {
+
+	/**
+	 * @param array<string, string> $headers
+	 */
+	public function __construct(
+		public readonly int $status,
+		public readonly array $headers,
+		public readonly string $body,
+		public readonly ?string $error = null
+	) {}
+}
+```
+
+Create `src/Contracts/HttpClient.php`:
+
+```php
+<?php
+declare( strict_types = 1 );
+
+namespace PostDomain\Contracts;
+
+use PostDomain\Support\HttpResponse;
+
+interface HttpClient {
+
+	/**
+	 * @param array<string, mixed> $opts
+	 */
+	public function request( string $method, string $url, array $opts = array() ): HttpResponse;
+}
+```
+
+Create `src/Support/WpHttpClient.php`:
+
+```php
+<?php
+declare( strict_types = 1 );
+
+namespace PostDomain\Support;
+
+use PostDomain\Contracts\HttpClient;
+
+final class WpHttpClient implements HttpClient {
+
+	/**
+	 * @param array<string, mixed> $opts
+	 */
+	public function request( string $method, string $url, array $opts = array() ): HttpResponse {
+		$args = array_merge(
+			array(
+				'method'      => $method,
+				'timeout'     => 10,
+				'redirection' => 0,
+			),
+			$opts
+		);
+
+		$response = wp_remote_request( $url, $args );
+
+		if ( is_wp_error( $response ) ) {
+			return new HttpResponse( 0, array(), '', $response->get_error_message() );
+		}
+
+		/** @var array<string, string> $headers */
+		$headers = wp_remote_retrieve_headers( $response )->getAll();
+
+		return new HttpResponse(
+			(int) wp_remote_retrieve_response_code( $response ),
+			$headers,
+			(string) wp_remote_retrieve_body( $response )
+		);
+	}
+}
+```
+
+- [ ] **Step 4: Run the tests to verify they pass**
+
+Run: `vendor/bin/phpunit --testsuite unit --filter SystemClockTest && composer test:integration -- --filter WpCronSchedulerTest`
+Expected: PASS — 3 unit tests, 2 integration tests
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/Contracts/Clock.php src/Contracts/Scheduler.php src/Contracts/HttpClient.php src/Support/SystemClock.php src/Support/WpCronScheduler.php src/Support/WpHttpClient.php src/Support/HttpResponse.php tests/unit/Support/SystemClockTest.php tests/integration/Support/WpCronSchedulerTest.php
+git commit -m "Inject the clock, scheduler, and HTTP client
+
+Grace arithmetic and reconciliation have to be testable without sleeping or
+waiting for real cron, and a test asserts no source file calls current_time()."
+```
+
+---
+
+### Task 8: Uninstall
+
+**Files:**
+- Create: `uninstall.php`
+- Test: `tests/integration/UninstallTest.php`
+
+**Interfaces:**
+- Consumes: `Schema` (Task 2).
+- Produces: nothing consumed by later tasks; this is the plugin's exit path.
+
+Drops both tables and the plugin's own options only. No post, meta, or option
+belonging to anything else is touched (spec §18).
+
+- [ ] **Step 1: Write the failing test**
+
+Create `tests/integration/UninstallTest.php`:
+
+```php
+<?php
+declare( strict_types = 1 );
+
+namespace PostDomain\Tests\Integration;
+
+use PostDomain\Support\Schema;
+use WP_UnitTestCase;
+
+final class UninstallTest extends WP_UnitTestCase {
+
+	public function test_uninstall_drops_our_tables_and_options_and_nothing_else(): void {
+		global $wpdb;
+
+		Schema::install();
+
+		$post_id = self::factory()->post->create( array( 'post_title' => 'Survives uninstall' ) );
+		update_post_meta( $post_id, 'unrelated_meta', 'keep me' );
+		update_option( 'unrelated_option', 'keep me', false );
+		update_option( 'pd_settings', array( 'a' => 1 ), false );
+		update_option( 'pd_installation_id', 'abc', false );
+
+		define( 'WP_UNINSTALL_PLUGIN', 'post-domain/post-domain.php' );
+		require dirname( __DIR__, 2 ) . '/uninstall.php';
+
+		$this->assertNull(
+			$wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', Schema::domains_table() ) )
+		);
+		$this->assertNull(
+			$wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', Schema::events_table() ) )
+		);
+		$this->assertFalse( get_option( 'pd_settings' ) );
+		$this->assertFalse( get_option( 'pd_installation_id' ) );
+		$this->assertFalse( get_option( 'pd_schema_version' ) );
+
+		$this->assertSame( 'Survives uninstall', get_post( $post_id )?->post_title );
+		$this->assertSame( 'keep me', get_post_meta( $post_id, 'unrelated_meta', true ) );
+		$this->assertSame( 'keep me', get_option( 'unrelated_option' ) );
+	}
+}
+```
+
+- [ ] **Step 2: Run the test to verify it fails**
+
+Run: `composer test:integration -- --filter UninstallTest`
+Expected: FAIL — `failed to open stream: No such file or directory` for `uninstall.php`
+
+- [ ] **Step 3: Write minimal implementation**
+
+Create `uninstall.php`:
+
+```php
+<?php
+/**
+ * Removes the plugin's own data and nothing else.
+ *
+ * @package PostDomain
+ */
+
+declare( strict_types = 1 );
+
+defined( 'WP_UNINSTALL_PLUGIN' ) || exit;
+
+require_once __DIR__ . '/vendor/autoload.php';
+
+global $wpdb;
+
+$pd_tables = array(
+	\PostDomain\Support\Schema::domains_table(),
+	\PostDomain\Support\Schema::events_table(),
+);
+
+foreach ( $pd_tables as $pd_table ) {
+	$wpdb->query( "DROP TABLE IF EXISTS {$pd_table}" ); // phpcs:ignore WordPress.DB
+}
+
+$pd_options = array(
+	'pd_schema_version',
+	'pd_schema_engine',
+	'pd_settings',
+	'pd_ssl_credentials',
+	'pd_installation_id',
+	'pd_installation_primary_host',
+	'pd_environment_mismatch',
+	'pd_provider_cooldowns',
+);
+
+foreach ( $pd_options as $pd_option ) {
+	delete_option( $pd_option );
+}
+
+$pd_hooks = array(
+	'pd_verify_pending',
+	'pd_verify_established',
+	'pd_ssl_sweep',
+	'pd_maintenance',
+);
+
+foreach ( $pd_hooks as $pd_hook ) {
+	wp_clear_scheduled_hook( $pd_hook );
+}
+```
+
+- [ ] **Step 4: Run the test to verify it passes**
+
+Run: `composer test:integration -- --filter UninstallTest`
+Expected: PASS — 1 test, 9 assertions
+
+- [ ] **Step 5: Run the full suite**
+
+Run: `composer lint && composer analyse && composer test && composer test:integration`
+Expected: PASS
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add uninstall.php tests/integration/UninstallTest.php
+git commit -m "Remove only this plugin's data on uninstall
+
+The test seeds an unrelated post, meta, and option and asserts all three
+survive, because 'we dropped our tables' is not the same claim as 'we touched
+nothing else'."
+```
+
+---
+
+## Gate for Plan 02
+
+```bash
+composer lint && composer analyse && composer test && composer test:integration
+```
+
+Plus: `Schema::install()` runs twice with no error, every invariant test in
+`RepositoryWriteTest` passes, and `UninstallTest` proves a seeded post survives.
