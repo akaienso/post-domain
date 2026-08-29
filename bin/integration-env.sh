@@ -17,10 +17,22 @@ docker inspect pd-mysql >/dev/null 2>&1 || docker run -d --name pd-mysql \
 
 docker start pd-mysql >/dev/null 2>&1 || true
 
-for _ in $(seq 1 60); do
-	docker exec pd-mysql mysqladmin -uroot -ppd ping >/dev/null 2>&1 && break
-	sleep 2
-done
+# Confirm the container actually came up before waiting on it.
+container_status="$(docker inspect -f '{{.State.Status}}' pd-mysql 2>/dev/null || echo absent)"
+
+if [ "${container_status}" != 'running' ]; then
+	echo "The pd-mysql container is '${container_status}', not running." >&2
+	docker ps -a --filter name=pd-mysql >&2 2>/dev/null || true
+	docker logs --tail 50 pd-mysql >&2 2>&1 || true
+
+	exit 1
+fi
+
+# Readiness is decided by the connection WordPress will make, not by a ping
+# inside the container. See bin/wait-for-mysql.sh. A failure here must stop the
+# script: printing "ready" after an unmet wait is what produced a green harness
+# and a red test run.
+"${root}/bin/wait-for-mysql.sh"
 
 mkdir -p "${root}/tmp"
 cd "${root}/tmp"

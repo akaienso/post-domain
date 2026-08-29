@@ -21,6 +21,12 @@ jobs:
       - run: git diff --exit-code references/cloudflare-status-map.php
       - run: composer lint:plans
       - run: composer test
-      - run: npm ci
-      - run: npx wp-env start
+      # The readiness state machine behind composer test:integration, proved
+      # without a database so a broken probe fails here rather than as a flake.
+      - run: tools/verify-mysql-readiness.sh
+      # composer test:integration brings up its own harness (bin/integration-env.sh:
+      # a pd-mysql container on 127.0.0.1:33306 plus a WordPress checkout under
+      # tmp/), so the wp-env containers that used to be started here were never
+      # contacted by it. .wp-env.json and composer test:integration:wp-env remain
+      # for developers who want that environment.
       - run: composer test:integration
