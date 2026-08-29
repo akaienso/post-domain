@@ -24,7 +24,19 @@ enum RemovalScope: string {
 	/** Only the provider resource goes; the mapping stays. */
 	case RESOURCE = 'resource';
 
+	/**
+	 * A persisted value has three meanings, not two: absent, one of these cases,
+	 * or something this build does not recognise. `tryFrom()` collapses the third
+	 * into the first, which is exactly the collapse that would let a corrupted
+	 * scope be treated as an ordinary row. Callers that must tell them apart use
+	 * `is_invalid()` on the raw column.
+	 */
 	public static function from_row( ?string $value ): ?self {
 		return null === $value ? null : self::tryFrom( $value );
+	}
+
+	/** True when the column holds something, and that something is not a case. */
+	public static function is_invalid( ?string $value ): bool {
+		return null !== $value && null === self::tryFrom( $value );
 	}
 }

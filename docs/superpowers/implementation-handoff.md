@@ -388,4 +388,32 @@ scope correctly means "no removal outstanding".
 
 No unresolved blocker.
 
+---
+
+## Fail-closed correction — 2026-08-29
+
+| # | Defect | Fix |
+|---|---|---|
+| 1 | The sweep dispatched `RESOURCE` explicitly and everything else to mapping deletion, so a corrupted scope byte meant a deleted domain | Exhaustive `match` with no `default`; the selector takes only known scopes and surfaces the rest as `integrity` events; **both services refuse the wrong or unreadable scope themselves** |
+| 2 | An ordinary PATCH wrote six NULLs over a live provider-mutation lease, destroying the fencing token and recovery record | The six columns left `save()` entirely; `ssl_mutation_token IS NULL` is part of the update CAS; PATCH answers `409 pd_mutation_in_progress` for any lease, expired or not |
+| 3 | Clone reset left two lease columns, the whole removal intent, and the source installation's retry state — and clearing the token *made* those rows selectable | The full six-column lease, removal intent and schedule, and stale retry/observation state are cleared in one statement; `ssl_method` is deliberately retained as configuration |
+
+### Verification, every command executed and observed
+
+| Command | Result |
+|---|---|
+| `composer lint` | exit 0 |
+| `composer analyse` | `[OK] No errors`, level 8 |
+| `composer test` | OK — 336 tests, 602 assertions |
+| `composer test:integration` | OK — 777 tests, 1884 assertions, three identical consecutive runs |
+| `composer lint:plans` | exit 0 |
+| `composer generate:status-map` + `git diff --exit-code` | byte-identical |
+| `git diff --check` | clean |
+| Focused, all three findings | OK — 34 tests, 184 assertions |
+
+Each correction was confirmed to bite by restoring the defect and observing the
+tests fail: 15 of 15, 8 of 10, and 5 of 9 respectively.
+
+No unresolved blocker.
+
 IMPLEMENTATION SESSION COMPLETE

@@ -687,3 +687,119 @@ call outside `MutationGate`, no attribution in history. `GET /environment` is
 unchanged and `CteSubtreeAdapter` remains disabled and unwired.
 
 No unresolved blocker.
+
+---
+
+## 2026-08-29 (later) — fail-closed correction, three data-integrity defects
+
+### 1. An unreadable removal scope was treated as whole-mapping deletion
+
+`Ssl\CronWiring` named `RESOURCE` explicitly and sent *everything else* to
+`DeletionService`, while `DeletionSchedule::due()` selected any non-null scope.
+A single corrupted byte in one column was therefore a deleted domain.
+
+`RemovalScope::is_invalid()` now distinguishes the three states a persisted
+value actually has — absent, a known case, or something this build does not
+recognise. `tryFrom()` collapses the third into the first, and that collapse was
+the defect.
+
+- The dispatcher is an exhaustive `match` on the two cases plus `null`. There is
+  no `default`, so a new case cannot silently inherit the deleting branch.
+- `DeletionSchedule::due()` selects only the values this build can finish;
+  `DeletionSchedule::undecidable()` surfaces the rest for diagnostics.
+- Each unreadable due row is reported once per sweep as an `integrity` event with
+  `auto_repaired => false`, and otherwise untouched. What the intent behind a
+  corrupted scope was is not recoverable from the row, and guessing wrong in one
+  direction deletes a domain.
+- **Both services refuse the wrong scope on their own account.** A service that
+  is safe only when something else routes correctly is not safe, so direct
+  invocation of either with the other's scope — or with an unreadable one —
+  returns `scope_conflict` and touches nothing.
+
+`Ssl\RemovalScopeDispatchTest` — 15 tests, 50 assertions. Restoring the old
+dispatcher fails all 15.
+
+### 2. An ordinary PATCH could destroy a live provider-mutation lease
+
+`DbRepository::save()` carried all six `ssl_mutation_*` columns in its update
+data, and `ManagementController::update()` rebuilds a `Mapping` from the request
+without them — so those six arrive at their null defaults. A routine PATCH with
+a current ETag wrote six NULLs over a `RESERVED`, `IN_FLIGHT` or `RECOVERING`
+lease, destroying the fencing token and the recovery record for an operation
+that may already have been sent to a provider.
+
+- The six columns are gone from `save()`'s data entirely. It can no longer clear
+  a lease, and equally no longer mint one — the mirror-image hazard. New rows
+  take the schema's null defaults.
+- `ssl_mutation_token IS NULL` is now part of the update CAS rather than a check
+  before it, so a lease acquired between the caller's read and the statement
+  makes the write match zero rows instead of racing it.
+- A zero-row update re-reads to report the actual reason: `MutationInProgress`
+  when a lease holds the row, `StaleRevision` otherwise. A stale revision is the
+  caller's to retry; a lease is not.
+- `PATCH /domains/{id}` returns `409 pd_mutation_in_progress` for any lease,
+  expired or unexpired. Expiry is not availability: the expired record is exactly
+  what `LeaseRecovery` needs in order to find out what the provider did.
+- Challenge rotation's existing refusal is unchanged, and ETag/revision
+  behaviour for lease-free rows is unchanged.
+
+A test-only action, `pd_test_before_repository_update`, opens the window between
+the read and the CAS so the race can be exercised. Nothing in production listens
+to it; it follows the existing `pd_test_after_provider_call` precedent.
+
+`Rest\LeaseBoundaryTest` — 10 tests, 80 assertions, covering all six
+phase/expiry combinations plus the post-read race. Restoring the old `save()`
+and dropping the PATCH guard fails 8 of the 10.
+
+`RepositoryWriteTest::test_a_complete_lease_is_accepted` asserted the opposite of
+the new contract and is now
+`test_a_caller_supplied_lease_is_never_persisted`.
+
+### 3. Clone reset left mutation and removal state behind
+
+`Environment::resolve_as_clone()` cleared four of the six lease columns, leaving
+`ssl_mutation_driver` and `ssl_mutation_environment` — a row the repository's own
+six-column invariant rejects. It also left `ssl_removal_scope`,
+`deletion_requested_at`, `deletion_attempts`, `deletion_next_attempt_at` and the
+provider retry and observation state of the *source* installation.
+
+Worse than inert: clearing the token while leaving the removal columns actively
+*made* a previously-shielded row selectable, because `DeletionSchedule::due()`
+skips leased rows. A cloned database could hard-delete a mapping on the strength
+of a deletion someone requested somewhere else.
+
+All six lease columns now move together, the removal intent and schedule are
+cleared, and the stale provider retry and observation state goes with them:
+`ssl_next_attempt_at`, `ssl_transient_count`, `ssl_error`, `ssl_checked_at`,
+`ssl_marker_support`, `ssl_method_requested_at` — all measured against a provider
+environment the clone is no longer bound to.
+
+`ssl_method` is deliberately retained: §14.8's clone row does not name it and
+§14.12 treats the DCV method as configuration, so a clone re-requesting a
+certificate should re-request under the method its operator chose.
+
+`Ssl\CloneResetTest` — 9 tests, 54 assertions, asserting every column
+individually by name, that neither `DeletionSchedule::due()` nor
+`LeaseRecovery::due()` returns anything afterwards, that the SSL and maintenance
+sweeps issue zero provider mutations, and that the row round-trips through
+`assert_valid()`. Against the pre-fix method it produces 1 error and 4 failures.
+
+### Verification — every command executed, every result observed
+
+- `composer lint` — exit 0
+- `composer analyse` — `[OK] No errors`, PHPStan level 8
+- `composer test` — OK, 336 tests, 602 assertions
+- `composer test:integration` — OK, 777 tests, 1884 assertions, three identical consecutive runs
+- `composer lint:plans` — exit 0
+- `composer generate:status-map` then `git diff --exit-code` — byte-identical
+- `git diff --check` — clean
+- Focused, all three: `RemovalScopeDispatchTest|LeaseBoundaryTest|CloneResetTest` — OK, 34 tests, 184 assertions
+- The `3ed1fc3` corrections still hold: `SslRemovalResumptionTest|ScheduleTest|DeletionSweepTest` — OK, 33 tests, 182 assertions; `DohEndpointQuorumTest` — OK, 20 tests, 26 assertions
+
+Invariants intact: one `DriverFactory::for_mapping()` caller, no mutating driver
+call outside `MutationGate`, `save()` no longer writes any lease column. The
+persisted removal-scope architecture, the distinct continuation hooks, the
+authority-keyed DoH quorum, `GET /environment` and the disabled
+`CteSubtreeAdapter` are all unchanged.
+
+No unresolved blocker.

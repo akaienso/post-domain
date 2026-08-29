@@ -245,7 +245,13 @@ final class RepositoryWriteTest extends WP_UnitTestCase {
 		);
 	}
 
-	public function test_a_complete_lease_is_accepted(): void {
+	/**
+	 * The six lease columns belong to MutationLease and its exact CAS operations.
+	 * A generic save that honoured them could mint a fencing token for a mutation
+	 * nobody performed, which is the mirror image of clearing one for a mutation
+	 * that is still in flight.
+	 */
+	public function test_a_caller_supplied_lease_is_never_persisted(): void {
 		$saved = $this->repo->save(
 			new Mapping(
 				0,
@@ -276,9 +282,13 @@ final class RepositoryWriteTest extends WP_UnitTestCase {
 
 		$after = $this->repo->by_id( $saved->id );
 
-		$this->assertSame( MutationPhase::RESERVED, $after?->ssl_mutation_phase );
-		$this->assertSame( 'cloudflare-saas', $after?->ssl_mutation_driver );
-		$this->assertSame( 'zone:abc123', $after?->ssl_mutation_environment );
+		$this->assertNotNull( $after, 'the row is written; only the lease is ignored' );
+		$this->assertNull( $after->ssl_mutation_token, 'save() cannot mint a lease' );
+		$this->assertNull( $after->ssl_mutation_kind );
+		$this->assertNull( $after->ssl_mutation_phase );
+		$this->assertNull( $after->ssl_mutation_expires_at );
+		$this->assertNull( $after->ssl_mutation_driver );
+		$this->assertNull( $after->ssl_mutation_environment );
 	}
 
 	public function test_the_completely_unbound_state_is_valid(): void {

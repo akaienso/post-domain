@@ -45,7 +45,14 @@ final class SslResourceRemoval {
 		// the operator who asked for the domain to go would never learn that it
 		// stayed. The lease CAS covers the in-flight case; this covers the
 		// requested-but-not-yet-started one.
-		if ( RemovalScope::MAPPING === RemovalScope::from_row( $mapping->ssl_removal_scope ) ) {
+		//
+		// Checked here rather than only in the dispatcher: a service that is safe
+		// only when something else routes correctly is not safe. A row whose scope
+		// this build cannot read is refused on the same terms — the one thing
+		// never to do with an unreadable intent is act on it.
+		$scope = $mapping->ssl_removal_scope;
+
+		if ( RemovalScope::MAPPING === RemovalScope::from_row( $scope ) || RemovalScope::is_invalid( $scope ) ) {
 			return 'scope_conflict';
 		}
 

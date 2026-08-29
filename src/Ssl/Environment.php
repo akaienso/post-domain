@@ -88,10 +88,48 @@ final class Environment {
 					'ssl_adopted_by'            => null,
 					'ssl_provider_state'        => null,
 					'ssl_state'                 => SslState::NONE->value,
+					// All six lease columns, never four. The repository enforces
+					// that they move together (spec §12.6, DbRepository::assert_valid),
+					// so clearing the token while leaving the driver and the
+					// environment behind produces a row the repository itself
+					// rejects — and a row nothing can then save.
 					'ssl_mutation_token'        => null,
 					'ssl_mutation_kind'         => null,
 					'ssl_mutation_phase'        => null,
 					'ssl_mutation_expires_at'   => null,
+					'ssl_mutation_driver'       => null,
+					'ssl_mutation_environment'  => null,
+					// An outstanding removal is intent recorded by the *source*
+					// installation against the *source* installation's provider
+					// resource. A clone owns nothing anywhere (§14.4, §14.8), so
+					// carrying the scope and its schedule across would leave the
+					// copy due for a removal it was never asked to perform — and
+					// for scope `mapping` (§14.15) that removal deletes the row.
+					'ssl_removal_scope'         => null,
+					'deletion_requested_at'     => null,
+					'deletion_attempts'         => 0,
+					'deletion_next_attempt_at'  => null,
+					// Retry and observation state describes a provider environment
+					// this installation is no longer bound to. Keeping it would
+					// make a clone act on a backoff, a transient count, an error,
+					// and a marker-support verdict that were all measured
+					// somewhere else (§12.6 "evidence about nothing").
+					'ssl_next_attempt_at'       => null,
+					'ssl_transient_count'       => 0,
+					'ssl_error'                 => null,
+					'ssl_checked_at'            => null,
+					'ssl_marker_support'        => null,
+					'ssl_method_requested_at'   => null,
+					// `ssl_method` is deliberately NOT cleared. It is the DCV
+					// method the operator chose for this mapping — configuration,
+					// per §14.12 ("configuration source", "per-mapping change is
+					// explicit"), merely persisted once a provider confirmed it.
+					// §14.8's clone row enumerates what a clone clears and does
+					// not name it, and a clone re-requesting a certificate should
+					// re-request under the method its operator picked. The same
+					// reasoning keeps `host`, `post_id`, `alias_of`, `title`,
+					// `challenge_label`, and `activation_state`: configuration a
+					// copy of a site legitimately still means.
 					'challenge'                 => Challenge::token(),
 					'challenge_rotated_at'      => gmdate( 'Y-m-d H:i:s' ),
 					'verification_state'        => VerificationState::UNVERIFIED->value,

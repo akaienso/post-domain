@@ -95,7 +95,21 @@ final class DeletionService {
 		return 1 === $affected;
 	}
 
+	/**
+	 * @return string One of: removed, pending, transient, failed, refused,
+	 *                scope_conflict, fenced, deferred.
+	 */
 	public function process( Mapping $mapping ): string {
+		// This workflow ends in a hard delete, so it runs only on a row that says
+		// in its own persisted state that the mapping is what is going. A resource
+		// scope, or a scope this build cannot read, is refused here and not merely
+		// routed elsewhere: safety that depends on the caller is not safety.
+		$scope = $mapping->ssl_removal_scope;
+
+		if ( RemovalScope::RESOURCE === RemovalScope::from_row( $scope ) || RemovalScope::is_invalid( $scope ) ) {
+			return 'scope_conflict';
+		}
+
 		$gated = $this->workflow->attempt( $mapping );
 
 		if ( $gated instanceof MutationRefusal ) {

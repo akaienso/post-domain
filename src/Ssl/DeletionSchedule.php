@@ -28,25 +28,65 @@ use PostDomain\Support\Schema;
  */
 final class DeletionSchedule {
 
-	/** @return Mapping[] */
+	/**
+	 * Ordinary due work: rows whose scope is one this build knows how to finish.
+	 *
+	 * A row whose scope is neither is not ordinary work and is not selected here.
+	 * It is surfaced by `undecidable()` for diagnostics instead, because the one
+	 * thing that must never happen to a row whose intent cannot be read is for it
+	 * to be handed to the workflow that hard-deletes mappings.
+	 *
+	 * @return Mapping[]
+	 */
 	public static function due( int $batch, Clock $clock ): array {
+		return self::select(
+			'ssl_removal_scope IN (%%SCOPES%%) AND ssl_mutation_token IS NULL',
+			$batch,
+			$clock
+		);
+	}
+
+	/**
+	 * Due rows whose persisted scope is not a value this build recognises.
+	 *
+	 * Reported, never repaired. What the intent behind a corrupted scope was is
+	 * not something the plugin can infer, and guessing wrong in one direction
+	 * deletes a domain nobody asked to delete.
+	 *
+	 * @return Mapping[]
+	 */
+	public static function undecidable( int $batch, Clock $clock ): array {
+		return self::select(
+			'ssl_removal_scope IS NOT NULL AND ssl_removal_scope NOT IN (%%SCOPES%%)',
+			$batch,
+			$clock
+		);
+	}
+
+	/**
+	 * @param string $scope_clause A WHERE fragment written here, never by a
+	 *                             caller, in which %%SCOPES%% expands to one
+	 *                             placeholder per RemovalScope case.
+	 * @return Mapping[]
+	 */
+	private static function select( string $scope_clause, int $batch, Clock $clock ): array {
 		global $wpdb;
 
-		$table = Schema::domains_table();
+		$table  = Schema::domains_table();
+		$scopes = array_map( static fn( RemovalScope $s ): string => $s->value, RemovalScope::cases() );
+		$clause = str_replace( '%%SCOPES%%', implode( ',', array_fill( 0, count( $scopes ), '%s' ) ), $scope_clause );
 
 		/** @var array<int, array<string, string|null>> $rows */
-		// phpcs:disable WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- $table is Schema::domains_table(), never caller input.
+		// phpcs:disable WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- $table is Schema::domains_table() and $clause is written above, never caller input.
 		$rows = $wpdb->get_results( // phpcs:ignore WordPress.DB
-			$wpdb->prepare(
+			$wpdb->prepare( // phpcs:ignore WordPress.DB.PreparedSQLPlaceholders.ReplacementsWrongNumber
 				"SELECT * FROM {$table}
-				  WHERE ssl_removal_scope IS NOT NULL
+				  WHERE {$clause}
 				    AND deletion_next_attempt_at IS NOT NULL
 				    AND deletion_next_attempt_at <= %s
-				    AND ssl_mutation_token IS NULL
 				  ORDER BY deletion_next_attempt_at ASC
 				  LIMIT %d",
-				$clock->mysql(),
-				$batch
+				array_merge( $scopes, array( $clock->mysql(), $batch ) )
 			),
 			ARRAY_A
 		);

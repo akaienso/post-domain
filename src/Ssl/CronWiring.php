@@ -4,6 +4,7 @@ declare( strict_types = 1 );
 namespace PostDomain\Ssl;
 
 use PostDomain\Mapping\DbRepository;
+use PostDomain\Mapping\EventLog;
 use PostDomain\Mapping\Mapping;
 use PostDomain\Support\SystemClock;
 use PostDomain\Verification\ResolverFactory;
@@ -23,6 +24,31 @@ use PostDomain\Verification\Schedule;
  */
 final class CronWiring {
 
+	/**
+	 * Rows due for work whose persisted scope this build cannot read.
+	 *
+	 * Reported once per sweep and otherwise untouched: no provider call, no local
+	 * change, no attempted repair. The intent behind a corrupted scope is not
+	 * recoverable from the row, and the event log is a record of what happened,
+	 * never an input to what happens next (§12.3).
+	 */
+	private static function report_undecidable( \PostDomain\Contracts\Clock $clock ): void {
+		foreach ( DeletionSchedule::undecidable( 50, $clock ) as $mapping ) {
+			EventLog::record(
+				$mapping->id,
+				$mapping->host,
+				'integrity',
+				null,
+				null,
+				'cron',
+				array(
+					'unreadable_removal_scope' => (string) $mapping->ssl_removal_scope,
+					'auto_repaired'            => false,
+				)
+			);
+		}
+	}
+
 	/** Recovery holds the default priority; ordinary due work follows it. */
 	public const SWEEP_PRIORITY = 20;
 
@@ -41,7 +67,10 @@ final class CronWiring {
 	 */
 	public static function sweep_deletions(): void {
 		$clock = new SystemClock();
-		$due   = DeletionSchedule::due( 50, $clock );
+
+		self::report_undecidable( $clock );
+
+		$due = DeletionSchedule::due( 50, $clock );
 
 		if ( array() === $due ) {
 			return;
@@ -68,13 +97,15 @@ final class CronWiring {
 			$due,
 			$budget,
 			static function ( Mapping $mapping ) use ( $mapping_deletion, $resource_removal ): void {
-				if ( RemovalScope::RESOURCE === RemovalScope::from_row( $mapping->ssl_removal_scope ) ) {
-					$resource_removal->process( $mapping );
-
-					return;
-				}
-
-				$mapping_deletion->process( $mapping );
+				// Each scope is dispatched explicitly, and anything else is
+				// dispatched nowhere. A `default` that fell through to mapping
+				// deletion would turn an unreadable byte in one column into a
+				// deleted domain.
+				match ( RemovalScope::from_row( $mapping->ssl_removal_scope ) ) {
+					RemovalScope::RESOURCE => $resource_removal->process( $mapping ),
+					RemovalScope::MAPPING  => $mapping_deletion->process( $mapping ),
+					null                   => null,
+				};
 			},
 			'pd_ssl_sweep'
 		);

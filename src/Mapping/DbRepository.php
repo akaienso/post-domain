@@ -72,12 +72,6 @@ final class DbRepository implements MappingRepository {
 			'ssl_provider_environment'  => $m->ssl_provider_environment,
 			'ssl_ref'                   => $m->ssl_ref,
 			'ssl_method'                => $m->ssl_method,
-			'ssl_mutation_token'        => $m->ssl_mutation_token,
-			'ssl_mutation_kind'         => $m->ssl_mutation_kind?->value,
-			'ssl_mutation_phase'        => $m->ssl_mutation_phase?->value,
-			'ssl_mutation_expires_at'   => $m->ssl_mutation_expires_at,
-			'ssl_mutation_driver'       => $m->ssl_mutation_driver,
-			'ssl_mutation_environment'  => $m->ssl_mutation_environment,
 			'updated_at'                => $now,
 		);
 
@@ -85,6 +79,16 @@ final class DbRepository implements MappingRepository {
 		// ssl_adopted_by are deliberately absent: they are written only by the CAS
 		// that owns them. An adoption in particular is not something save() may
 		// mint — it happens through MutationGate or not at all.
+		//
+		// The six ssl_mutation_* columns are absent for a stronger reason. They
+		// are owned outright by MutationLease and its exact CAS operations, and
+		// they describe an operation that may already have been sent to a
+		// provider. An ordinary update that carried them would write whatever the
+		// caller happened to hold — and a Mapping rebuilt from a PATCH body holds
+		// six nulls — silently destroying the fencing token and the recovery
+		// record for a mutation still in flight. A generic save must be incapable
+		// of clearing a lease, and equally incapable of minting one. New rows take
+		// the schema's own null defaults.
 
 		if ( 0 === $m->id ) {
 			$data['revision']   = 1;
@@ -126,8 +130,17 @@ final class DbRepository implements MappingRepository {
 			$values[] = $value;
 		}
 
+		// The window a race has to open in. Nothing production listens to it; it
+		// exists so a test can take a lease exactly here, between the caller's
+		// read and the CAS, which is the interleaving the CAS is for.
+		do_action( 'pd_test_before_repository_update', $m->id );
+
+		// `ssl_mutation_token IS NULL` is part of the CAS, not a check before it.
+		// A lease acquired between the caller's read and this statement makes the
+		// update match zero rows, so the write loses rather than racing the lease.
 		$sql = "UPDATE {$table} SET " . implode( ', ', $sets )
-			. ', revision = revision + 1 WHERE id = %d AND revision = %d';
+			. ', revision = revision + 1'
+			. ' WHERE id = %d AND revision = %d AND ssl_mutation_token IS NULL';
 
 		$values[] = $m->id;
 		$values[] = $m->revision;
@@ -135,6 +148,17 @@ final class DbRepository implements MappingRepository {
 		$affected = $wpdb->query( $wpdb->prepare( $sql, $values ) ); // phpcs:ignore WordPress.DB
 
 		if ( 1 !== $affected ) {
+			// Which of the two it was is decided by re-reading, so the caller is
+			// told the actual reason: a stale revision is the caller's to retry,
+			// a lease is not.
+			$current = $this->by_id( $m->id );
+
+			if ( null !== $current && null !== $current->ssl_mutation_token ) {
+				throw new MutationInProgress(
+					sprintf( 'Mapping %d is held by a provider mutation.', $m->id )
+				);
+			}
+
 			throw new StaleRevision(
 				sprintf( 'Mapping %d changed underneath revision %d.', $m->id, $m->revision )
 			);

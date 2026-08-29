@@ -8,6 +8,7 @@ use PostDomain\Mapping\ActivationState;
 use PostDomain\Mapping\AliasResolver;
 use PostDomain\Mapping\InvalidMapping;
 use PostDomain\Mapping\Mapping;
+use PostDomain\Mapping\MutationInProgress;
 use PostDomain\Mapping\SslState;
 use PostDomain\Mapping\VerificationState;
 use PostDomain\Ssl\DriverUnavailable;
@@ -223,6 +224,13 @@ final class ManagementController {
 			return self::error( Errors::CONFLICT, 'That is not an activation state.', 400 );
 		}
 
+		// Any lease at all, including an expired one awaiting recovery (spec
+		// §15.2). Expiry is not availability: the expired record is what tells
+		// LeaseRecovery what the provider was asked to do.
+		if ( null !== $mapping->ssl_mutation_token ) {
+			return self::error( Errors::MUTATION_IN_PROGRESS, 'A provider mutation is in progress.', 409 );
+		}
+
 		// verification_state and ssl_state are copied from the stored row, never
 		// from the request: they are outcomes, not settings.
 		$updated = new Mapping(
@@ -248,7 +256,16 @@ final class ManagementController {
 			$mapping->ssl_method
 		);
 
-		$saved    = $this->repo->save( $updated );
+		try {
+			$saved = $this->repo->save( $updated );
+		} catch ( MutationInProgress $e ) {
+			unset( $e );
+
+			// A lease taken between the read above and the repository's own CAS.
+			// The write lost, which is the point: it did not touch the lease.
+			return self::error( Errors::MUTATION_IN_PROGRESS, 'A provider mutation is in progress.', 409 );
+		}
+
 		$response = new \WP_REST_Response( MappingSerializer::resource( $saved ), 200 );
 		$response->header( 'ETag', Guard::etag( $saved ) );
 
