@@ -803,3 +803,39 @@ authority-keyed DoH quorum, `GET /environment` and the disabled
 `CteSubtreeAdapter` are all unchanged.
 
 No unresolved blocker.
+
+---
+
+## 2026-08-29 (later) — release infrastructure
+
+Single-channel Release Please, matching the convention in
+`wp-rotary-masterbrand-logo`: `release-please-config.json` with one `simple`
+package, `.release-please-manifest.json`, `.github/workflows/release-please.yml`
+on `main` only, and `googleapis/release-please-action@v4` authenticated through
+a GitHub App token (`RELEASE_APP_ID` / `RELEASE_APP_PRIVATE_KEY`).
+
+The manifest starts at **`0.0.0`**, not `0.1.0`. Nothing has been released, and
+the manifest records the last *released* version rather than the version in the
+source. Seeding it with `0.1.0` would make the first `feat:` merge compute
+`0.2.0` and skip the version the plugin already declares. From `0.0.0` a `feat:`
+lands on `0.1.0` — Release Please's pre-1.0 default bumps the minor for a
+feature — which matches the header. Nothing is pinned with `release-as`, so
+every later increment is decided by conventional commits alone.
+
+`post-domain.php` carries `x-release-please-start-version` /
+`x-release-please-end` around its `Version:` header, and the file is listed in
+`extra-files`, so the header moves with the tag.
+
+`.github/workflows/release.yml` builds `post-domain-VERSION.zip` on a published
+release, with `workflow_dispatch` for recovery. It refuses to proceed unless the
+plugin header equals the tag, installs production dependencies with `--no-dev
+--optimize-autoloader` from the committed lock file, and fails the build if
+`vendor/autoload.php` is missing, if any development dependency reached
+`vendor/`, or if the archive does not have exactly one top-level `post-domain/`
+directory. Existing release assets are never replaced.
+
+`LICENSE` was added: `composer.json` has declared `GPL-2.0-or-later` since the
+first commit and the packaged plugin had no licence text to ship.
+
+The build step was verified by extracting it from the workflow and running it
+locally against this working tree, rather than by reading it.

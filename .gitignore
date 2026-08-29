@@ -3,3 +3,4 @@
 /build/
 /tmp/
 .phpunit.result.cache
+.DS_Store
