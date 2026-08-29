@@ -103,7 +103,15 @@ final class NullDriverTest extends TestCase {
 		$report = ( new NullDriver() )->reconcile( array( $this->context() ) );
 
 		$this->assertTrue( $report->snapshot_complete );
-		$this->assertSame( array(), iterator_to_array( $report->statuses ) );
+
+		// `statuses` is declared `iterable`, so it may be an array or a Traversable.
+		// iterator_to_array() only accepts a plain array from PHP 8.2; the plugin
+		// supports 8.1, where that is a TypeError.
+		$statuses = is_array( $report->statuses )
+			? $report->statuses
+			: iterator_to_array( $report->statuses );
+
+		$this->assertSame( array(), $statuses );
 	}
 
 	public function test_the_validation_plan_contributes_no_provider_records(): void {
