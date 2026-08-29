@@ -26,7 +26,9 @@
     "autoload-dev": {
         "psr-4": {
             "PostDomain\\Tests\\": "tests/",
-            "PostDomain\\Tests\\Fixtures\\": "tests/Fixtures/"
+            "PostDomain\\Tests\\Fixtures\\": "tests/Fixtures/",
+            "PostDomain\\Tests\\Unit\\": "tests/unit/",
+            "PostDomain\\Tests\\Integration\\": "tests/integration/"
         }
     },
     "config": {
