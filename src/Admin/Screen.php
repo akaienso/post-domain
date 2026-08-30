@@ -3,6 +3,7 @@ declare( strict_types = 1 );
 
 namespace PostDomain\Admin;
 
+use PostDomain\Application\MappingCommands;
 use PostDomain\Mapping\ActivationState;
 use PostDomain\Mapping\DbRepository;
 use PostDomain\Mapping\Mapping;
@@ -30,16 +31,13 @@ final class Screen {
 	/**
 	 * Which post types an operator may map a domain to.
 	 *
+	 * Defined once, in the command layer that also validates a submitted id, so
+	 * the selector cannot offer something the server would then refuse.
+	 *
 	 * @return string[]
 	 */
 	public static function target_post_types(): array {
-		/** @var string[] $types */
-		$types = (array) apply_filters(
-			'pd_admin_target_post_types',
-			array_values( get_post_types( array( 'public' => true ), 'names' ) )
-		);
-
-		return array_values( array_filter( $types, 'post_type_exists' ) );
+		return MappingCommands::target_post_types();
 	}
 
 	public static function render(): void {
@@ -128,8 +126,79 @@ final class Screen {
 		return $html;
 	}
 
+	/** How many targets one page of the selector offers. */
+	public const TARGETS_PER_PAGE = 50;
+
+	/** The current search term, if the operator has typed one. */
+	private static function target_query(): string {
+		// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- a GET that only narrows a read-only list.
+		return isset( $_GET['pd_target_q'] ) ? sanitize_text_field( wp_unslash( $_GET['pd_target_q'] ) ) : '';
+	}
+
+	private static function target_page(): int {
+		// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- a GET that only pages a read-only list.
+		return max( 1, isset( $_GET['pd_target_page'] ) ? absint( wp_unslash( $_GET['pd_target_page'] ) ) : 1 );
+	}
+
+	/**
+	 * One bounded page of candidate targets.
+	 *
+	 * Never every post: a selector that silently stops at the first 200 titles
+	 * makes every target after them unreachable, with nothing on screen to say
+	 * so. This asks for one page at a time and reports the total, so an operator
+	 * on an established site can always search their way to the right one.
+	 *
+	 * @return array{posts: \WP_Post[], total: int, pages: int}
+	 */
+	public static function target_candidates( string $search, int $page ): array {
+		$types = self::target_post_types();
+
+		if ( array() === $types ) {
+			return array(
+				'posts' => array(),
+				'total' => 0,
+				'pages' => 0,
+			);
+		}
+
+		$query = new \WP_Query(
+			array(
+				'post_type'           => $types,
+				'post_status'         => array( 'publish', 'private' ),
+				'posts_per_page'      => self::TARGETS_PER_PAGE,
+				'paged'               => $page,
+				's'                   => $search,
+				'orderby'             => '' === $search ? 'modified' : 'relevance',
+				'order'               => 'DESC',
+				'ignore_sticky_posts' => true,
+				'no_found_rows'       => false,
+				'suppress_filters'    => false,
+			)
+		);
+
+		// Never offer a target the operator is not allowed to read. `read_post`
+		// is the capability that decides that, and it is checked again on submit.
+		$readable = array();
+
+		foreach ( $query->posts as $post ) {
+			if ( $post instanceof \WP_Post && current_user_can( 'read_post', $post->ID ) ) {
+				$readable[] = $post;
+			}
+		}
+
+		return array(
+			'posts' => $readable,
+			'total' => (int) $query->found_posts,
+			'pages' => (int) $query->max_num_pages,
+		);
+	}
+
 	public static function add_form(): string {
+		$search = self::target_query();
+		$page   = self::target_page();
+
 		$html  = '<h2>' . esc_html__( 'Add a domain', 'post-domain' ) . '</h2>';
+		$html .= self::target_search_form( $search );
 		$html .= self::form_open( 'pd_add_mapping' );
 		$html .= '<table class="form-table" role="presentation"><tbody>';
 
@@ -143,10 +212,8 @@ final class Screen {
 
 		$html .= '<tr><th scope="row"><label for="pd_post_id">'
 			. esc_html__( 'Shows this content', 'post-domain' ) . '</label></th><td>';
-		$html .= self::target_select();
-		$html .= '<p class="description">'
-			. esc_html__( 'The page or post this domain opens on. Anything beneath it is served too.', 'post-domain' )
-			. '</p></td></tr>';
+		$html .= self::target_select( $search, $page );
+		$html .= '</td></tr>';
 
 		$html .= '</tbody></table>';
 		$html .= get_submit_button( __( 'Add domain', 'post-domain' ), 'primary', 'submit', false );
@@ -155,48 +222,115 @@ final class Screen {
 		return $html;
 	}
 
-	private static function target_select(): string {
-		$html  = '<select name="pd_post_id" id="pd_post_id" required>';
+	/**
+	 * A GET form, separate from the POST form it feeds.
+	 *
+	 * Searching is a read, so it is a GET and its result is linkable; nesting it
+	 * inside the add form would be invalid HTML and would submit the wrong thing.
+	 * It works with no JavaScript at all.
+	 */
+	private static function target_search_form( string $search ): string {
+		$html  = '<form method="get" action="' . esc_url( admin_url( 'options-general.php' ) ) . '">';
+		$html .= '<input type="hidden" name="page" value="' . esc_attr( SettingsPage::SLUG ) . '">';
+		$html .= '<p><label for="pd_target_q">'
+			. esc_html__( 'Find the content this domain should show', 'post-domain' )
+			. '</label><br>';
+		$html .= '<input type="search" id="pd_target_q" name="pd_target_q" class="regular-text" value="'
+			. esc_attr( $search ) . '" placeholder="'
+			. esc_attr__( 'Search by title', 'post-domain' ) . '">';
+		$html .= ' ' . get_submit_button( __( 'Search', 'post-domain' ), 'secondary', 'submit', false );
+		$html .= '</p></form>';
+
+		return $html;
+	}
+
+	private static function target_select( string $search, int $page ): string {
+		$found = self::target_candidates( $search, $page );
+
+		if ( array() === $found['posts'] ) {
+			$message = '' === $search
+				? __( 'There is no published content to map a domain to yet.', 'post-domain' )
+				: __( 'Nothing matched that search. Try another term.', 'post-domain' );
+
+			// An empty control with nothing to choose is worse than none: say why.
+			return '<p id="pd_post_id_help">' . esc_html( $message ) . '</p>'
+				. '<input type="hidden" name="pd_post_id" value="">';
+		}
+
+		$html  = '<select name="pd_post_id" id="pd_post_id" aria-describedby="pd_post_id_help" required>';
 		$html .= '<option value="">' . esc_html__( '— Choose —', 'post-domain' ) . '</option>';
 
-		foreach ( self::target_post_types() as $type ) {
-			$object = get_post_type_object( $type );
-			$posts  = get_posts(
-				array(
-					'post_type'        => $type,
-					'post_status'      => array( 'publish', 'private' ),
-					// Bounded deliberately: a selector, not an export.
-					'numberposts'      => 200, // phpcs:ignore WordPress.WP.PostsPerPage.posts_per_page_numberposts
-					'orderby'          => 'title',
-					'order'            => 'ASC',
-					'suppress_filters' => false,
+		foreach ( $found['posts'] as $post ) {
+			$type  = get_post_type_object( $post->post_type );
+			$title = '' === trim( $post->post_title )
+				? sprintf( /* translators: %d: post id. */ __( '(no title) #%d', 'post-domain' ), $post->ID )
+				: $post->post_title;
+
+			$html .= sprintf(
+				'<option value="%d">%s</option>',
+				(int) $post->ID,
+				esc_html(
+					sprintf(
+						/* translators: 1: content title, 2: post type label. */
+						__( '%1$s (%2$s)', 'post-domain' ),
+						$title,
+						$type?->labels->singular_name ?? $post->post_type
+					)
 				)
 			);
-
-			if ( array() === $posts ) {
-				continue;
-			}
-
-			$html .= '<optgroup label="' . esc_attr( $object?->labels->name ?? $type ) . '">';
-
-			foreach ( $posts as $post ) {
-				$title = '' === trim( $post->post_title )
-					? sprintf( /* translators: %d: post id. */ __( '(no title) #%d', 'post-domain' ), $post->ID )
-					: $post->post_title;
-
-				$html .= sprintf(
-					'<option value="%d">%s</option>',
-					(int) $post->ID,
-					esc_html( $title )
-				);
-			}
-
-			$html .= '</optgroup>';
 		}
 
 		$html .= '</select>';
+		$html .= '<p class="description" id="pd_post_id_help">'
+			. esc_html__( 'The page or post this domain opens on. Anything beneath it is served too.', 'post-domain' )
+			. '</p>';
+		$html .= self::target_pagination( $search, $page, $found );
 
 		return $html;
+	}
+
+	/**
+	 * @param array{posts: \WP_Post[], total: int, pages: int} $found
+	 */
+	private static function target_pagination( string $search, int $page, array $found ): string {
+		if ( $found['pages'] <= 1 ) {
+			return '';
+		}
+
+		$link = static function ( int $target ) use ( $search ): string {
+			return add_query_arg(
+				array(
+					'page'           => SettingsPage::SLUG,
+					'pd_target_q'    => $search,
+					'pd_target_page' => $target,
+				),
+				admin_url( 'options-general.php' )
+			);
+		};
+
+		// Said out loud rather than left to be discovered: the operator needs to
+		// know the list continues, and how to reach the rest of it.
+		$html = '<p class="description">' . esc_html(
+			sprintf(
+				/* translators: 1: first item shown, 2: last item shown, 3: total items. */
+				__( 'Showing %1$d–%2$d of %3$d. Search above, or move through the pages.', 'post-domain' ),
+				( ( $page - 1 ) * self::TARGETS_PER_PAGE ) + 1,
+				min( $page * self::TARGETS_PER_PAGE, $found['total'] ),
+				$found['total']
+			)
+		) . '<br>';
+
+		if ( $page > 1 ) {
+			$html .= '<a href="' . esc_url( $link( $page - 1 ) ) . '">'
+				. esc_html__( '← Previous', 'post-domain' ) . '</a> ';
+		}
+
+		if ( $page < $found['pages'] ) {
+			$html .= '<a href="' . esc_url( $link( $page + 1 ) ) . '">'
+				. esc_html__( 'Next →', 'post-domain' ) . '</a>';
+		}
+
+		return $html . '</p>';
 	}
 
 	public static function list_table(): string {

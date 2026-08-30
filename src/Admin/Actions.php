@@ -136,8 +136,28 @@ final class Actions {
 
 		$result = self::run( $commands, $action, $mapping );
 
-		self::report( $result, self::success_message( $action ) );
-		self::redirect( 'pd_delete_mapping' === $action && $result->succeeded ? 0 : $mapping->id );
+		self::report( $result, self::success_message( $action, $result ) );
+
+		// Where to go next is decided by what happened, not by what was asked.
+		// A removal that is merely scheduled leaves the row in place, and sending
+		// the operator to a list that still shows it — after telling them it was
+		// removed — is how the interface lies about durable deletion.
+		self::redirect( self::destination( $mapping, $result ) );
+	}
+
+	/**
+	 * The list only when the row is actually gone; otherwise the row itself.
+	 *
+	 * `MappingCommands::delete()` answers 204 with no mapping for a local delete
+	 * and 202 with a surviving mapping when §14.15 has scheduled provider
+	 * cleanup. Both are successes and they are not the same outcome.
+	 */
+	private static function destination( Mapping $mapping, CommandResult $result ): int {
+		if ( $result->succeeded && null === $result->mapping ) {
+			return 0;
+		}
+
+		return $mapping->id;
 	}
 
 	private static function run( MappingCommands $commands, string $action, Mapping $mapping ): CommandResult {
@@ -153,15 +173,40 @@ final class Actions {
 		};
 	}
 
-	private static function success_message( string $action ): string {
+	/**
+	 * What to tell the operator, from what actually happened.
+	 *
+	 * Two removals report completion, and neither is always complete when the
+	 * command returns. Durable deletion (§14.15) answers 202 with the row still
+	 * present while provider cleanup is scheduled, and an SSL-resource removal
+	 * answers 202 for a pending, transient or failed provider outcome that a
+	 * later sweep will retry. Choosing the message from the action name alone
+	 * announces both as finished, which is the one thing an operator must not be
+	 * told about a deletion that has not happened.
+	 *
+	 * 202 is the shared signal: accepted, not completed.
+	 */
+	private static function success_message( string $action, CommandResult $result ): string {
+		$outstanding = 202 === $result->status;
+
+		if ( 'pd_delete_mapping' === $action ) {
+			return $outstanding
+				? __( 'Removal has started. The domain stops serving now, and disappears once its certificate is released.', 'post-domain' )
+				: __( 'The domain was removed.', 'post-domain' );
+		}
+
+		if ( 'pd_remove_ssl' === $action ) {
+			return $outstanding
+				? __( 'Certificate removal has started. It finishes once the provider confirms.', 'post-domain' )
+				: __( 'The certificate was removed. The domain mapping is unchanged.', 'post-domain' );
+		}
+
 		return match ( $action ) {
 			'pd_activate'         => __( 'This domain is now serving.', 'post-domain' ),
 			'pd_deactivate'       => __( 'This domain has stopped serving.', 'post-domain' ),
 			'pd_verify'           => __( 'Verification was requested. The result appears here shortly.', 'post-domain' ),
 			'pd_rotate_challenge' => __( 'A new verification record was issued. Publish it, then check verification.', 'post-domain' ),
 			'pd_provision_ssl'    => __( 'A certificate was requested. Publish any records shown below.', 'post-domain' ),
-			'pd_remove_ssl'       => __( 'The certificate was removed. The domain mapping is unchanged.', 'post-domain' ),
-			'pd_delete_mapping'   => __( 'The domain was removed.', 'post-domain' ),
 			default               => __( 'Done.', 'post-domain' ),
 		};
 	}

@@ -145,6 +145,8 @@ final class AdminWorkflowTest extends OwnedSessionTestCase {
 	// -- rendering -----------------------------------------------------------
 
 	public function test_an_empty_installation_offers_a_way_to_add_a_domain(): void {
+		$this->target();
+
 		$html = $this->page();
 
 		$this->assertMatchesRegularExpression( '/<input[^>]*name=["\']pd_host["\']/', $html );
@@ -153,11 +155,33 @@ final class AdminWorkflowTest extends OwnedSessionTestCase {
 		$this->assertStringNotContainsString( '<thead>', $html, 'a bare header row is not an empty state' );
 	}
 
+	public function test_a_site_with_no_content_says_so_rather_than_offering_an_empty_control(): void {
+		// This session commits, so posts other tests created are still here. A
+		// registered type with nothing in it is the deterministic way to ask what
+		// the screen does when there is nothing to choose.
+		register_post_type(
+			'pd_empty_type',
+			array(
+				'public' => true,
+				'label'  => 'Empty',
+			)
+		);
+		add_filter( 'pd_admin_target_post_types', static fn(): array => array( 'pd_empty_type' ) );
+
+		$html = $this->page();
+
+		remove_all_filters( 'pd_admin_target_post_types' );
+		unregister_post_type( 'pd_empty_type' );
+
+		$this->assertStringContainsString( 'no published content', $html );
+		$this->assertStringNotContainsString( '<select name="pd_post_id"', $html );
+	}
+
 	public function test_the_target_selector_lists_real_content(): void {
 		$id = $this->target();
 
 		$this->assertMatchesRegularExpression(
-			'/<option value="' . $id . '">\s*Club home\s*<\/option>/',
+			'/<option value="' . $id . '">\s*Club home \(Page\)\s*<\/option>/',
 			$this->page()
 		);
 	}

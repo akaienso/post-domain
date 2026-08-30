@@ -158,10 +158,31 @@ final class MappingCommands {
 		}
 
 		if ( null === $alias_of ) {
-			if ( null === $post_id || null === get_post( $post_id ) ) {
+			$target = null === $post_id ? null : get_post( $post_id );
+
+			if ( null === $target ) {
 				return CommandResult::refused(
 					Errors::POST_INVALID,
 					'Choose the page or post this domain should show.',
+					400
+				);
+			}
+
+			// Re-checked here, not only where the selector was drawn. A posted id
+			// is caller input whichever surface sent it, and the list it came from
+			// is not a permission.
+			if ( ! current_user_can( 'read_post', $target->ID ) ) {
+				return CommandResult::refused(
+					Errors::POST_INVALID,
+					'That content cannot be used as a target.',
+					400
+				);
+			}
+
+			if ( ! in_array( $target->post_type, self::target_post_types(), true ) ) {
+				return CommandResult::refused(
+					Errors::POST_INVALID,
+					'A domain cannot be mapped to that kind of content.',
 					400
 				);
 			}
@@ -405,6 +426,24 @@ final class MappingCommands {
 			self::explain_refusal( $result->refusal?->precondition ),
 			409
 		);
+	}
+
+	/**
+	 * Which post types a domain may be mapped to.
+	 *
+	 * The same list the admin selector offers, so the two cannot disagree about
+	 * what is eligible.
+	 *
+	 * @return string[]
+	 */
+	public static function target_post_types(): array {
+		/** @var string[] $types */
+		$types = (array) apply_filters(
+			'pd_admin_target_post_types',
+			array_values( get_post_types( array( 'public' => true ), 'names' ) )
+		);
+
+		return array_values( array_filter( $types, 'post_type_exists' ) );
 	}
 
 	/**
