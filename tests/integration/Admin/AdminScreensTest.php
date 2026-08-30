@@ -3,7 +3,9 @@ declare( strict_types = 1 );
 
 namespace PostDomain\Tests\Integration\Admin;
 
+use PostDomain\Admin\Actions;
 use PostDomain\Admin\EnvironmentNotice;
+use PostDomain\Admin\RedirectedAway;
 use PostDomain\Admin\MappingListTable;
 use PostDomain\Admin\SettingsPage;
 use PostDomain\Mapping\ActivationState;
@@ -128,22 +130,43 @@ final class AdminScreensTest extends WP_UnitTestCase {
 		\PostDomain\Ssl\DriverFactory::reset();
 	}
 
+	/**
+	 * Drives the real POST path rather than a helper: nonce, capability, and
+	 * dispatch are what a browser exercises, and what these must therefore test.
+	 */
+	private function post_driver( string $driver ): void {
+		$_SERVER['REQUEST_METHOD'] = 'POST';
+		$_POST                     = array(
+			'pd_action'     => 'pd_set_driver',
+			'pd_ssl_driver' => $driver,
+			'_wpnonce'      => wp_create_nonce( Actions::nonce_action( 'pd_set_driver', 0 ) ),
+		);
+		// check_admin_referer() reads $_REQUEST, which a real POST populates.
+		$_REQUEST = $_POST; // phpcs:ignore WordPress.Security.NonceVerification.Missing -- assembling the request the handler will verify.
+
+		add_filter( 'pd_admin_redirect_should_exit', '__return_false' );
+
+		try {
+			Actions::handle();
+		} catch ( RedirectedAway $e ) {
+			unset( $e );
+		} finally {
+			remove_filter( 'pd_admin_redirect_should_exit', '__return_false' );
+			$_POST                     = array();
+			$_REQUEST                  = array();
+			$_SERVER['REQUEST_METHOD'] = 'GET';
+		}
+	}
+
 	public function test_saving_an_unregistered_driver_is_ignored(): void {
 		wp_set_current_user( self::factory()->user->create( array( 'role' => 'administrator' ) ) );
 
-		$_POST['pd_ssl_driver'] = 'not-a-driver';
-		$_POST['_wpnonce']      = wp_create_nonce( 'pd_settings' );
-		// check_admin_referer() reads $_REQUEST, which a real POST populates.
-		$_REQUEST['_wpnonce'] = $_POST['_wpnonce']; // phpcs:ignore WordPress.Security.NonceVerification.Missing
-
-		SettingsPage::save_driver_selection();
+		$this->post_driver( 'not-a-driver' );
 
 		$this->assertSame(
 			\PostDomain\Ssl\DriverFactory::NULL_DRIVER,
 			\PostDomain\Ssl\DriverFactory::selected_driver_id()
 		);
-
-		unset( $_POST['pd_ssl_driver'], $_POST['_wpnonce'], $_REQUEST['_wpnonce'] );
 	}
 
 	public function test_saving_resets_the_memoized_registry(): void {
@@ -151,36 +174,39 @@ final class AdminScreensTest extends WP_UnitTestCase {
 
 		\PostDomain\Ssl\DriverFactory::registry();
 
-		$_POST['pd_ssl_driver'] = \PostDomain\Ssl\DriverFactory::NULL_DRIVER;
-		$_POST['_wpnonce']      = wp_create_nonce( 'pd_settings' );
-		// check_admin_referer() reads $_REQUEST, which a real POST populates.
-		$_REQUEST['_wpnonce'] = $_POST['_wpnonce']; // phpcs:ignore WordPress.Security.NonceVerification.Missing
-
-		SettingsPage::save_driver_selection();
+		$this->post_driver( \PostDomain\Ssl\DriverFactory::NULL_DRIVER );
 
 		$this->assertSame(
 			\PostDomain\Ssl\DriverFactory::NULL_DRIVER,
 			\PostDomain\Ssl\DriverFactory::selected_driver_id()
 		);
-
-		unset( $_POST['pd_ssl_driver'], $_POST['_wpnonce'], $_REQUEST['_wpnonce'] );
 	}
 
 	public function test_a_subscriber_cannot_change_the_selection(): void {
 		wp_set_current_user( self::factory()->user->create( array( 'role' => 'subscriber' ) ) );
 
-		$_POST['pd_ssl_driver'] = \PostDomain\Ssl\DriverFactory::NULL_DRIVER;
-		$_POST['_wpnonce']      = wp_create_nonce( 'pd_settings' );
-		// check_admin_referer() reads $_REQUEST, which a real POST populates.
-		$_REQUEST['_wpnonce'] = $_POST['_wpnonce']; // phpcs:ignore WordPress.Security.NonceVerification.Missing
-
 		update_option( 'pd_settings', array( 'ssl_driver' => 'preexisting' ), false );
+		\PostDomain\Ssl\DriverFactory::reset();
 
-		SettingsPage::save_driver_selection();
+		// wp_die() is how WordPress refuses an under-privileged admin POST.
+		add_filter(
+			'wp_die_handler',
+			static fn(): callable => static function ( $message ): void {
+			throw new \RuntimeException( is_string( $message ) ? $message : 'denied' );
+			}
+		);
+
+		try {
+			$this->post_driver( \PostDomain\Ssl\DriverFactory::NULL_DRIVER );
+			$this->fail( 'a subscriber must not reach the driver selection' );
+		} catch ( \RuntimeException $e ) {
+			$this->assertStringContainsString( 'permission', $e->getMessage() );
+		} finally {
+			remove_all_filters( 'wp_die_handler' );
+		}
 
 		$this->assertSame( 'preexisting', \PostDomain\Ssl\DriverFactory::selected_driver_id() );
 
-		unset( $_POST['pd_ssl_driver'], $_POST['_wpnonce'], $_REQUEST['_wpnonce'] );
 		delete_option( 'pd_settings' );
 		\PostDomain\Ssl\DriverFactory::reset();
 	}

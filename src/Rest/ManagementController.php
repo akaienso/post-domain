@@ -7,6 +7,8 @@ use PostDomain\Contracts\MappingRepository;
 use PostDomain\Mapping\ActivationState;
 use PostDomain\Mapping\AliasResolver;
 use PostDomain\Mapping\InvalidMapping;
+use PostDomain\Application\CommandResult;
+use PostDomain\Application\MappingCommands;
 use PostDomain\Mapping\Mapping;
 use PostDomain\Mapping\MutationInProgress;
 use PostDomain\Mapping\SslState;
@@ -23,10 +25,34 @@ use PostDomain\Verification\Challenge;
 
 final class ManagementController {
 
+	private readonly MappingCommands $commands;
+
 	public function __construct(
 		private readonly MappingRepository $repo,
 		private readonly SslServices $ssl
-	) {}
+	) {
+		// One place decides what an operator may do. REST translates a request
+		// into a call and a result into a response; it does not decide.
+		$this->commands = new MappingCommands( $repo, $ssl );
+	}
+
+	/** Turns a shared command result into the REST response for it. */
+	private function respond( CommandResult $result, ?int $ok_status = null ): \WP_REST_Response {
+		if ( ! $result->succeeded ) {
+			return self::error( (string) $result->code, (string) $result->message, $result->status );
+		}
+
+		$status = $ok_status ?? $result->status;
+
+		if ( null === $result->mapping ) {
+			return new \WP_REST_Response( null, 204 );
+		}
+
+		$response = new \WP_REST_Response( MappingSerializer::resource( $result->mapping ), $status );
+		$response->header( 'ETag', Guard::etag( $result->mapping ) );
+
+		return $response;
+	}
 
 	public function register(): void {
 		$this->register_domains();
@@ -73,93 +99,17 @@ final class ManagementController {
 	}
 
 	public function create( \WP_REST_Request $request ): \WP_REST_Response {
-		$raw   = (string) $request->get_param( 'host' );
 		$alias = $request->get_param( 'alias_of' );
+		$post  = $request->get_param( 'post_id' );
 
-		if ( str_contains( $raw, '*' ) ) {
-			return self::error( Errors::HOST_WILDCARD, 'Wildcard hosts are out of scope.', 400 );
-		}
-
-		$authority = ( new AuthorityParser() )->parse( $raw );
-
-		if ( null === $authority ) {
-			return self::error( Errors::HOST_MALFORMED_AUTHORITY, 'That host is not a valid authority.', 400 );
-		}
-
-		$host = ( new HostNormalizer( new IdnaNormalizer() ) )->normalize( $authority );
-
-		if ( null === $host ) {
-			return self::error( Errors::HOST_INVALID, 'That host cannot be normalized.', 400 );
-		}
-
-		if ( null !== $this->repo->by_host( $host ) ) {
-			return self::error( Errors::HOST_EXISTS, 'That host is already mapped.', 409 );
-		}
-
-		// `pd_txt_record_label` runs only at create and rotate, and its validated
-		// result is what gets persisted (spec §13.1). The provisional row exists
-		// so the filter sees the mapping it is deciding a label for.
-		$label = Challenge::label_for(
-			new Mapping(
-				0,
-				$host,
+		return $this->respond(
+			$this->commands->create_mapping(
+				(string) $request->get_param( 'host' ),
 				null === $alias ? null : (int) $alias,
-				null,
-				1,
-				VerificationState::UNVERIFIED,
-				ActivationState::INACTIVE,
-				SslState::NONE,
-				null,
-				str_repeat( '0', 32 ),
-				Challenge::DEFAULT_LABEL
-			)
+				null === $post ? null : (int) $post
+			),
+			201
 		);
-
-		if ( strlen( $host ) > Challenge::max_host_length( $label ) ) {
-			return self::error(
-				Errors::HOST_TOO_LONG,
-				sprintf(
-					'The composed TXT record name would exceed 253 bytes; this label permits %d bytes of host.',
-					Challenge::max_host_length( $label )
-				),
-				400
-			);
-		}
-
-		$post_id = null;
-
-		if ( null === $alias ) {
-			$post_id = (int) $request->get_param( 'post_id' );
-
-			if ( null === get_post( $post_id ) ) {
-				return self::error( Errors::POST_INVALID, 'That post does not exist.', 400 );
-			}
-		}
-
-		try {
-			$mapping = $this->repo->save(
-				new Mapping(
-					0,
-					$host,
-					null === $alias ? null : (int) $alias,
-					$post_id,
-					1,
-					VerificationState::UNVERIFIED,
-					ActivationState::INACTIVE,
-					SslState::NONE,
-					null,
-					Challenge::token(),
-					$label
-				)
-			);
-		} catch ( InvalidMapping $e ) {
-			return self::error( Errors::ALIAS_CHAIN, $e->getMessage(), 400 );
-		}
-
-		$response = new \WP_REST_Response( MappingSerializer::resource( $mapping ), 201 );
-		$response->header( 'ETag', Guard::etag( $mapping ) );
-
-		return $response;
 	}
 
 	private function register_domain(): void {
@@ -285,20 +235,7 @@ final class ManagementController {
 			return self::from_wp_error( $precondition );
 		}
 
-		if ( array() !== ( new AliasResolver( $this->repo ) )->aliases_of( $mapping->id ) ) {
-			return self::error( Errors::ALIAS_IN_USE, 'Other mappings alias this one.', 409 );
-		}
-
-		// The durable workflow decides: local delete now, or pending_removal.
-		if ( ! $this->ssl->delete->request( $mapping ) ) {
-			return self::error( Errors::CONFLICT, 'The mapping changed or a mutation is in progress.', 409 );
-		}
-
-		$after = $this->repo->by_id( $mapping->id );
-
-		return null === $after
-			? new \WP_REST_Response( null, 204 )
-			: new \WP_REST_Response( MappingSerializer::resource( $after ), 202 );
+		return $this->respond( $this->commands->delete( $mapping ) );
 	}
 
 	private function register_verification(): void {
@@ -327,18 +264,7 @@ final class ManagementController {
 			return self::error( 'rest_no_route', 'No such mapping.', 404 );
 		}
 
-		$key = 'pd_verify_rate_' . $mapping->id;
-
-		if ( false !== get_transient( $key ) ) {
-			return self::error( Errors::RATE_LIMITED, 'Verification was requested less than a minute ago.', 429 );
-		}
-
-		set_transient( $key, 1, MINUTE_IN_SECONDS );
-
-		// The probe is scheduled; the response reports state, it does not claim it.
-		wp_schedule_single_event( time(), 'pd_verify_now', array( $mapping->id ) );
-
-		return new \WP_REST_Response( MappingSerializer::resource( $mapping ), 202 );
+		return $this->respond( $this->commands->verify_now( $mapping ), 202 );
 	}
 
 	public function rotate_challenge( \WP_REST_Request $request ): \WP_REST_Response {
@@ -354,43 +280,14 @@ final class ManagementController {
 			return self::from_wp_error( $precondition );
 		}
 
-		// Any lease at all, including an expired one awaiting recovery (spec §15.2).
-		if ( null !== $mapping->ssl_mutation_token ) {
-			return self::error( Errors::MUTATION_IN_PROGRESS, 'A provider mutation is in progress.', 409 );
+		$result = $this->commands->rotate_challenge( $mapping );
+
+		if ( ! $result->succeeded ) {
+			return self::error( (string) $result->code, (string) $result->message, $result->status );
 		}
 
-		// Rotation is the other point at which `pd_txt_record_label` runs and its
-		// validated result is persisted (spec §13.1).
-		$label = Challenge::label_for( $mapping );
-
-		if ( null === Challenge::record_name( $label, $mapping->host ) ) {
-			return self::error( Errors::HOST_TOO_LONG, 'The composed TXT record name would be invalid.', 400 );
-		}
-
-		$rotated = $this->repo->save(
-			new Mapping(
-				$mapping->id,
-				$mapping->host,
-				$mapping->alias_of,
-				$mapping->post_id,
-				$mapping->revision,
-				VerificationState::UNVERIFIED,
-				$mapping->activation_state,
-				$mapping->ssl_state,
-				$mapping->integrity_error,
-				Challenge::token(),
-				$label,
-				// The durable binding is untouched by a challenge rotation, and it
-				// moves as one: carrying it through is what keeps the row valid.
-				$mapping->ssl_ownership_origin,
-				$mapping->ssl_owner_installation_id,
-				$mapping->ssl_provider,
-				$mapping->ssl_provider_environment,
-				$mapping->ssl_ref,
-				$mapping->ssl_method
-			)
-		);
-
+		/** @var Mapping $rotated */
+		$rotated      = $result->mapping;
 		$data         = MappingSerializer::resource( $rotated );
 		$data['note'] = 'The challenge was rotated; verification is now unverified and the new record must be published.';
 
