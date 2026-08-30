@@ -26,6 +26,10 @@ final class AdminTargetSelectorTest extends OwnedSessionTestCase {
 
 	private DbRepository $repo;
 
+	private string $probe_type = '';
+
+	private static int $probes = 0;
+
 	public function set_up(): void {
 		parent::set_up();
 		Schema::install();
@@ -39,6 +43,12 @@ final class AdminTargetSelectorTest extends OwnedSessionTestCase {
 
 	public function tear_down(): void {
 		remove_all_filters( 'pd_admin_target_post_types' );
+		remove_all_filters( 'pd_rest_capability' );
+		remove_role( 'pd_manager' );
+		if ( '' !== $this->probe_type ) {
+			unregister_post_type( $this->probe_type );
+			$this->probe_type = '';
+		}
 		$_GET                      = array();
 		$_POST                     = array();
 		$_REQUEST                  = array();
@@ -225,33 +235,43 @@ final class AdminTargetSelectorTest extends OwnedSessionTestCase {
 		);
 	}
 
-	public function test_a_post_type_outside_the_allowed_list_is_refused(): void {
+	/**
+	 * The selector's list is presentation; it is not the rule.
+	 *
+	 * An earlier version of this test asserted the opposite, because the shared
+	 * command consulted `pd_admin_target_post_types`. That narrowed the REST
+	 * contract: the specification supports mapping a domain to a private,
+	 * non-REST custom post type, and v1.0.0 accepted one.
+	 */
+	public function test_a_type_the_selector_never_offers_is_still_a_valid_target(): void {
 		register_post_type(
-			'pd_secret_type',
+			'pd_hidden_type',
 			array(
 				'public' => false,
-				'label'  => 'Secret',
+				'label'  => 'Hidden',
 			)
 		);
 
 		$hidden = self::factory()->post->create(
 			array(
-				'post_type'   => 'pd_secret_type',
+				'post_type'   => 'pd_hidden_type',
 				'post_status' => 'publish',
-				'post_title'  => 'Not mappable',
+				'post_title'  => 'Not offered, still mappable',
 			)
 		);
 
-		$commands = MappingCommands::production( $this->repo );
-		$result   = $commands->create_mapping( 'hidden.example', null, $hidden );
-
-		$this->assertTrue(
-			$result->refused_as( Errors::POST_INVALID ),
-			'a private post type is not a valid target just because an id was posted'
+		$this->assertNotContains(
+			'pd_hidden_type',
+			Screen::target_post_types(),
+			'the selector does not offer a non-public type'
 		);
-		$this->assertNull( $this->repo->by_host( 'hidden.example' ) );
 
-		unregister_post_type( 'pd_secret_type' );
+		$result = MappingCommands::production( $this->repo )->create_mapping( 'hidden.example', null, $hidden );
+
+		$this->assertTrue( $result->succeeded, 'and the command still accepts it, as it did in v1.0.0' );
+		$this->assertNotNull( $this->repo->by_host( 'hidden.example' ) );
+
+		unregister_post_type( 'pd_hidden_type' );
 	}
 
 	public function test_content_the_operator_cannot_read_is_never_offered(): void {
@@ -282,5 +302,175 @@ final class AdminTargetSelectorTest extends OwnedSessionTestCase {
 		);
 
 		unset( $ids );
+	}
+
+	// -- authorization belongs in the query, not after it ---------------------
+
+	/**
+	 * A user who may manage mappings but may not read a block of private posts.
+	 *
+	 * The capability that gates the screen and the capability that decides what
+	 * content is readable are different things, and a selector filtered after
+	 * the fact conflates them.
+	 */
+	private function manager_who_cannot_read_private(): int {
+		add_role(
+			'pd_manager',
+			'Domain manager',
+			array(
+				'read'              => true,
+				'pd_manage_domains' => true,
+			)
+		);
+		add_filter( 'pd_rest_capability', static fn(): string => 'pd_manage_domains' );
+
+		return self::factory()->user->create( array( 'role' => 'pd_manager' ) );
+	}
+
+	/**
+	 * One readable target, then enough unreadable ones to fill the first page.
+	 *
+	 * Scoped to a post type of its own: this session commits, so counting
+	 * against the whole site would depend on what every other test left behind.
+	 */
+	private function seed_unreadable_block(): int {
+		// A post type per test. This session commits, so a shared type would
+		// accumulate the previous test's rows and make every count depend on
+		// execution order.
+		++self::$probes;
+
+		$this->probe_type = 'pd_probe_' . self::$probes;
+
+		register_post_type(
+			$this->probe_type,
+			array(
+				'public' => true,
+				'label'  => 'Probe',
+			)
+		);
+
+		$type = $this->probe_type;
+		add_filter( 'pd_admin_target_post_types', static fn(): array => array( $type ) );
+
+		$owner = self::factory()->user->create( array( 'role' => 'administrator' ) );
+
+		// Dated explicitly, not merely created in order: the production query
+		// sorts by modified date, and rows written in the same second sort
+		// arbitrarily, which would make this test pass or fail by luck.
+		$readable = self::factory()->post->create(
+			array(
+				'post_type'         => $this->probe_type,
+				'post_status'       => 'publish',
+				'post_title'        => 'Quokka reading room',
+				'post_date'         => '2020-01-01 00:00:00',
+				'post_date_gmt'     => '2020-01-01 00:00:00',
+				'post_modified'     => '2020-01-01 00:00:00',
+				'post_modified_gmt' => '2020-01-01 00:00:00',
+			)
+		);
+
+		// Every one of these is newer, so all 55 fill the first page ahead of it.
+		for ( $i = 0; $i < 55; $i++ ) {
+			$when = gmdate( 'Y-m-d H:i:s', strtotime( '2026-01-01 00:00:00' ) + $i );
+
+			self::factory()->post->create(
+				array(
+					'post_type'         => $this->probe_type,
+					'post_status'       => 'private',
+					'post_title'        => sprintf( 'Confidential dossier %03d', $i ),
+					'post_author'       => $owner,
+					'post_date'         => $when,
+					'post_date_gmt'     => $when,
+					'post_modified'     => $when,
+					'post_modified_gmt' => $when,
+				)
+			);
+		}
+
+		return $readable;
+	}
+
+	public function test_a_readable_target_behind_an_unreadable_page_is_still_reachable(): void {
+		$readable = $this->seed_unreadable_block();
+
+		wp_set_current_user( $this->manager_who_cannot_read_private() );
+
+		$html = $this->page( array( 'page' => SettingsPage::SLUG ) );
+
+		// Filtering after pagination gave a first page of 50 private posts that
+		// filtered to nothing, so the screen claimed the site had no content and
+		// rendered no pagination at all.
+		$this->assertStringContainsString(
+			'value="' . $readable . '"',
+			$html,
+			'the only readable target must appear, not sit behind a page of content this user cannot see'
+		);
+	}
+
+	public function test_an_empty_filtered_page_cannot_strand_the_operator(): void {
+		$this->seed_unreadable_block();
+
+		wp_set_current_user( $this->manager_who_cannot_read_private() );
+
+		$html = $this->page( array( 'page' => SettingsPage::SLUG ) );
+
+		$this->assertStringNotContainsString(
+			'There is no published content',
+			$html,
+			'there is readable content; saying otherwise is what strands the operator'
+		);
+	}
+
+	public function test_totals_and_paging_describe_only_readable_content(): void {
+		$this->seed_unreadable_block();
+
+		wp_set_current_user( $this->manager_who_cannot_read_private() );
+
+		$found = Screen::target_candidates( '', 1 );
+
+		$this->assertSame(
+			1,
+			$found['total'],
+			'exactly one of the 56 posts is readable, and the total must say so'
+		);
+		$this->assertCount( 1, $found['posts'] );
+		$this->assertSame( 1, $found['pages'], '55 unreadable posts must not manufacture pages of nothing' );
+	}
+
+	public function test_no_unreadable_title_or_identifier_is_rendered(): void {
+		$this->seed_unreadable_block();
+
+		wp_set_current_user( $this->manager_who_cannot_read_private() );
+
+		$html = $this->page( array( 'page' => SettingsPage::SLUG ) );
+
+		$this->assertStringNotContainsString( 'Confidential dossier', $html );
+
+		foreach ( get_posts(
+			array(
+				'post_type'      => $this->probe_type,
+				'post_status'    => 'private',
+				'posts_per_page' => 5,
+			)
+		) as $private ) {
+			$this->assertStringNotContainsString(
+				'value="' . $private->ID . '"',
+				$html,
+				'an id the operator cannot read must not be offered'
+			);
+		}
+	}
+
+	public function test_a_user_who_can_read_private_content_still_sees_it(): void {
+		$this->seed_unreadable_block();
+
+		// The set_up user is an administrator, who may read those private posts.
+		$found = Screen::target_candidates( '', 1 );
+
+		$this->assertSame(
+			56,
+			$found['total'],
+			'readability is decided per user, not by excluding private content outright'
+		);
 	}
 }

@@ -3,7 +3,6 @@ declare( strict_types = 1 );
 
 namespace PostDomain\Admin;
 
-use PostDomain\Application\MappingCommands;
 use PostDomain\Mapping\ActivationState;
 use PostDomain\Mapping\DbRepository;
 use PostDomain\Mapping\Mapping;
@@ -29,15 +28,23 @@ use PostDomain\Verification\Challenge;
 final class Screen {
 
 	/**
-	 * Which post types an operator may map a domain to.
+	 * Which post types the selector offers.
 	 *
-	 * Defined once, in the command layer that also validates a submitted id, so
-	 * the selector cannot offer something the server would then refuse.
+	 * A presentation choice, and only that. It narrows what the admin lists; it
+	 * does not decide what a mapping may target, because the REST contract
+	 * already accepts any readable post — including a private, non-REST custom
+	 * type that this list would never show.
 	 *
 	 * @return string[]
 	 */
 	public static function target_post_types(): array {
-		return MappingCommands::target_post_types();
+		/** @var string[] $types */
+		$types = (array) apply_filters(
+			'pd_admin_target_post_types',
+			array_values( get_post_types( array( 'public' => true ), 'names' ) )
+		);
+
+		return array_values( array_filter( $types, 'post_type_exists' ) );
 	}
 
 	public static function render(): void {
@@ -165,6 +172,13 @@ final class Screen {
 			array(
 				'post_type'           => $types,
 				'post_status'         => array( 'publish', 'private' ),
+				// `perm => readable` makes the capability part of the SQL, so
+				// found_posts and max_num_pages describe the set the operator can
+				// actually see. Filtering after the query instead left the counts
+				// describing content they cannot read: a page of fifty private
+				// posts filtered to nothing, the screen said there was no content
+				// at all, and every readable target after it became unreachable.
+				'perm'                => 'readable',
 				'posts_per_page'      => self::TARGETS_PER_PAGE,
 				'paged'               => $page,
 				's'                   => $search,
@@ -176,8 +190,10 @@ final class Screen {
 			)
 		);
 
-		// Never offer a target the operator is not allowed to read. `read_post`
-		// is the capability that decides that, and it is checked again on submit.
+		// Defence in depth. `perm` has already excluded what this would exclude,
+		// so it normally removes nothing and the counts stay consistent with the
+		// list; if a filter ever widened the query, this still refuses to name a
+		// post the operator cannot read.
 		$readable = array();
 
 		foreach ( $query->posts as $post ) {
@@ -248,11 +264,23 @@ final class Screen {
 		$found = self::target_candidates( $search, $page );
 
 		if ( array() === $found['posts'] ) {
+			// An empty *page* is not an empty site. Saying "there is no content"
+			// while later pages hold readable targets is what strands an operator,
+			// so the pagination is still rendered and the message says which case
+			// this is.
+			if ( $found['total'] > 0 ) {
+				return '<p id="pd_post_id_help">' . esc_html__(
+					'Nothing on this page. Use the pages below, or search above.',
+					'post-domain'
+				) . '</p>'
+					. '<input type="hidden" name="pd_post_id" value="">'
+					. self::target_pagination( $search, $page, $found );
+			}
+
 			$message = '' === $search
 				? __( 'There is no published content to map a domain to yet.', 'post-domain' )
 				: __( 'Nothing matched that search. Try another term.', 'post-domain' );
 
-			// An empty control with nothing to choose is worse than none: say why.
 			return '<p id="pd_post_id_help">' . esc_html( $message ) . '</p>'
 				. '<input type="hidden" name="pd_post_id" value="">';
 		}

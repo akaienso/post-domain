@@ -171,18 +171,17 @@ final class MappingCommands {
 			// Re-checked here, not only where the selector was drawn. A posted id
 			// is caller input whichever surface sent it, and the list it came from
 			// is not a permission.
+			//
+			// Readability is the only thing asked. Which *types* are eligible is
+			// not decided here: the specification supports mapping a domain to a
+			// private, non-REST custom post type, and v1.0.0 accepted one. Making
+			// the shared command consult an admin-presentation filter would have
+			// narrowed the published REST contract without saying so, and required
+			// existing sites to opt back in to behaviour they already had.
 			if ( ! current_user_can( 'read_post', $target->ID ) ) {
 				return CommandResult::refused(
 					Errors::POST_INVALID,
 					'That content cannot be used as a target.',
-					400
-				);
-			}
-
-			if ( ! in_array( $target->post_type, self::target_post_types(), true ) ) {
-				return CommandResult::refused(
-					Errors::POST_INVALID,
-					'A domain cannot be mapped to that kind of content.',
 					400
 				);
 			}
@@ -426,24 +425,6 @@ final class MappingCommands {
 			self::explain_refusal( $result->refusal?->precondition ),
 			409
 		);
-	}
-
-	/**
-	 * Which post types a domain may be mapped to.
-	 *
-	 * The same list the admin selector offers, so the two cannot disagree about
-	 * what is eligible.
-	 *
-	 * @return string[]
-	 */
-	public static function target_post_types(): array {
-		/** @var string[] $types */
-		$types = (array) apply_filters(
-			'pd_admin_target_post_types',
-			array_values( get_post_types( array( 'public' => true ), 'names' ) )
-		);
-
-		return array_values( array_filter( $types, 'post_type_exists' ) );
 	}
 
 	/**
