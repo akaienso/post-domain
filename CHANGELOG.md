@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.0.1](https://github.com/akaienso/post-domain/compare/v1.0.0...v1.0.1) (2026-08-30)
+
+
+### Bug Fixes
+
+* make the domain management screen usable ([#5](https://github.com/akaienso/post-domain/issues/5)) ([0d7fea6](https://github.com/akaienso/post-domain/commit/0d7fea6c41a16f567ff5d4ebaab77f424fc83f8c))
+
 ## 1.0.0 (2026-08-29)
 
 
