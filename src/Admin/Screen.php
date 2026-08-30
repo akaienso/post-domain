@@ -58,6 +58,7 @@ final class Screen {
 
 		if ( null !== $mapping ) {
 			echo self::detail( $mapping ); // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped
+			echo Guide::render_panel(); // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped
 			echo '</div>';
 
 			return;
@@ -66,6 +67,7 @@ final class Screen {
 		echo self::driver_form(); // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped
 		echo self::add_form(); // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped
 		echo self::list_table(); // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped
+		echo Guide::render_panel(); // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped
 		echo '</div>';
 	}
 
@@ -136,17 +138,6 @@ final class Screen {
 	/** How many targets one page of the selector offers. */
 	public const TARGETS_PER_PAGE = 50;
 
-	/** The current search term, if the operator has typed one. */
-	private static function target_query(): string {
-		// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- a GET that only narrows a read-only list.
-		return isset( $_GET['pd_target_q'] ) ? sanitize_text_field( wp_unslash( $_GET['pd_target_q'] ) ) : '';
-	}
-
-	private static function target_page(): int {
-		// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- a GET that only pages a read-only list.
-		return max( 1, isset( $_GET['pd_target_page'] ) ? absint( wp_unslash( $_GET['pd_target_page'] ) ) : 1 );
-	}
-
 	/**
 	 * One bounded page of candidate targets.
 	 *
@@ -157,7 +148,7 @@ final class Screen {
 	 *
 	 * @return array{posts: \WP_Post[], total: int, pages: int}
 	 */
-	public static function target_candidates( string $search, int $page ): array {
+	public static function target_candidates( string $search, int $page, ?int $limit = null ): array {
 		$types = self::target_post_types();
 
 		if ( array() === $types ) {
@@ -179,7 +170,7 @@ final class Screen {
 				// posts filtered to nothing, the screen said there was no content
 				// at all, and every readable target after it became unreachable.
 				'perm'                => 'readable',
-				'posts_per_page'      => self::TARGETS_PER_PAGE,
+				'posts_per_page'      => $limit ?? self::TARGETS_PER_PAGE,
 				'paged'               => $page,
 				's'                   => $search,
 				'orderby'             => '' === $search ? 'modified' : 'relevance',
@@ -210,14 +201,12 @@ final class Screen {
 	}
 
 	public static function add_form(): string {
-		$search = self::target_query();
-		$page   = self::target_page();
-
 		$html  = '<h2>' . esc_html__( 'Add a domain', 'post-domain' ) . '</h2>';
-		$html .= self::target_search_form( $search );
 		$html .= self::form_open( 'pd_add_mapping' );
 		$html .= '<table class="form-table" role="presentation"><tbody>';
 
+		// Domain name first. The content control follows it, because that is the
+		// order the operator thinks in and the order the form now reads.
 		$html .= '<tr><th scope="row"><label for="pd_host">'
 			. esc_html__( 'Domain name', 'post-domain' ) . '</label></th><td>';
 		$html .= '<input type="text" class="regular-text" name="pd_host" id="pd_host" '
@@ -228,7 +217,7 @@ final class Screen {
 
 		$html .= '<tr><th scope="row"><label for="pd_post_id">'
 			. esc_html__( 'Shows this content', 'post-domain' ) . '</label></th><td>';
-		$html .= self::target_select( $search, $page );
+		$html .= self::target_control();
 		$html .= '</td></tr>';
 
 		$html .= '</tbody></table>';
@@ -239,60 +228,35 @@ final class Screen {
 	}
 
 	/**
-	 * A GET form, separate from the POST form it feeds.
+	 * One control that both searches and selects.
 	 *
-	 * Searching is a read, so it is a GET and its result is linkable; nesting it
-	 * inside the add form would be invalid HTML and would submit the wrong thing.
-	 * It works with no JavaScript at all.
+	 * A separate search form above the field asked the operator to understand
+	 * that finding content and choosing it were two different operations. They
+	 * are not. This is a native `<select>` carrying the first page of results,
+	 * which submits and validates on its own with no JavaScript at all; the
+	 * script upgrades it in place into a combobox that filters as you type,
+	 * against the same bounded server-side search.
 	 */
-	private static function target_search_form( string $search ): string {
-		$html  = '<form method="get" action="' . esc_url( admin_url( 'options-general.php' ) ) . '">';
-		$html .= '<input type="hidden" name="page" value="' . esc_attr( SettingsPage::SLUG ) . '">';
-		$html .= '<p><label for="pd_target_q">'
-			. esc_html__( 'Find the content this domain should show', 'post-domain' )
-			. '</label><br>';
-		$html .= '<input type="search" id="pd_target_q" name="pd_target_q" class="regular-text" value="'
-			. esc_attr( $search ) . '" placeholder="'
-			. esc_attr__( 'Search by title', 'post-domain' ) . '">';
-		$html .= ' ' . get_submit_button( __( 'Search', 'post-domain' ), 'secondary', 'submit', false );
-		$html .= '</p></form>';
-
-		return $html;
-	}
-
-	private static function target_select( string $search, int $page ): string {
-		$found = self::target_candidates( $search, $page );
+	private static function target_control(): string {
+		$found = self::target_candidates( '', 1, self::TARGETS_PER_PAGE );
 
 		if ( array() === $found['posts'] ) {
-			// An empty *page* is not an empty site. Saying "there is no content"
-			// while later pages hold readable targets is what strands an operator,
-			// so the pagination is still rendered and the message says which case
-			// this is.
-			if ( $found['total'] > 0 ) {
-				return '<p id="pd_post_id_help">' . esc_html__(
-					'Nothing on this page. Use the pages below, or search above.',
-					'post-domain'
-				) . '</p>'
-					. '<input type="hidden" name="pd_post_id" value="">'
-					. self::target_pagination( $search, $page, $found );
-			}
-
-			$message = '' === $search
-				? __( 'There is no published content to map a domain to yet.', 'post-domain' )
-				: __( 'Nothing matched that search. Try another term.', 'post-domain' );
-
-			return '<p id="pd_post_id_help">' . esc_html( $message ) . '</p>'
-				. '<input type="hidden" name="pd_post_id" value="">';
+			return '<p id="pd_post_id_help">' . esc_html__(
+				'There is no published content to map a domain to yet.',
+				'post-domain'
+			) . '</p><input type="hidden" name="pd_post_id" value="">';
 		}
 
-		$html  = '<select name="pd_post_id" id="pd_post_id" aria-describedby="pd_post_id_help" required>';
+		$html = '<div class="pd-combobox" data-pd-combobox'
+			. ' data-nonce="' . esc_attr( wp_create_nonce( TargetSearch::nonce_action() ) ) . '"'
+			. ' data-action="' . esc_attr( TargetSearch::ACTION ) . '"'
+			. ' data-endpoint="' . esc_url( admin_url( 'admin-ajax.php' ) ) . '">';
+
+		$html .= '<select name="pd_post_id" id="pd_post_id" aria-describedby="pd_post_id_help" required>';
 		$html .= '<option value="">' . esc_html__( '— Choose —', 'post-domain' ) . '</option>';
 
 		foreach ( $found['posts'] as $post ) {
-			$type  = get_post_type_object( $post->post_type );
-			$title = '' === trim( $post->post_title )
-				? sprintf( /* translators: %d: post id. */ __( '(no title) #%d', 'post-domain' ), $post->ID )
-				: $post->post_title;
+			$type = get_post_type_object( $post->post_type );
 
 			$html .= sprintf(
 				'<option value="%d">%s</option>',
@@ -301,7 +265,9 @@ final class Screen {
 					sprintf(
 						/* translators: 1: content title, 2: post type label. */
 						__( '%1$s (%2$s)', 'post-domain' ),
-						$title,
+						'' === trim( $post->post_title )
+							? sprintf( /* translators: %d: post id. */ __( '(no title) #%d', 'post-domain' ), $post->ID )
+							: $post->post_title,
 						$type?->labels->singular_name ?? $post->post_type
 					)
 				)
@@ -309,56 +275,45 @@ final class Screen {
 		}
 
 		$html .= '</select>';
+		$html .= '</div>';
 		$html .= '<p class="description" id="pd_post_id_help">'
-			. esc_html__( 'The page or post this domain opens on. Anything beneath it is served too.', 'post-domain' )
+			. esc_html__( 'Start typing to search all of your content. Anything beneath the page you choose is served too.', 'post-domain' )
 			. '</p>';
-		$html .= self::target_pagination( $search, $page, $found );
+
+		if ( $found['total'] > count( $found['posts'] ) ) {
+			$html .= '<p class="description">' . esc_html(
+				sprintf(
+					/* translators: %d: total number of eligible items. */
+					__( 'Showing the most recent %1$d of %2$d. Type to search the rest.', 'post-domain' ),
+					count( $found['posts'] ),
+					$found['total']
+				)
+			) . '</p>';
+		}
 
 		return $html;
 	}
 
 	/**
-	 * @param array{posts: \WP_Post[], total: int, pages: int} $found
+	 * A copy-friendly value with a Copy control in the corner, the way a code
+	 * block does it.
+	 *
+	 * Reused for DNS names and values as well as hostnames: those are the values
+	 * an operator retypes into a DNS provider, and a mistyped TXT value is an
+	 * afternoon of confusion. The button is a real button, so it is reachable by
+	 * keyboard, and it carries the value it copies so the fallback works with no
+	 * Clipboard API.
 	 */
-	private static function target_pagination( string $search, int $page, array $found ): string {
-		if ( $found['pages'] <= 1 ) {
-			return '';
-		}
-
-		$link = static function ( int $target ) use ( $search ): string {
-			return add_query_arg(
-				array(
-					'page'           => SettingsPage::SLUG,
-					'pd_target_q'    => $search,
-					'pd_target_page' => $target,
-				),
-				admin_url( 'options-general.php' )
-			);
-		};
-
-		// Said out loud rather than left to be discovered: the operator needs to
-		// know the list continues, and how to reach the rest of it.
-		$html = '<p class="description">' . esc_html(
-			sprintf(
-				/* translators: 1: first item shown, 2: last item shown, 3: total items. */
-				__( 'Showing %1$d–%2$d of %3$d. Search above, or move through the pages.', 'post-domain' ),
-				( ( $page - 1 ) * self::TARGETS_PER_PAGE ) + 1,
-				min( $page * self::TARGETS_PER_PAGE, $found['total'] ),
-				$found['total']
-			)
-		) . '<br>';
-
-		if ( $page > 1 ) {
-			$html .= '<a href="' . esc_url( $link( $page - 1 ) ) . '">'
-				. esc_html__( '← Previous', 'post-domain' ) . '</a> ';
-		}
-
-		if ( $page < $found['pages'] ) {
-			$html .= '<a href="' . esc_url( $link( $page + 1 ) ) . '">'
-				. esc_html__( 'Next →', 'post-domain' ) . '</a>';
-		}
-
-		return $html . '</p>';
+	public static function copyable( string $value, string $accessible_name ): string {
+		return '<span class="pd-copy" data-pd-copy>'
+			. '<code class="pd-copy__value" data-pd-copy-value>' . esc_html( $value ) . '</code>'
+			. '<button type="button" class="button-link pd-copy__button" data-pd-copy-button'
+			. ' aria-label="' . esc_attr( $accessible_name ) . '">'
+			. '<span class="dashicons dashicons-clipboard" aria-hidden="true"></span>'
+			. '<span class="screen-reader-text">' . esc_html( $accessible_name ) . '</span>'
+			. '</button>'
+			. '<span class="pd-copy__status" role="status" aria-live="polite"></span>'
+			. '</span>';
 	}
 
 	public static function list_table(): string {
@@ -384,6 +339,7 @@ final class Screen {
 				__( 'Verification', 'post-domain' ),
 				__( 'Serving', 'post-domain' ),
 				__( 'Certificate', 'post-domain' ),
+				__( 'Actions', 'post-domain' ),
 			) as $heading
 		) {
 			$html .= '<th scope="col">' . esc_html( $heading ) . '</th>';
@@ -400,15 +356,34 @@ final class Screen {
 				admin_url( 'options-general.php' )
 			);
 
-			$title = null === $mapping->post_id ? null : get_the_title( $mapping->post_id );
+			$display = $idna->to_display( $mapping->host );
+			$title   = null === $mapping->post_id ? null : get_the_title( $mapping->post_id );
 
-			$html .= '<tr><td><strong><a href="' . esc_url( $detail ) . '">'
-				. esc_html( $idna->to_display( $mapping->host ) ) . '</a></strong><br><code>'
-				. esc_html( $mapping->host ) . '</code></td>';
+			// The hostname once. It used to appear twice — as a link and again in
+			// code styling — which read as two different values.
+			$html .= '<tr><td>' . self::copyable(
+				$mapping->host,
+				sprintf( /* translators: %s: the mapped hostname. */ __( 'Copy %s', 'post-domain' ), $display )
+			) . '</td>';
+
 			$html .= '<td>' . esc_html( (string) ( $title ?? __( '(alias)', 'post-domain' ) ) ) . '</td>';
 			$html .= '<td>' . esc_html( Labels::verification( $mapping->verification_state ) ) . '</td>';
 			$html .= '<td>' . esc_html( Labels::activation( $mapping->activation_state ) ) . '</td>';
-			$html .= '<td>' . esc_html( Labels::ssl( $mapping->ssl_state ) ) . '</td></tr>';
+			$html .= '<td>' . esc_html( Labels::ssl( $mapping->ssl_state ) ) . '</td>';
+
+			$html .= '<td><a class="button button-small" href="' . esc_url( 'https://' . $mapping->host . '/' ) . '"'
+				. ' target="_blank" rel="noopener noreferrer">'
+				. esc_html__( 'Test', 'post-domain' )
+				. '<span class="screen-reader-text">' . esc_html(
+					sprintf( /* translators: %s: the mapped hostname. */ __( 'Open %s in a new tab', 'post-domain' ), $display )
+				) . '</span></a> ';
+			$html .= '<a class="button button-small" href="' . esc_url( $detail ) . '">'
+				. esc_html__( 'Edit', 'post-domain' )
+				. '<span class="screen-reader-text">' . esc_html(
+					sprintf( /* translators: %s: the mapped hostname. */ __( 'Manage %s', 'post-domain' ), $display )
+				) . '</span></a></td>';
+
+			$html .= '</tr>';
 		}
 
 		return $html . '</tbody></table>';
@@ -421,7 +396,7 @@ final class Screen {
 		$html  = '<p><a href="' . esc_url( $back ) . '">'
 			. esc_html__( '← All domains', 'post-domain' ) . '</a></p>';
 		$html .= '<h2>' . esc_html( $idna->to_display( $mapping->host ) ) . '</h2>';
-		$html .= '<p class="description">' . esc_html( Labels::next_step( $mapping ) ) . '</p>';
+		$html .= '<p class="description">' . esc_html( Workflow::summary( $mapping ) ) . '</p>';
 
 		$html .= '<table class="widefat"><tbody>';
 		$html .= self::status_row( __( 'Verification', 'post-domain' ), Labels::verification( $mapping->verification_state ), $mapping->verification_state->value );
@@ -429,11 +404,211 @@ final class Screen {
 		$html .= self::status_row( __( 'Certificate', 'post-domain' ), Labels::ssl( $mapping->ssl_state ), $mapping->ssl_state->value );
 		$html .= '</tbody></table>';
 
+		$html .= self::timings( $mapping );
+		$html .= self::steps( $mapping );
 		$html .= self::ownership( $mapping );
 		$html .= self::dns_requirements( $mapping );
-		$html .= self::controls( $mapping );
+		$html .= self::management( $mapping );
 
 		return $html;
+	}
+
+	/**
+	 * When things last happened and when they happen next.
+	 *
+	 * Every figure here comes from the state the server enforces or schedules.
+	 * Nothing is promised that the persisted schedule does not say: where the
+	 * provider owns the timing and there is no deadline to give, that is said
+	 * rather than filled in with a plausible number.
+	 */
+	private static function timings( Mapping $mapping ): string {
+		$rows = array();
+
+		if ( null !== $mapping->last_checked_at ) {
+			$rows[] = array(
+				__( 'Ownership last checked', 'post-domain' ),
+				self::when( $mapping->last_checked_at ),
+			);
+		}
+
+		if ( null !== $mapping->verify_next_attempt_at ) {
+			$rows[] = array(
+				__( 'Next automatic ownership check', 'post-domain' ),
+				self::when( $mapping->verify_next_attempt_at ),
+			);
+		}
+
+		if ( null !== $mapping->ssl_checked_at ) {
+			$rows[] = array(
+				__( 'Certificate last checked', 'post-domain' ),
+				self::when( $mapping->ssl_checked_at ),
+			);
+		}
+
+		if ( null !== $mapping->ssl_next_attempt_at ) {
+			$rows[] = array(
+				__( 'Next automatic certificate check', 'post-domain' ),
+				self::when( $mapping->ssl_next_attempt_at ),
+			);
+		}
+
+		if ( array() === $rows ) {
+			return '';
+		}
+
+		$html = '<h3>' . esc_html__( 'Timings', 'post-domain' ) . '</h3><table class="widefat"><tbody>';
+
+		foreach ( $rows as $row ) {
+			$html .= '<tr><th scope="row" style="width:18em">' . esc_html( $row[0] ) . '</th><td>'
+				. $row[1] . '</td></tr>';
+		}
+
+		$html .= '</tbody></table>';
+
+		if ( in_array( $mapping->ssl_state, array( SslState::REQUESTED, SslState::PENDING_VALIDATION ), true ) ) {
+			$html .= '<p class="description">' . esc_html__(
+				'The certificate provider decides when validation completes, so there is no exact deadline to give. The times above are when this plugin next looks.',
+				'post-domain'
+			) . '</p>';
+		}
+
+		return $html;
+	}
+
+	/** A stored UTC timestamp, in the site's timezone, with the raw value kept. */
+	private static function when( string $utc ): string {
+		$stamp = strtotime( $utc . ' UTC' );
+
+		if ( false === $stamp ) {
+			return esc_html( $utc );
+		}
+
+		// wp_date() returns false if the timezone cannot be resolved; the stored
+		// UTC value is then the honest thing to show.
+		$formatted = wp_date(
+			(string) get_option( 'date_format' ) . ' ' . (string) get_option( 'time_format' ),
+			$stamp
+		);
+
+		return '<time datetime="' . esc_attr( gmdate( 'c', $stamp ) ) . '">'
+			. esc_html( false === $formatted ? $utc : $formatted )
+			. '</time>';
+	}
+
+	/**
+	 * The verification cooldown, read from the state the server actually
+	 * enforces.
+	 *
+	 * `MappingCommands::verify_now()` refuses while the `pd_verify_rate_` transient
+	 * is set, so its expiry is the authority. The countdown in the page is a
+	 * convenience: a stale or forged client still meets the same refusal.
+	 */
+	public static function verify_available_at( Mapping $mapping ): ?int {
+		$timeout = get_option( '_transient_timeout_pd_verify_rate_' . $mapping->id );
+
+		if ( ! is_numeric( $timeout ) ) {
+			return null;
+		}
+
+		$at = (int) $timeout;
+
+		return $at > time() ? $at : null;
+	}
+
+	private static function steps( Mapping $mapping ): string {
+		$html = '<h3>' . esc_html__( 'Setup', 'post-domain' ) . '</h3><ol class="pd-steps">';
+
+		foreach ( Workflow::steps( $mapping ) as $step ) {
+			$html .= '<li class="pd-step pd-step--' . esc_attr( $step->status ) . '">';
+			$html .= '<p><strong>' . esc_html( $step->title ) . '</strong> '
+				. '<span class="pd-step__status">' . esc_html( $step->status_text() ) . '</span></p>';
+			$html .= '<p class="description">' . esc_html( $step->detail ) . '</p>';
+
+			if ( null !== $step->because ) {
+				$html .= '<p class="description">' . esc_html( $step->because ) . '</p>';
+			}
+
+			$html .= self::step_action( $mapping, $step );
+			$html .= '</li>';
+		}
+
+		return $html . '</ol>';
+	}
+
+	private static function step_action( Mapping $mapping, Step $step ): string {
+		if ( 7 === $step->number ) {
+			return self::origin_test( $mapping, $step );
+		}
+
+		if ( ! $step->is_actionable() || null === $step->action ) {
+			return '';
+		}
+
+		if ( 'pd_verify' === $step->action ) {
+			$available = self::verify_available_at( $mapping );
+
+			if ( null !== $available ) {
+				// Disabled because the server will refuse, not to be tidy.
+				return '<p><button type="button" class="button" disabled'
+					. ' data-pd-countdown="' . esc_attr( (string) $available ) . '">'
+					. esc_html__( 'Check verification', 'post-domain' )
+					. ' <span class="pd-countdown" role="status" aria-live="polite"></span>'
+					. '</button> <span class="description">' . esc_html__(
+						'Checks are limited to one a minute.',
+						'post-domain'
+					) . '</span></p>';
+			}
+		}
+
+		return '<p>' . self::form_open( $step->action, $mapping->id, $mapping->revision )
+			. '<button type="submit" class="button button-primary">'
+			. esc_html( (string) $step->label )
+			. '</button></form></p>';
+	}
+
+	/**
+	 * The final step: does the host route the mapped name here.
+	 *
+	 * The probe runs in the browser on the mapped origin, because only the
+	 * browser can produce that Origin — the same boundary the CORS probe already
+	 * respects. A page served by the host instead of by this installation runs no
+	 * script and reports nothing, which is the honest answer: not confirmed.
+	 */
+	private static function origin_test( Mapping $mapping, Step $step ): string {
+		if ( Step::UPCOMING === $step->status ) {
+			return '';
+		}
+
+		$open = '<a class="button" href="' . esc_url( 'https://' . $mapping->host . '/' ) . '"'
+			. ' target="_blank" rel="noopener noreferrer">'
+			. esc_html__( 'Open the domain', 'post-domain' ) . '</a>';
+
+		if ( Step::DONE === $step->status ) {
+			$at = Workflow::origin_confirmed_at( $mapping );
+
+			return '<p>' . $open . ' <span class="description">' . esc_html(
+				sprintf(
+					/* translators: %s: a date and time. */
+					__( 'Confirmed %s.', 'post-domain' ),
+					null === $at ? '' : wp_date(
+						(string) get_option( 'date_format' ) . ' ' . (string) get_option( 'time_format' ),
+						(int) ( false === strtotime( $at . ' UTC' ) ? time() : strtotime( $at . ' UTC' ) )
+					)
+				)
+			) . '</span></p>';
+		}
+
+		return '<p>' . $open . '</p>'
+			. '<div class="pd-origin-test" data-pd-origin-test'
+			. ' data-host="' . esc_attr( $mapping->host ) . '"'
+			. ' data-mapping="' . esc_attr( (string) $mapping->id ) . '"'
+			. ' data-nonce="' . esc_attr( wp_create_nonce( OriginProbe::nonce_action( $mapping->id ) ) ) . '"'
+			. ' data-endpoint="' . esc_url( admin_url( 'admin-ajax.php' ) ) . '"'
+			. ' data-action="' . esc_attr( OriginProbe::ACTION ) . '">'
+			. '<p><button type="button" class="button" data-pd-origin-run>'
+			. esc_html__( 'Test this domain now', 'post-domain' ) . '</button></p>'
+			. '<p class="pd-origin-test__result" role="status" aria-live="polite"></p>'
+			. '</div>';
 	}
 
 	private static function status_row( string $label, string $plain, string $technical ): string {
@@ -465,32 +640,43 @@ final class Screen {
 		return $html . '</p>';
 	}
 
-	/** The records the operator has to publish, including the ownership TXT. */
+	/**
+	 * The records to publish, grouped by purpose, each rendered once.
+	 *
+	 * There is no aggregate table above this. One used to repeat the permanent
+	 * ownership TXT that the purpose-grouped output already contains, so the same
+	 * record appeared twice and read as two requirements.
+	 */
 	private static function dns_requirements( Mapping $mapping ): string {
-		$html = '<h3>' . esc_html__( 'DNS records to publish', 'post-domain' ) . '</h3>';
-
-		$name = Challenge::record_name( $mapping->challenge_label, $mapping->host );
-
-		if ( null !== $name ) {
-			$html .= '<table class="widefat"><thead><tr>'
-				. '<th>' . esc_html__( 'Type', 'post-domain' ) . '</th>'
-				. '<th>' . esc_html__( 'Name', 'post-domain' ) . '</th>'
-				. '<th>' . esc_html__( 'Value', 'post-domain' ) . '</th>'
-				. '</tr></thead><tbody><tr><td>TXT</td><td><code>'
-				. esc_html( $name ) . '</code></td><td><code>'
-				. esc_html( Challenge::expected_value( $mapping->challenge ) )
-				. '</code></td></tr></tbody></table>';
-		}
+		$html = '<h3>' . esc_html__( 'DNS records', 'post-domain' ) . '</h3>';
 
 		$driver = BoundResource::driver_for( $mapping );
 
 		if ( $driver instanceof DriverUnavailable ) {
-			$html .= '<p>' . esc_html__(
-				'Certificate validation records appear once a provider is configured for this domain.',
-				'post-domain'
-			) . '</p>';
+			$name = Challenge::record_name( $mapping->challenge_label, $mapping->host );
 
-			return $html;
+			if ( null === $name ) {
+				return $html;
+			}
+
+			// Before a provider is bound there is exactly one record to publish,
+			// and it is this plugin's own. Rendered here in the same shape the
+			// purpose-grouped output uses, so nothing appears twice later.
+			return $html . '<h4>' . esc_html__( 'Ownership (post-domain)', 'post-domain' ) . '</h4>'
+				. '<p class="pd-permanent">' . esc_html__(
+					'Permanent: this record must never be removed while the domain is mapped.',
+					'post-domain'
+				) . '</p>'
+				. '<table class="widefat"><thead><tr><th>' . esc_html__( 'Type', 'post-domain' ) . '</th><th>'
+				. esc_html__( 'Name', 'post-domain' ) . '</th><th>' . esc_html__( 'Value', 'post-domain' )
+				. '</th></tr></thead><tbody><tr><td>TXT</td><td>'
+				. self::copyable( $name, sprintf( /* translators: %s: a DNS record name. */ __( 'Copy the record name %s', 'post-domain' ), $name ) )
+				. '</td><td>'
+				. self::copyable(
+					Challenge::expected_value( $mapping->challenge ),
+					__( 'Copy the record value', 'post-domain' )
+				)
+				. '</td></tr></tbody></table>';
 		}
 
 		$record_name = Challenge::record_name( $mapping->challenge_label, $mapping->host );
@@ -506,14 +692,18 @@ final class Screen {
 
 		// DomainDetail escapes as it builds; it must not be run through an
 		// allowlist that would strip its tables.
-		$html .= DomainDetail::render_plan( $plan );
-
-		return $html;
+		return $html . DomainDetail::render_plan( $plan, $mapping );
 	}
 
-	/** One button per action the state machine actually permits right now. */
-	private static function controls( Mapping $mapping ): string {
-		$html = '<h3>' . esc_html__( 'Actions', 'post-domain' ) . '</h3>';
+	/**
+	 * Everything that is not part of setting the domain up.
+	 *
+	 * Kept away from the numbered steps on purpose: stopping serving, removing a
+	 * certificate and deleting a domain are not stages of onboarding, and putting
+	 * them in the same list invites an operator to work through them.
+	 */
+	private static function management( Mapping $mapping ): string {
+		$html = '<h3>' . esc_html__( 'Manage this domain', 'post-domain' ) . '</h3>';
 
 		if ( null !== $mapping->ssl_removal_scope ) {
 			return $html . '<p>' . esc_html__(
@@ -531,52 +721,30 @@ final class Screen {
 
 		$buttons = array();
 
-		$buttons[] = self::button( 'pd_verify', $mapping, __( 'Check verification', 'post-domain' ), 'secondary' );
 		$buttons[] = self::button( 'pd_rotate_challenge', $mapping, __( 'Issue a new verification record', 'post-domain' ), 'secondary' );
 
-		if ( VerificationState::VERIFIED === $mapping->verification_state ) {
-			$buttons[] = ActivationState::ACTIVE === $mapping->activation_state
-				? self::button( 'pd_deactivate', $mapping, __( 'Stop serving', 'post-domain' ), 'secondary' )
-				: self::button( 'pd_activate', $mapping, __( 'Start serving', 'post-domain' ), 'primary' );
-		}
-
-		if ( self::may_request_certificate( $mapping ) ) {
-			$buttons[] = self::button(
-				'pd_provision_ssl',
-				$mapping,
-				SslState::FAILED === $mapping->ssl_state
-					? __( 'Request the certificate again', 'post-domain' )
-					: __( 'Request a certificate', 'post-domain' ),
-				'primary'
-			);
+		if ( VerificationState::VERIFIED === $mapping->verification_state
+			&& ActivationState::ACTIVE === $mapping->activation_state ) {
+			$buttons[] = self::button( 'pd_deactivate', $mapping, __( 'Stop serving', 'post-domain' ), 'secondary' );
 		}
 
 		if ( null !== $mapping->ssl_ref ) {
 			$buttons[] = self::button( 'pd_remove_ssl', $mapping, __( 'Remove the certificate', 'post-domain' ), 'secondary' );
 		}
 
-		$buttons[] = self::button( 'pd_delete_mapping', $mapping, __( 'Delete this domain', 'post-domain' ), 'delete' );
-
-		// Each control is its own form, so they are siblings in a div rather than
-		// block elements inside a paragraph.
-		return $html . '<div class="pd-actions" style="display:flex;flex-wrap:wrap;gap:.5rem">'
+		$html .= '<div class="pd-actions" style="display:flex;flex-wrap:wrap;gap:.5rem">'
 			. implode( '', $buttons ) . '</div>';
-	}
 
-	private static function may_request_certificate( Mapping $mapping ): bool {
-		if ( VerificationState::VERIFIED !== $mapping->verification_state ) {
-			return false;
-		}
+		$html .= '<h3 class="pd-danger">' . esc_html__( 'Danger zone', 'post-domain' ) . '</h3>';
+		$html .= '<p class="description">' . esc_html__(
+			'Deleting the domain removes the mapping only. The page or post it shows is not deleted.',
+			'post-domain'
+		) . '</p>';
+		$html .= '<div class="pd-actions" style="display:flex;flex-wrap:wrap;gap:.5rem">'
+			. self::button( 'pd_delete_mapping', $mapping, __( 'Delete this domain', 'post-domain' ), 'delete' )
+			. '</div>';
 
-		if ( ActivationState::ACTIVE !== $mapping->activation_state ) {
-			return false;
-		}
-
-		return in_array(
-			$mapping->ssl_state,
-			array( SslState::NONE, SslState::FAILED, SslState::REVOKED ),
-			true
-		);
+		return $html;
 	}
 
 	private static function button( string $action, Mapping $mapping, string $label, string $variant ): string {

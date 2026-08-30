@@ -255,7 +255,10 @@ final class CloudflareSaasDriver implements SslDriver {
 			$capability,
 			PublicSuffix::is_apex( $ctx->host ),
 			$ctx->challenge_name,
-			$ctx->challenge_value
+			$ctx->challenge_value,
+			// The routing record names the real hostname. The challenge name
+			// cannot stand in for it: its label is filterable.
+			$ctx->host
 		);
 	}
 

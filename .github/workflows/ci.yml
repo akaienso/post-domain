@@ -20,6 +20,7 @@ jobs:
       - run: composer generate:status-map
       - run: git diff --exit-code references/cloudflare-status-map.php
       - run: composer lint:plans
+      - run: composer lint:js
       - run: composer test
       # The readiness state machine behind composer test:integration, proved
       # without a database so a broken probe fails here rather than as a flake.

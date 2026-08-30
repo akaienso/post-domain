@@ -24,6 +24,54 @@ ever requested from a certificate provider.
   network is a different problem with a different solution, and supporting both
   makes both worse.
 
+### The origin must accept the mapped `Host` header
+
+**This is a hosting-side prerequisite, and the plugin cannot satisfy it.** Read it
+before mapping anything, because everything the plugin reports can be green while
+the mapped domain still fails.
+
+`verified` + `serving` + an active certificate proves three things: DNS ownership
+was demonstrated, the certificate provider issued a certificate, and TLS
+terminates correctly for the mapped host. It proves **nothing** about whether the
+request then reaches *this* WordPress installation. Those are control-plane and
+TLS facts; routing to the origin is a separate fact, established somewhere the
+plugin has no reach.
+
+Whatever fronts this site — the web server, the managed hosting platform, a
+reverse proxy, a CDN — must:
+
+- **accept the mapped `Host` header** rather than rejecting it as an unknown
+  hostname, and
+- **route it to this same WordPress installation**, and
+- **not canonicalise it back to the primary domain** at any layer, whether by
+  redirect, by a rewritten `Host`, or by a canonical-URL rule.
+
+On most managed hosts this is an explicit step: a **domain alias**, an
+**additional domain**, an Apache/nginx **virtual-host entry**, or on a CDN an
+**origin host** / **host header override**. The name varies by vendor; the
+requirement does not.
+
+**Do not use an alias mode that redirects to the primary hostname.** Many control
+panels offer exactly that as the default "add a domain" behaviour, and it is
+worse than doing nothing: a redirect replaces the mapped domain in the address
+bar, which is precisely the outcome resolved-not-redirected mapping exists to
+avoid. The alias must *serve* the hostname, not forward it.
+
+Symptoms that this step is missing, in a mapping that is otherwise fully
+provisioned:
+
+- HTTPS downgrades to HTTP.
+- The browser ends up on the primary hostname.
+- A generic hosting "success", "welcome", or parked-domain placeholder page
+  appears instead of the mapped post.
+
+Live testing reached verified, serving, an active certificate, and publicly valid
+HTTPS while the mapped domain still returned the host's placeholder page: the
+request never arrived at the WordPress installation under the mapped `Host`
+header, because the host rejected the unregistered hostname before PHP ran. No
+amount of plugin-side state fixes that. See `docs/operator-guide.md`, and the
+**Setup guide** panel on the plugin's own screen, for the operator-facing version.
+
 ## 3. The DNS records
 
 Four separate purposes. They are not interchangeable, and only one of them is

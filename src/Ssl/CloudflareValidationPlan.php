@@ -7,6 +7,15 @@ final class CloudflareValidationPlan {
 
 	/**
 	 * @param array<string, mixed> $payload The custom hostname payload.
+	 * @param string               $host    The normalised mapped hostname. Routing
+	 *                                      records name this host, so it is passed
+	 *                                      in rather than derived: the challenge
+	 *                                      label in $core_record_name is filterable
+	 *                                      and is not a hostname. The parameter is
+	 *                                      optional only so the plan keeps building
+	 *                                      until the one production caller is wired
+	 *                                      to pass $ctx->host; the provider payload
+	 *                                      is the fallback, never the challenge name.
 	 */
 	public static function build(
 		array $payload,
@@ -14,13 +23,28 @@ final class CloudflareValidationPlan {
 		ApexCapability $apex,
 		bool $is_apex,
 		string $core_record_name,
-		string $core_record_value
+		string $core_record_value,
+		string $host = ''
 	): ValidationPlan {
 		$dns      = array();
 		$http     = array();
 		$manual   = array();
 		$pending  = array();
 		$blockers = array();
+
+		if ( '' === $host ) {
+			$host = (string) ( $payload['hostname'] ?? '' );
+		}
+
+		/**
+		 * An empty payload is what an absent provider resource looks like: the
+		 * read either returned nothing or was never made. Nothing about such a
+		 * resource is outstanding, so the provider-issued purposes contribute
+		 * neither requirements nor a wait. Claiming records are "not yet issued"
+		 * for a resource that does not exist is the root of the false
+		 * "Awaiting provider" notice on a revoked mapping.
+		 */
+		$resource_exists = array() !== $payload;
 
 		// Purpose 1: the plugin's own permanent challenge.
 		$dns['ownership'] = array(
@@ -38,7 +62,7 @@ final class CloudflareValidationPlan {
 		// Purpose 2: Cloudflare hostname ownership.
 		$hostname_status = (string) ( $payload['status'] ?? '' );
 
-		if ( 'active' !== $hostname_status ) {
+		if ( $resource_exists && 'active' !== $hostname_status ) {
 			$ownership = $payload['ownership_verification'] ?? null;
 			$http_own  = $payload['ownership_verification_http'] ?? null;
 			$found     = false;
@@ -98,7 +122,7 @@ final class CloudflareValidationPlan {
 		$ssl_status = (string) ( $ssl['status'] ?? '' );
 		$records    = is_array( $ssl['validation_records'] ?? null ) ? $ssl['validation_records'] : array();
 
-		if ( 'active' !== $ssl_status ) {
+		if ( $resource_exists && 'active' !== $ssl_status ) {
 			if ( array() === $records ) {
 				$pending[] = new ValidationPending( 'ssl_validation', 'provider_records_not_yet_issued' );
 			}
@@ -165,7 +189,7 @@ final class CloudflareValidationPlan {
 					'routing',
 					'routing-cname',
 					'Point the hostname at the SaaS target',
-					array( new DnsRecordSpec( 'CNAME', 'mapped host', $cname_target ) ),
+					array( new DnsRecordSpec( 'CNAME', $host, $cname_target ) ),
 					false,
 					'cloudflare-saas'
 				),
@@ -179,7 +203,7 @@ final class CloudflareValidationPlan {
 					array_map(
 						static fn( string $ip ): DnsRecordSpec => new DnsRecordSpec(
 							false === filter_var( $ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6 ) ? 'A' : 'AAAA',
-							'mapped host',
+							$host,
 							$ip
 						),
 						$apex->targets
@@ -194,7 +218,7 @@ final class CloudflareValidationPlan {
 					'routing',
 					'routing-apex-cname',
 					'Point the apex at the SaaS target (flattened)',
-					array( new DnsRecordSpec( 'CNAME', 'mapped host', $cname_target ) ),
+					array( new DnsRecordSpec( 'CNAME', $host, $cname_target ) ),
 					true,
 					'cloudflare-saas'
 				),
