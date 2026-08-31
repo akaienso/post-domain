@@ -3,7 +3,7 @@
  * Plugin Name: post-domain
  * Description: Maps a domain name to a single post, resolved rather than redirected.
  * x-release-please-start-version
- * Version:     1.0.2
+ * Version:     1.1.0
  * x-release-please-end
  * Requires at least: 6.4
  * Requires PHP: 8.1
