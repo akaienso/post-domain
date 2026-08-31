@@ -45,6 +45,21 @@ final class RegistrationOutcome {
 		return new self( HostingRegistrationState::UNSUPPORTED, null, null, null );
 	}
 
+	/**
+	 * The provider answered and the answer could not be written.
+	 *
+	 * Never a success and never terminal: the durable claim survives, so a
+	 * read-only recovery pass settles it without another write.
+	 */
+	public static function fenced(): self {
+		return new self(
+			HostingRegistrationState::FENCED,
+			null,
+			null,
+			'The hosting result could not be recorded because the domain changed at the same moment. This will be settled by reading.'
+		);
+	}
+
 	public function succeeded(): bool {
 		return in_array(
 			$this->state,

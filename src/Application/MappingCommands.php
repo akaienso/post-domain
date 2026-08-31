@@ -8,6 +8,7 @@ use PostDomain\Hosting\HostingProviderFactory;
 use PostDomain\Hosting\HostingProviderUnavailable;
 use PostDomain\Hosting\HostingRegistrationCoordinator;
 use PostDomain\Hosting\HostingRegistrationState;
+use PostDomain\Hosting\RegistrationOutcome;
 use PostDomain\Mapping\ActivationState;
 use PostDomain\Mapping\AliasResolver;
 use PostDomain\Mapping\InvalidMapping;
@@ -234,21 +235,86 @@ final class MappingCommands {
 		// The row moved: the claim and its settlement each bumped the revision.
 		$mapping = $this->repo->by_id( $mapping->id ) ?? $mapping;
 
-		return CommandResult::ok(
-			201,
-			$mapping,
-			array(
-				'hosting' => array(
-					'state'    => $outcome->state->value,
-					// Never dressed up: a registration that did not complete is
-					// reported as what it was, alongside the mapping that was
-					// created, rather than folded into a plain success.
-					'settled'  => $outcome->succeeded(),
-					'message'  => $outcome->message,
-					'provider' => $provider->id(),
-				),
-			)
+		return self::creation_result( $mapping, $provider->id(), $outcome );
+	}
+
+	/**
+	 * Repeats the one attachment for a mapping the provider definitively refused.
+	 *
+	 * Exists so that correcting a token is enough. Deleting and rebuilding a
+	 * mapping to repeat an attachment that never happened would discard its
+	 * challenge, its certificate and its history for nothing. The coordinator
+	 * still owns the rules: only a refused registration is eligible, the claim
+	 * is taken through the same CAS, and at most one attachment is made.
+	 */
+	public function retry_hosting( Mapping $mapping ): CommandResult {
+		$provider = HostingProviderFactory::for_mapping( $mapping );
+
+		if ( $provider instanceof HostingProviderUnavailable ) {
+			return CommandResult::refused(
+				Errors::HOSTING_UNAVAILABLE,
+				'This site\'s hosting is not connected, so there is nothing to ask again.',
+				409,
+				$mapping
+			);
+		}
+
+		$outcome = $this->hosting->retry_refused( $mapping, $provider );
+		$mapping = $this->repo->by_id( $mapping->id ) ?? $mapping;
+
+		return self::creation_result( $mapping, $provider->id(), $outcome, 200 );
+	}
+
+	/**
+	 * The truth about a creation, which is the truth about its registration.
+	 *
+	 * A durable local row is kept whatever the provider said — it is what fences
+	 * a second attempt and what the operator inspects — but the *result* must
+	 * not call that a completed creation. A refusal is a refusal, an unconfirmed
+	 * write is accepted rather than finished, and only an origin that actually
+	 * accepted the hostname produces a plain success.
+	 */
+	private static function creation_result(
+		Mapping $mapping,
+		string $provider_id,
+		RegistrationOutcome $outcome,
+		int $created = 201
+	): CommandResult {
+		$payload = array(
+			'hosting' => array(
+				'state'    => $outcome->state->value,
+				'settled'  => $outcome->succeeded(),
+				'message'  => $outcome->message,
+				'provider' => $provider_id,
+			),
 		);
+
+		return match ( $outcome->state ) {
+			HostingRegistrationState::REGISTERED,
+			HostingRegistrationState::ALREADY_MINE,
+			HostingRegistrationState::UNSUPPORTED => CommandResult::ok( $created, $mapping, $payload ),
+
+			// Accepted, not completed. The row exists and something outstanding
+			// will be settled by reading, so this is never dressed up as done.
+			HostingRegistrationState::AMBIGUOUS,
+			HostingRegistrationState::FENCED      => CommandResult::ok( 202, $mapping, $payload ),
+
+			HostingRegistrationState::FOREIGN     => CommandResult::refused(
+				Errors::HOSTING_FOREIGN,
+				'That domain is already attached to a different site on this hosting account, so it was not attached to this one. The mapping was kept; detach the domain at your host, then ask again.',
+				409,
+				$mapping
+			),
+
+			HostingRegistrationState::REFUSED     => CommandResult::refused(
+				Errors::HOSTING_REFUSED,
+				null === $outcome->message || '' === $outcome->message
+					? 'Your hosting refused to accept this domain, so it will not reach this site. The mapping was kept.'
+					: $outcome->message . ' The mapping was kept, so you can ask again once that is fixed.',
+				409,
+				$mapping
+			),
+		};
 	}
 
 	public function set_activation( Mapping $mapping, ActivationState $to, ?int $post_id = null ): CommandResult {

@@ -39,7 +39,15 @@ final class ManagementController {
 	/** Turns a shared command result into the REST response for it. */
 	private function respond( CommandResult $result, ?int $ok_status = null ): \WP_REST_Response {
 		if ( ! $result->succeeded ) {
-			return self::error( (string) $result->code, (string) $result->message, $result->status );
+			// A hosting refusal leaves a durable mapping behind, and a caller
+			// cannot inspect or retry what it cannot name. The identifier is the
+			// only thing added; nothing the provider said travels with it.
+			return self::error(
+				(string) $result->code,
+				(string) $result->message,
+				$result->status,
+				null === $result->mapping ? array() : array( 'mapping' => $result->mapping->id )
+			);
 		}
 
 		$status = $ok_status ?? $result->status;
@@ -103,12 +111,14 @@ final class ManagementController {
 		$post  = $request->get_param( 'post_id' );
 
 		return $this->respond(
+			// No forced status: creation answers 201 when the origin accepted the
+			// hostname and 202 when it has not confirmed yet, and flattening the
+			// two would be the claim this guards against.
 			$this->commands->create_mapping(
 				(string) $request->get_param( 'host' ),
 				null === $alias ? null : (int) $alias,
 				null === $post ? null : (int) $post
-			),
-			201
+			)
 		);
 	}
 
@@ -678,12 +688,13 @@ final class ManagementController {
 		return $this->environment( $request );
 	}
 
-	private static function error( string $code, string $message, int $status ): \WP_REST_Response {
+	/** @param array<string, mixed> $data Extra error data. Never provider content. */
+	private static function error( string $code, string $message, int $status, array $data = array() ): \WP_REST_Response {
 		return new \WP_REST_Response(
 			array(
 				'code'    => $code,
 				'message' => $message,
-				'data'    => array( 'status' => $status ),
+				'data'    => array_merge( array( 'status' => $status ), $data ),
 			),
 			$status
 		);

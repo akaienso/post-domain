@@ -899,4 +899,380 @@ final class WordifyWorkflowTest extends OwnedSessionTestCase {
 		$this->assertStringNotContainsString( 'wpk_test-token-not-a-credential', $page );
 		$this->assertStringNotContainsString( 'wpk_', $page );
 	}
+
+	// ------------------------------------------- the result must tell truth --
+
+	/**
+	 * @return array{status: int, ok: bool, settled: bool, hosting: string, notice: string, redirect: ?string}
+	 */
+	private function add_domain( string $host ): array {
+		$result = null;
+
+		add_filter(
+			'pd_test_command_result',
+			static function ( $carry ) use ( &$result ) {
+				$result = $carry;
+
+				return $carry;
+			}
+		);
+
+		$redirect = $this->post_returning_redirect(
+			'pd_add_mapping',
+			array(
+				'pd_host'    => $host,
+				'pd_post_id' => $this->target(),
+			)
+		);
+
+		remove_all_filters( 'pd_test_command_result' );
+
+		$notice = \PostDomain\Admin\Notices::take();
+
+		/** @var array<string, mixed> $hosting */
+		$hosting = null === $result || ! isset( $result->payload['hosting'] ) || ! is_array( $result->payload['hosting'] )
+			? array()
+			: $result->payload['hosting'];
+
+		return array(
+			'status'   => null === $result ? 0 : $result->status,
+			'ok'       => null !== $result && $result->succeeded,
+			'settled'  => true === ( $hosting['settled'] ?? false ),
+			'hosting'  => (string) ( $hosting['state'] ?? '' ),
+			'notice'   => null === $notice ? '' : $notice['type'] . ':' . $notice['message'],
+			'redirect' => $redirect,
+		);
+	}
+
+	/** @param array<string, string|int> $fields */
+	private function post_returning_redirect( string $action, array $fields ): ?string {
+		$_SERVER['REQUEST_METHOD'] = 'POST';
+
+		$_POST             = array_merge( array( 'pd_action' => $action ), $fields );
+		$_POST['_wpnonce'] = wp_create_nonce( Actions::nonce_action( $action, (int) ( $fields['pd_mapping'] ?? 0 ) ) );
+		$_REQUEST          = $_POST; // phpcs:ignore WordPress.Security.NonceVerification.Missing -- assembling the request the handler verifies.
+
+		add_filter( 'pd_admin_redirect_should_exit', '__return_false' );
+
+		try {
+			Actions::handle();
+
+			return null;
+		} catch ( RedirectedAway $e ) {
+			return $e->url;
+		} finally {
+			remove_filter( 'pd_admin_redirect_should_exit', '__return_false' );
+			$_POST                     = array();
+			$_REQUEST                  = array();
+			$_SERVER['REQUEST_METHOD'] = 'GET';
+			HostingProviderFactory::reset();
+		}
+	}
+
+	public function test_a_403_refusal_is_not_reported_as_a_successful_creation(): void {
+		$this->complete_setup();
+		$this->http->attach_answers(
+			array(
+				'status' => 403,
+				'body'   => '{"error":{"code":"forbidden"}}',
+			)
+		);
+
+		$outcome = $this->add_domain( 'refused-truth.example.org' );
+
+		$this->assertFalse( $outcome['ok'], 'Hosting refused, so the operation did not succeed.' );
+		$this->assertSame( 409, $outcome['status'] );
+		$this->assertStringStartsWith( 'error:', $outcome['notice'], 'A refusal is not a green notice.' );
+		$this->assertStringContainsString( 'Manage Sites', $outcome['notice'] );
+
+		$mapping = $this->repo->by_host( 'refused-truth.example.org' );
+
+		$this->assertNotNull( $mapping, 'The durable row survives, for fencing and for the operator to inspect.' );
+		$this->assertStringContainsString(
+			'mapping=' . $mapping->id,
+			(string) $outcome['redirect'],
+			'The operator is taken to the row that exists.'
+		);
+	}
+
+	public function test_a_401_refusal_is_not_reported_as_a_successful_creation(): void {
+		$this->complete_setup();
+		$this->http->attach_answers(
+			array(
+				'status' => 401,
+				'body'   => '{"error":{"code":"unauthenticated"}}',
+			)
+		);
+
+		$outcome = $this->add_domain( 'rejected-truth.example.org' );
+
+		$this->assertFalse( $outcome['ok'] );
+		$this->assertSame( 409, $outcome['status'] );
+		$this->assertStringStartsWith( 'error:', $outcome['notice'] );
+	}
+
+	public function test_a_foreign_hostname_is_a_conflict_rather_than_a_creation(): void {
+		$this->complete_setup();
+		$this->http->attach_answers(
+			array(
+				'status' => 422,
+				'body'   => '{"error":{"code":"taken"}}',
+			)
+		);
+		$this->http->owned_elsewhere['foreign-truth.example.org'] = $this->http->site_id( 3 );
+
+		$outcome = $this->add_domain( 'foreign-truth.example.org' );
+
+		$this->assertFalse( $outcome['ok'] );
+		$this->assertSame( 409, $outcome['status'] );
+		$this->assertStringStartsWith( 'error:', $outcome['notice'] );
+		$this->assertNotNull( $this->repo->by_host( 'foreign-truth.example.org' ) );
+	}
+
+	public function test_an_ambiguous_write_is_accepted_but_never_called_settled(): void {
+		$this->complete_setup();
+		$this->http->attach_answers(
+			array(
+				'status' => 503,
+				'body'   => '',
+			)
+		);
+
+		$outcome = $this->add_domain( 'pending-truth.example.org' );
+
+		$this->assertSame( 202, $outcome['status'], 'Accepted, not completed.' );
+		$this->assertFalse( $outcome['settled'] );
+		$this->assertStringStartsWith( 'warning:', $outcome['notice'] );
+		$this->assertStringNotContainsString( 'hosting has been told to accept it', $outcome['notice'] );
+		$this->assertStringContainsString( 'did not confirm', $outcome['notice'] );
+	}
+
+	public function test_a_successful_attachment_is_still_a_201(): void {
+		$this->complete_setup();
+
+		$outcome = $this->add_domain( 'happy-truth.example.org' );
+
+		$this->assertTrue( $outcome['ok'] );
+		$this->assertSame( 201, $outcome['status'] );
+		$this->assertStringStartsWith( 'success:', $outcome['notice'] );
+	}
+
+	public function test_manual_hosting_creation_is_still_a_plain_success(): void {
+		$this->post( 'pd_set_hosting', array( 'pd_hosting_provider' => HostingDetection::MANUAL ) );
+
+		$outcome = $this->add_domain( 'manual-truth.example.org' );
+
+		$this->assertTrue( $outcome['ok'] );
+		$this->assertSame( 201, $outcome['status'] );
+		$this->assertStringStartsWith( 'success:', $outcome['notice'] );
+	}
+
+	public function test_rest_reports_the_hosting_refusal_rather_than_201(): void {
+		$this->complete_setup();
+		$this->http->attach_answers(
+			array(
+				'status' => 403,
+				'body'   => '{"error":{"code":"forbidden"}}',
+			)
+		);
+
+		$request = new \WP_REST_Request( 'POST', '/post-domain/v1/domains' );
+		$request->set_param( 'host', 'rest-refused.example.org' );
+		$request->set_param( 'post_id', $this->target() );
+
+		$response = rest_do_request( $request );
+
+		$this->assertSame( 409, $response->get_status() );
+
+		$body = $response->get_data();
+
+		$this->assertSame( 'pd_hosting_refused', is_array( $body ) ? ( $body['code'] ?? null ) : null );
+		$this->assertNotNull( $this->repo->by_host( 'rest-refused.example.org' ), 'The row survives.' );
+		$this->assertStringNotContainsString( 'forbidden', (string) wp_json_encode( $body ), 'No provider body escapes.' );
+	}
+
+	public function test_rest_reports_an_unconfirmed_attachment_as_accepted(): void {
+		$this->complete_setup();
+		$this->http->attach_answers(
+			array(
+				'status' => 503,
+				'body'   => '',
+			)
+		);
+
+		$request = new \WP_REST_Request( 'POST', '/post-domain/v1/domains' );
+		$request->set_param( 'host', 'rest-pending.example.org' );
+		$request->set_param( 'post_id', $this->target() );
+
+		$this->assertSame( 202, rest_do_request( $request )->get_status() );
+	}
+
+	// ------------------------------------------------------- lost settlement --
+
+	/**
+	 * A write that landed, and a settlement that lost its row.
+	 *
+	 * The row moves between the provider answering and the CAS running, so the
+	 * CAS matches nothing. Reporting REGISTERED here would announce a success
+	 * the database never recorded.
+	 */
+	public function test_a_settlement_that_loses_its_row_is_never_reported_as_success(): void {
+		$this->complete_setup();
+
+		// Bump the revision after the provider answers and before the settle.
+		add_filter(
+			'pd_test_before_hosting_settlement',
+			function ( $carry, \PostDomain\Hosting\HostingClaim $claim ) {
+				global $wpdb;
+
+				$table = Schema::domains_table();
+
+				$wpdb->query( // phpcs:ignore WordPress.DB
+					$wpdb->prepare( "UPDATE {$table} SET revision = revision + 1 WHERE id = %d", $claim->mapping_id ) // phpcs:ignore WordPress.DB
+				);
+
+				return $carry;
+			},
+			10,
+			2
+		);
+
+		$outcome = $this->add_domain( 'fenced-truth.example.org' );
+
+		remove_all_filters( 'pd_test_before_hosting_settlement' );
+
+		$this->assertSame( 202, $outcome['status'], 'Accepted and unresolved, never a completed creation.' );
+		$this->assertSame( 'fenced', $outcome['hosting'] );
+		$this->assertFalse( $outcome['settled'], 'The provider answer was never recorded, so nothing is settled.' );
+		$this->assertStringStartsWith( 'warning:', $outcome['notice'], 'Not a green notice for a result nothing wrote.' );
+
+		$mapping = $this->repo->by_host( 'fenced-truth.example.org' );
+
+		$this->assertNotNull( $mapping );
+		$this->assertSame(
+			HostingState::RESERVED->value,
+			$mapping->hosting_state,
+			'The row stays claimed, which is exactly what recovery settles.'
+		);
+
+		$events = array_map(
+			static fn ( array $row ): string => (string) $row['type'],
+			\PostDomain\Mapping\EventLog::for_domain( $mapping->id )
+		);
+
+		$this->assertNotContains( 'hosting.attached', $events, 'No terminal event for a transition that never happened.' );
+
+		// Recovery settles it by reading, with no further attach.
+		$attaches = count( $this->http->attach_calls() );
+
+		do_action( HostingRecoveryService::HOOK );
+
+		$this->assertCount( $attaches, $this->http->attach_calls() );
+		$this->assertSame( HostingState::ATTACHED->value, $this->repo->by_id( $mapping->id )?->hosting_state );
+	}
+
+	// ------------------------------------------------------ retry a refusal --
+
+	public function test_a_refused_attachment_can_be_asked_again_once_the_token_is_fixed(): void {
+		$this->complete_setup();
+		$this->http->attach_answers(
+			array(
+				'status' => 403,
+				'body'   => '{"error":{"code":"forbidden"}}',
+			)
+		);
+
+		$this->add_domain( 'retry.example.org' );
+
+		$refused = $this->repo->by_host( 'retry.example.org' );
+		$this->assertNotNull( $refused );
+		$this->assertSame( HostingState::REFUSED->value, $refused->hosting_state );
+
+		// The screen offers the retry, so the operator is not told to delete and
+		// rebuild a mapping to repeat an attachment that never happened.
+		$_GET = array( 'mapping' => (string) $refused->id );
+		ob_start();
+		SettingsPage::render();
+		$this->assertStringContainsString( 'pd_retry_hosting', (string) ob_get_clean() );
+
+		$before = count( $this->http->attach_calls() );
+
+		$this->post(
+			'pd_retry_hosting',
+			array(
+				'pd_mapping'  => $refused->id,
+				'pd_revision' => $refused->revision,
+			)
+		);
+
+		$this->assertCount( $before + 1, $this->http->attach_calls(), 'Exactly one more attachment.' );
+
+		$settled = $this->repo->by_id( $refused->id );
+
+		$this->assertSame( HostingState::ATTACHED->value, $settled?->hosting_state );
+		$this->assertNotNull( $settled?->hosting_registered_at );
+		$this->assertSame( $refused->challenge, $settled?->challenge, 'The mapping was kept, not rebuilt.' );
+	}
+
+	public function test_an_unconfirmed_attachment_is_never_retried_by_hand(): void {
+		$this->complete_setup();
+		$this->http->attach_answers(
+			array(
+				'status' => 503,
+				'body'   => '',
+			)
+		);
+		$this->add_domain( 'no-retry.example.org' );
+
+		$pending = $this->repo->by_host( 'no-retry.example.org' );
+		$this->assertNotNull( $pending );
+		$this->assertSame( HostingState::AMBIGUOUS->value, $pending->hosting_state );
+
+		$_GET = array( 'mapping' => (string) $pending->id );
+		ob_start();
+		SettingsPage::render();
+		$this->assertStringNotContainsString( 'pd_retry_hosting', (string) ob_get_clean(), 'A write that may have landed is not repeated.' );
+
+		$before = count( $this->http->attach_calls() );
+
+		$this->post(
+			'pd_retry_hosting',
+			array(
+				'pd_mapping'  => $pending->id,
+				'pd_revision' => $pending->revision,
+			)
+		);
+
+		$this->assertCount( $before, $this->http->attach_calls(), 'Even a posted retry sends nothing.' );
+		$this->assertSame( HostingState::AMBIGUOUS->value, $this->repo->by_id( $pending->id )?->hosting_state );
+	}
+
+	public function test_a_foreign_hostname_is_never_retried_by_hand(): void {
+		$this->complete_setup();
+		$this->http->attach_answers(
+			array(
+				'status' => 422,
+				'body'   => '{"error":{"code":"taken"}}',
+			)
+		);
+		$this->http->owned_elsewhere['elsewhere.example.org'] = $this->http->site_id( 3 );
+		$this->add_domain( 'elsewhere.example.org' );
+
+		$foreign = $this->repo->by_host( 'elsewhere.example.org' );
+		$this->assertNotNull( $foreign );
+		$this->assertSame( HostingState::FOREIGN->value, $foreign->hosting_state );
+
+		$before = count( $this->http->attach_calls() );
+
+		$this->post(
+			'pd_retry_hosting',
+			array(
+				'pd_mapping'  => $foreign->id,
+				'pd_revision' => $foreign->revision,
+			)
+		);
+
+		$this->assertCount( $before, $this->http->attach_calls() );
+		$this->assertSame( HostingState::FOREIGN->value, $this->repo->by_id( $foreign->id )?->hosting_state );
+	}
 }

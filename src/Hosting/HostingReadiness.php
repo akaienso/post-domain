@@ -46,11 +46,20 @@ final class HostingReadiness {
 		}
 
 		if ( ! $binding->is_valid() ) {
+			// A token that was never validated is not a token that stopped
+			// working. Telling an operator mid-setup that their brand-new token
+			// is broken sends them to replace something that is fine.
+			$was_validated = null !== $binding->site_id;
+
 			return new self(
 				false,
 				$provider,
-				__( 'The Wordify API token is no longer working.', 'post-domain' ),
-				__( 'Replace the token below and test the connection again. Domains already set up keep serving in the meantime.', 'post-domain' )
+				$was_validated
+					? __( 'The Wordify connection needs to be confirmed again.', 'post-domain' )
+					: __( 'The Wordify connection has not been confirmed yet.', 'post-domain' ),
+				$was_validated
+					? __( 'The API token, the site, or this installation changed, so the connection has to be proved again. Choose Test connection, then confirm which Wordify site this is. Domains already set up keep serving in the meantime.', 'post-domain' )
+					: __( 'Choose Test connection, then choose which Wordify site this WordPress installation is.', 'post-domain' )
 			);
 		}
 

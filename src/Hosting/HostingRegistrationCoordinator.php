@@ -44,10 +44,11 @@ final class HostingRegistrationCoordinator {
 		$environment = $provider->environment();
 
 		if ( null === $environment ) {
-			// The manual provider: there is no origin API to tell.
-			$this->transitions->not_required( $mapping->id, $mapping->revision, $provider->id() );
-
-			return RegistrationOutcome::unsupported();
+			// The manual provider: there is no origin API to tell. The row still
+			// records that, and a CAS that lost its row has recorded nothing.
+			return $this->transitions->not_required( $mapping->id, $mapping->revision, $provider->id() )
+				? RegistrationOutcome::unsupported()
+				: RegistrationOutcome::fenced();
 		}
 
 		$claim = $this->transitions->reserve(
@@ -64,6 +65,31 @@ final class HostingRegistrationCoordinator {
 		}
 
 		return $this->settle( $claim, $provider->register( $this->context( $mapping ) ) );
+	}
+
+	/**
+	 * Repeats the one attachment for a registration the provider definitively
+	 * refused.
+	 *
+	 * Only from `refused`. A 401 or 403 says nothing happened at the provider,
+	 * so once the token is corrected the attachment can be made — and requiring
+	 * the operator to delete and rebuild a mapping to do that would throw away
+	 * its challenge, its certificate and its history for no reason.
+	 *
+	 * Everything else is excluded on purpose. `ambiguous` may already have
+	 * landed, and `foreign` belongs to another site; writing again in either
+	 * case is the duplicate mutation this whole design exists to prevent.
+	 *
+	 * @param HostingProvider|HostingProviderUnavailable $provider
+	 */
+	public function retry_refused( Mapping $mapping, $provider ): RegistrationOutcome {
+		if ( HostingState::REFUSED !== HostingState::of( $mapping->hosting_state ) ) {
+			return RegistrationOutcome::refused(
+				'Only a registration the hosting provider definitively refused can be retried.'
+			);
+		}
+
+		return $this->register_new( $mapping, $provider );
 	}
 
 	/**
@@ -108,27 +134,41 @@ final class HostingRegistrationCoordinator {
 
 		if ( HostingRegistrationState::AMBIGUOUS === $outcome->state && $attempts_spent + 1 >= HostingReconciler::MAX_ATTEMPTS ) {
 			// Bounded: past the documented number of reads this becomes a state a
-			// person is asked to look at, not a job that runs forever.
-			$this->transitions->manual_review( $claim );
-
-			return $outcome;
+			// person is asked to look at, not a job that runs forever. A CAS that
+			// lost its row has not moved anything there, and saying so leaves the
+			// claim for the next pass rather than reporting a state nobody wrote.
+			return $this->transitions->manual_review( $claim ) ? $outcome : RegistrationOutcome::fenced();
 		}
 
 		return $this->settle( $claim, $outcome );
 	}
 
-	/** Writes what the provider answered, through the owner-pinned CAS. */
+	/**
+	 * Writes what the provider answered, through the owner-pinned CAS.
+	 *
+	 * The CAS result decides what is reported. A zero-row settlement means the
+	 * row moved between the provider answering and this write, so nothing was
+	 * recorded — and announcing the provider's answer anyway would claim a state
+	 * the database does not hold. The claim survives, so recovery settles it by
+	 * reading; nothing is attached a second time.
+	 */
 	private function settle( HostingClaim $claim, RegistrationOutcome $outcome ): RegistrationOutcome {
-		match ( $outcome->state ) {
+		// A seam for the one interleaving this guards: a write landing between
+		// the provider's answer and the settling CAS. Nothing in production
+		// listens to it.
+		apply_filters( 'pd_test_before_hosting_settlement', null, $claim );
+
+		$written = match ( $outcome->state ) {
 			HostingRegistrationState::REGISTERED,
 			HostingRegistrationState::ALREADY_MINE => $this->transitions->attach( $claim, $outcome->reference ),
 			HostingRegistrationState::FOREIGN      => $this->transitions->foreign( $claim ),
 			HostingRegistrationState::REFUSED      => $this->transitions->refuse( $claim ),
 			HostingRegistrationState::AMBIGUOUS    => $this->transitions->ambiguous( $claim ),
-			HostingRegistrationState::UNSUPPORTED  => null,
+			HostingRegistrationState::UNSUPPORTED,
+			HostingRegistrationState::FENCED       => true,
 		};
 
-		return $outcome;
+		return $written ? $outcome : RegistrationOutcome::fenced();
 	}
 
 	private function context( Mapping $mapping ): HostingResourceContext {

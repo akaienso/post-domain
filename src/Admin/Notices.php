@@ -22,6 +22,17 @@ final class Notices {
 		self::store( 'error', $message );
 	}
 
+	/**
+	 * Something happened, and it is not finished.
+	 *
+	 * Distinct from both: an accepted-but-unconfirmed hosting attachment is not
+	 * a failure, and painting it green would tell an operator the origin has
+	 * accepted a hostname nothing has confirmed.
+	 */
+	public static function pending( string $message ): void {
+		self::store( 'warning', $message );
+	}
+
 	/** @return array{type: string, message: string}|null */
 	public static function take(): ?array {
 		$key    = self::KEY . get_current_user_id();

@@ -372,6 +372,13 @@ final class Screen {
 		$binding    = HostingBinding::current();
 		$connection = WordifyConnectionService::production( $binding->team_id )->probe( $binding->team_id, $page, $search );
 
+		// Several teams and none chosen: that is a question, not a dead end. The
+		// service already honours a stated team; without this the operator had
+		// no way to state one and setup could not be completed at all.
+		if ( $connection->needs_team() ) {
+			return self::wordify_team_selector( $connection );
+		}
+
 		$html = '<h4>' . esc_html__( 'Which Wordify site is this?', 'post-domain' ) . '</h4>';
 
 		if ( ! $connection->is_ready() || null === $connection->team || null === $connection->sites ) {
@@ -380,6 +387,21 @@ final class Screen {
 
 		$team  = $connection->team;
 		$sites = $connection->sites;
+
+		$html .= '<p class="description">' . sprintf(
+			/* translators: %s: Wordify team name. */
+			esc_html__( 'Showing sites in team %s.', 'post-domain' ),
+			'<strong>' . esc_html( $team->label() ) . '</strong>'
+		);
+
+		if ( null !== $connection->account && count( $connection->account->teams ) > 1 ) {
+			$html .= ' ' . self::form_open( 'pd_select_wordify_team' )
+				. '<input type="hidden" name="pd_wordify_team" value="">'
+				. '<button type="submit" class="button-link">' . esc_html__( 'Choose a different team', 'post-domain' )
+				. '</button></form>';
+		}
+
+		$html .= '</p>';
 
 		$html .= '<p class="description">' . esc_html__(
 			'Post Domain will attach every mapped domain to the site you choose here. Choosing the wrong one sends your domains to the wrong installation, so check the name and address before confirming.',
@@ -451,6 +473,34 @@ final class Screen {
 		$html .= self::site_pagination( $sites, $search );
 
 		return $html;
+	}
+
+	/**
+	 * The team choice, offered only from the authenticated account's own teams.
+	 *
+	 * Never a guess between them: a token that can act for three teams says
+	 * nothing about which installation this is, and picking one on the
+	 * operator's behalf would list — and could bind — the wrong site.
+	 */
+	public static function wordify_team_selector( \PostDomain\Hosting\ConnectionResult $connection ): string {
+		$html = '<h4>' . esc_html__( 'Which Wordify team is this site in?', 'post-domain' ) . '</h4>';
+
+		$html .= '<p class="description">' . esc_html( HostingMessages::for_connection( $connection ) ) . '</p>';
+
+		if ( null === $connection->account ) {
+			return $html;
+		}
+
+		$html .= self::form_open( 'pd_select_wordify_team' );
+
+		foreach ( $connection->account->teams as $team ) {
+			$html .= '<p><label><input type="radio" name="pd_wordify_team" value="' . esc_attr( $team->id ) . '"> '
+				. esc_html( $team->label() ) . '</label></p>';
+		}
+
+		$html .= get_submit_button( __( 'Use this team', 'post-domain' ), 'primary', 'submit', false );
+
+		return $html . '</form>';
 	}
 
 	/** Page links for the selector, so a large account stays reachable. */
@@ -1048,6 +1098,14 @@ final class Screen {
 
 		if ( null !== $mapping->ssl_ref ) {
 			$buttons[] = self::button( 'pd_remove_ssl', $mapping, __( 'Remove the certificate', 'post-domain' ), 'secondary' );
+		}
+
+		// Offered only for a refusal, which is the one hosting outcome that
+		// definitely did nothing at the provider. An unconfirmed write may
+		// already have landed and a foreign one belongs elsewhere; asking again
+		// in either case is the duplicate mutation the whole design prevents.
+		if ( \PostDomain\Hosting\HostingState::REFUSED === \PostDomain\Hosting\HostingState::of( $mapping->hosting_state ) ) {
+			$buttons[] = self::button( 'pd_retry_hosting', $mapping, __( 'Ask your hosting again', 'post-domain' ), 'secondary' );
 		}
 
 		$html .= '<div class="pd-actions" style="display:flex;flex-wrap:wrap;gap:.5rem">'

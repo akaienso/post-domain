@@ -155,29 +155,33 @@ final class HostingBinding {
 	}
 
 	/**
-	 * Merges fields into the stored binding.
+	 * Merges fields into the stored binding, and always leaves it unvalidated.
 	 *
-	 * Deliberately cannot produce a valid binding on its own: `validated_at` and
-	 * `fingerprint` are stripped, so only `bind()` — which has actually
-	 * confirmed the site — can make a binding authoritative.
+	 * Structurally incapable of producing or preserving validity: the two fields
+	 * that confer it are removed from the value that is written, so neither a
+	 * caller supplying them nor an existing valid binding underneath can survive
+	 * a change of team or site. Only `bind()` — which has actually read the site
+	 * back — makes a binding authoritative.
 	 *
 	 * @param array<string, mixed> $fields
 	 */
 	public static function store( array $fields ): void {
-		unset( $fields['validated_at'], $fields['fingerprint'] );
-
 		$existing = get_option( self::OPTION );
 		$existing = is_array( $existing ) ? $existing : array();
 
-		update_option(
-			self::OPTION,
-			array_merge(
-				$existing,
-				$fields,
-				array( 'installation_id' => Environment::installation_id() )
-			),
-			false
+		$merged = array_merge(
+			$existing,
+			$fields,
+			array( 'installation_id' => Environment::installation_id() )
 		);
+
+		// Stripped from the *result*, not from the caller's fields. Removing them
+		// only on the way in left an existing validation attached to a team and
+		// site that changed underneath it, which is precisely a binding nothing
+		// ever confirmed. Only `bind()`, after the confirming read, writes these.
+		unset( $merged['validated_at'], $merged['fingerprint'] );
+
+		update_option( self::OPTION, $merged, false );
 	}
 
 	/**

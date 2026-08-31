@@ -328,7 +328,10 @@ plugin has no credential of its own and never will.
    primary domain, or your site's settings.
 3. Paste it into **Settings → Domain mappings → Hosting provider**.
 4. Choose **Test connection**. Post Domain reads who the token belongs to and
-   lists the sites it can see. Nothing is changed at Wordify.
+   lists the sites it can see. Nothing is changed at Wordify. If your token can
+   act for more than one Wordify team, you are asked which one first — Post
+   Domain will not pick for you, and only the teams your token actually names
+   are offered.
 5. Pick which Wordify site this WordPress installation is, and tick the box
    confirming it. The list is searchable and paged, so an account with hundreds
    of sites stays usable. Post Domain then reads that exact site back with your
@@ -373,6 +376,20 @@ Wordify to accept the hostname. It never asks twice. If Wordify does not answer,
 the domain is left in a "not confirmed" state and Post Domain settles it later by
 *reading* — it never repeats the attachment. Until Wordify confirms, the setup
 screen says so plainly rather than calling the domain ready.
+
+The message you get says which of three things happened. If Wordify accepted the
+domain, that is a plain success. If it did not answer, the domain is added and
+marked unconfirmed, and Post Domain settles it later by checking. If Wordify
+refused — usually a token missing **Manage Sites** — you get a failure, the
+mapping is kept, and once you have fixed the token you can choose **Ask your
+hosting again** on that domain rather than deleting and rebuilding it.
+
+The message you get says which of three things happened. If Wordify accepted the
+domain, that is a plain success. If it did not answer, the domain is added and
+marked unconfirmed, and Post Domain settles it later by checking. If Wordify
+refused — usually a token missing **Manage Sites** — you get a failure, the
+mapping is kept, and once you have fixed the token you can choose **Ask your
+hosting again** on that domain rather than deleting and rebuilding it.
 
 ### If your site is hosted anywhere else
 

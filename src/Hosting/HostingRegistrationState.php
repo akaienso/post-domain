@@ -11,4 +11,14 @@ enum HostingRegistrationState: string {
 	case REFUSED      = 'refused';
 	case AMBIGUOUS    = 'ambiguous';
 	case UNSUPPORTED  = 'unsupported';
+
+	/**
+	 * The row moved between the provider answering and the state being written.
+	 *
+	 * The compare-and-swap matched nothing, so whatever the provider said was
+	 * never recorded. Reporting the provider's answer here would announce a
+	 * state the database does not hold; the claim stays, and recovery settles it
+	 * by reading.
+	 */
+	case FENCED = 'fenced';
 }

@@ -381,10 +381,19 @@ token, which **you** create — the plugin ships with no credential of any kind.
   credential that proved it. Replacing the token — including a `wp-config.php`
   constant swapped out with no event to hook — invalidates it, and a restored
   backup inherits the row and none of the authority.
+- A token that can act for several teams is never resolved by guessing. The
+  operator chooses, from the teams `GET /me` actually named, and every listing,
+  search, page and confirming read is then made as that team.
 - Creating a mapping performs **exactly one** attachment call, claimed durably
   before the call so a crash or a second worker cannot produce two. An
   unconfirmed write is settled afterwards by reading, on the existing sweep,
   bounded, and never by attaching again.
+- **The result says what happened.** An accepted attachment is a success (201);
+  an unconfirmed one is accepted-not-finished (202); a refusal or a hostname on
+  another site is a failure (409, `pd_hosting_refused` / `pd_hosting_foreign`).
+  The mapping is kept either way, and a definitive refusal can be retried once
+  the token is fixed — without rebuilding the mapping, and never for an
+  unconfirmed or foreign one.
 - If the token is later revoked, new domains cannot be added — and every domain
   already serving keeps serving. A failed provider read never changes stored
   state.

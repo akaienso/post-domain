@@ -19,6 +19,7 @@ final class HostingActions {
 			'pd_set_hosting'         => self::set_provider(),
 			'pd_set_wordify_token'   => self::set_token(),
 			'pd_test_wordify'        => self::test_connection(),
+			'pd_select_wordify_team' => self::select_team(),
 			'pd_select_wordify_site' => self::select_site(),
 			'pd_disconnect_wordify'  => self::disconnect(),
 			default                  => null,
@@ -110,6 +111,69 @@ final class HostingActions {
 		}
 
 		Notices::failure( (string) $result['message'] );
+	}
+
+	/**
+	 * Records which Wordify team the operator is working in.
+	 *
+	 * Only a team the authenticated `GET /me` named may be chosen — a posted id
+	 * is caller input, and a team the token cannot act for is refused rather
+	 * than stored and discovered later. The choice is ordinary configuration and
+	 * confers no authority: it goes through `store()`, which cannot make a
+	 * binding valid, so the site still has to be chosen and read back.
+	 */
+	private static function select_team(): void {
+		// phpcs:ignore WordPress.Security.NonceVerification.Missing -- Admin\Actions::handle() verified the nonce for this action before dispatching.
+		$team_id = isset( $_POST['pd_wordify_team'] ) ? sanitize_text_field( wp_unslash( $_POST['pd_wordify_team'] ) ) : '';
+
+		if ( '' === $team_id ) {
+			Notices::failure( __( 'Choose which Wordify team this WordPress installation belongs to.', 'post-domain' ) );
+
+			return;
+		}
+
+		// Read the account with no preference, so the answer is the whole set of
+		// teams this token can act for rather than a confirmation of the guess.
+		$account = WordifyConnectionService::production()->account();
+
+		if ( $account instanceof WordifyFailure ) {
+			Notices::failure(
+				__( 'Wordify could not be read with this token, so no team was chosen.', 'post-domain' )
+			);
+
+			return;
+		}
+
+		$team = $account->team( $team_id );
+
+		if ( null === $team ) {
+			Notices::failure(
+				__( 'That Wordify team is not one this token can act for, so nothing was changed.', 'post-domain' )
+			);
+
+			return;
+		}
+
+		// A different team means a different set of sites, so any site already
+		// chosen under the previous team stops being the site.
+		HostingBinding::store(
+			array(
+				'team_id'   => $team->id,
+				'team_name' => $team->name,
+				'site_id'   => null,
+				'site_name' => null,
+			)
+		);
+
+		HostingProviderFactory::reset();
+
+		Notices::success(
+			sprintf(
+				/* translators: %s: Wordify team name. */
+				__( 'Working in Wordify team %s. Now choose which site this WordPress installation is.', 'post-domain' ),
+				$team->label()
+			)
+		);
 	}
 
 	/**

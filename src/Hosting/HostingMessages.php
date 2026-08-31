@@ -27,7 +27,9 @@ final class HostingMessages {
 			ConnectionOutcome::NO_CREDENTIAL => __( 'No Wordify token is configured, so there was nothing to test.', 'post-domain' ),
 			ConnectionOutcome::REJECTED      => __( 'Wordify did not accept that token. Check that it has not been revoked, then paste a new one.', 'post-domain' ),
 			ConnectionOutcome::NOT_PERMITTED => __( 'That token cannot read your sites. Give it the Read Sites ability in the Wordify console, and Manage Sites as well so domains can be attached later.', 'post-domain' ),
-			ConnectionOutcome::NO_TEAM       => __( 'That token works, but no single Wordify team could be resolved for it. Choose a team in the Wordify console, or use a token issued for one team.', 'post-domain' ),
+			ConnectionOutcome::NO_TEAM       => $result->needs_team()
+				? __( 'That token works and can act for more than one Wordify team. Choose which one this WordPress installation belongs to.', 'post-domain' )
+				: __( 'That token works, but it can act for no Wordify team, so there is nothing to bind. Check the token in the Wordify console.', 'post-domain' ),
 			ConnectionOutcome::NO_SITES      => __( 'That token works, and the team has no sites to choose from.', 'post-domain' ),
 			ConnectionOutcome::UNREACHABLE   => __( 'Wordify could not be reached, so nothing was changed. Try again shortly.', 'post-domain' ),
 		};
@@ -61,6 +63,11 @@ final class HostingMessages {
 			HostingRegistrationState::AMBIGUOUS    => sprintf(
 				/* translators: %s: the mapped hostname. */
 				__( '%s was added here, but your hosting did not confirm it. Post Domain will keep checking and will not ask again. Do not add it by hand yet.', 'post-domain' ),
+				$host
+			),
+			HostingRegistrationState::FENCED       => sprintf(
+				/* translators: %s: the mapped hostname. */
+				__( '%s was added here. Its hosting result arrived while the domain was being changed, so it was not recorded. Post Domain will settle it by checking, and will not ask your host again.', 'post-domain' ),
 				$host
 			),
 			HostingRegistrationState::REFUSED      => sprintf(

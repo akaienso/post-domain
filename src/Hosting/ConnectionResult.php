@@ -37,6 +37,13 @@ final class ConnectionResult {
 		return new self( ConnectionOutcome::NO_CREDENTIAL, null, null, null, null );
 	}
 
+	/**
+	 * Authenticated, and no single team follows from that.
+	 *
+	 * The account travels with it, because the teams it names are exactly the
+	 * choices an operator may be offered — and the only ones. A team that did
+	 * not come back from `GET /me` is not a team this token can act for.
+	 */
 	public static function no_team( WordifyAccount $account ): self {
 		return new self( ConnectionOutcome::NO_TEAM, $account, null, null, null );
 	}
@@ -59,6 +66,13 @@ final class ConnectionResult {
 
 	public function is_ready(): bool {
 		return $this->outcome->is_ready();
+	}
+
+	/** True when the operator still has to pick which team to work in. */
+	public function needs_team(): bool {
+		return ConnectionOutcome::NO_TEAM === $this->outcome
+			&& null !== $this->account
+			&& array() !== $this->account->teams;
 	}
 
 	/** True when the operator still has to pick between several sites. */

@@ -47,6 +47,18 @@ final class WordifyConnectionService {
 	}
 
 	/**
+	 * The authenticated identity, and nothing else.
+	 *
+	 * The teams it names are the only teams this token can act for, which makes
+	 * it the one admissible source for a team choice.
+	 *
+	 * @return WordifyAccount|WordifyFailure
+	 */
+	public function account() {
+		return $this->client->me();
+	}
+
+	/**
 	 * Reads identity, resolves a team, and lists that team's first page of sites.
 	 *
 	 * @param string|null $prefer_team A team already chosen, honoured when the
@@ -59,14 +71,32 @@ final class WordifyConnectionService {
 			return ConnectionResult::from_failure( $account );
 		}
 
-		$team = null === $prefer_team ? null : $account->team( $prefer_team );
-		$team = $team ?? $account->default_team();
+		if ( null !== $prefer_team && '' !== $prefer_team ) {
+			// A stated preference is honoured or refused, never silently
+			// replaced. Falling back to the account default here would list —
+			// and could bind — a different team's sites than the one the
+			// operator named, which is the one substitution that must not happen
+			// quietly.
+			$team = $account->team( $prefer_team );
+
+			return null === $team
+				? ConnectionResult::no_team( $account )
+				: $this->with_sites( $account, $team, $page, $search );
+		}
+
+		$team = $account->default_team();
 
 		if ( null === $team ) {
 			// Either no team at all, or several with none chosen. Both are for
 			// the operator to resolve; neither is something to guess at.
 			return ConnectionResult::no_team( $account );
 		}
+
+		return $this->with_sites( $account, $team, $page, $search );
+	}
+
+	/** One page of a resolved team's sites, or why there is none. */
+	private function with_sites( WordifyAccount $account, WordifyTeam $team, int $page, string $search ): ConnectionResult {
 
 		$sites = $this->sites( $team, $page, $search );
 
