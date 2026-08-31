@@ -5,6 +5,11 @@ namespace PostDomain\Admin;
 
 use PostDomain\Application\CommandResult;
 use PostDomain\Hosting\HostingActions;
+use PostDomain\Hosting\HostingBinding;
+use PostDomain\Hosting\HostingState;
+use PostDomain\Hosting\HostingMessages;
+use PostDomain\Hosting\HostingRegistrationState;
+use PostDomain\Hosting\RegistrationOutcome;
 use PostDomain\Application\MappingCommands;
 use PostDomain\Mapping\ActivationState;
 use PostDomain\Mapping\DbRepository;
@@ -38,6 +43,7 @@ final class Actions {
 		'pd_set_hosting',
 		'pd_set_wordify_token',
 		'pd_test_wordify',
+		'pd_select_wordify_site',
 		'pd_disconnect_wordify',
 	);
 
@@ -45,6 +51,51 @@ final class Actions {
 		$capability = (string) apply_filters( 'pd_rest_capability', 'manage_options', 'admin' );
 
 		return '' === $capability ? 'manage_options' : $capability;
+	}
+
+	/**
+	 * What an operator is told after adding a domain.
+	 *
+	 * The hosting outcome is the headline when there is one, because it decides
+	 * whether the domain can reach this site at all. The verification step
+	 * follows it only when the origin is actually ready for the hostname.
+	 */
+	private static function creation_message( CommandResult $result ): string {
+		$next = __( 'Publish its verification record, then check verification.', 'post-domain' );
+
+		/** @var array<string, mixed>|null $hosting */
+		$hosting = isset( $result->payload['hosting'] ) && is_array( $result->payload['hosting'] )
+			? $result->payload['hosting']
+			: null;
+
+		if ( null === $hosting || null === $result->mapping ) {
+			return __( 'Domain added.', 'post-domain' ) . ' ' . $next;
+		}
+
+		$state = HostingRegistrationState::tryFrom( (string) ( $hosting['state'] ?? '' ) );
+
+		if ( null === $state ) {
+			return __( 'Domain added.', 'post-domain' ) . ' ' . $next;
+		}
+
+		$message = HostingMessages::for_registration(
+			self::outcome_for( $state, isset( $hosting['message'] ) ? (string) $hosting['message'] : null ),
+			$result->mapping->host
+		);
+
+		return true === ( $hosting['settled'] ?? false ) ? $message . ' ' . $next : $message;
+	}
+
+	/** Rebuilds the outcome the command reported, for the message layer. */
+	private static function outcome_for( HostingRegistrationState $state, ?string $message ): RegistrationOutcome {
+		return match ( $state ) {
+			HostingRegistrationState::REGISTERED   => RegistrationOutcome::registered( '', '' ),
+			HostingRegistrationState::ALREADY_MINE => RegistrationOutcome::already_mine( null, '' ),
+			HostingRegistrationState::FOREIGN      => RegistrationOutcome::foreign( (string) $message ),
+			HostingRegistrationState::REFUSED      => RegistrationOutcome::refused( (string) $message ),
+			HostingRegistrationState::AMBIGUOUS    => RegistrationOutcome::ambiguous( (string) $message ),
+			HostingRegistrationState::UNSUPPORTED  => RegistrationOutcome::unsupported(),
+		};
 	}
 
 	/** The nonce is bound to the action and the row it acts on. */
@@ -106,7 +157,7 @@ final class Actions {
 			self::redirect( 0 );
 		}
 
-		if ( in_array( $action, array( 'pd_set_hosting', 'pd_set_wordify_token', 'pd_test_wordify', 'pd_disconnect_wordify' ), true ) ) {
+		if ( in_array( $action, array( 'pd_set_hosting', 'pd_set_wordify_token', 'pd_test_wordify', 'pd_select_wordify_site', 'pd_disconnect_wordify' ), true ) ) {
 			HostingActions::dispatch( $action );
 			self::redirect( 0 );
 		}
@@ -119,10 +170,10 @@ final class Actions {
 
 			$result = $commands->create_mapping( $host, null, 0 === $post ? null : $post );
 
-			self::report(
-				$result,
-				__( 'Domain added. Publish its verification record, then check verification.', 'post-domain' )
-			);
+			// A mapping whose origin was never told about it is not set up, and
+			// saying "Domain added" alone would be the failure that looks like
+			// success. What the hosting provider actually answered leads.
+			self::report( $result, self::creation_message( $result ) );
 			self::redirect( $result->succeeded ? (int) $result->mapping?->id : 0 );
 		}
 
@@ -146,7 +197,7 @@ final class Actions {
 
 		$result = self::run( $commands, $action, $mapping );
 
-		self::report( $result, self::success_message( $action, $result ) );
+		self::report( $result, self::success_message( $action, $result, $mapping ) );
 
 		// Where to go next is decided by what happened, not by what was asked.
 		// A removal that is merely scheduled leaves the row in place, and sending
@@ -196,13 +247,28 @@ final class Actions {
 	 *
 	 * 202 is the shared signal: accepted, not completed.
 	 */
-	private static function success_message( string $action, CommandResult $result ): string {
+	private static function success_message( string $action, CommandResult $result, Mapping $mapping ): string {
 		$outstanding = 202 === $result->status;
 
 		if ( 'pd_delete_mapping' === $action ) {
-			return $outstanding
+			$message = $outstanding
 				? __( 'Removal has started. The domain stops serving now, and disappears once its certificate is released.', 'post-domain' )
 				: __( 'The domain was removed.', 'post-domain' );
+
+			// Wordify exposes no domain-detachment operation, so deleting here
+			// leaves the hostname attached there. Naming the hostname and the
+			// site is the difference between a warning and a chore an operator
+			// can actually complete.
+			$state = HostingState::of( $mapping->hosting_state );
+
+			if ( null !== $state && HostingState::NOT_REQUIRED !== $state && null !== $mapping->hosting_provider ) {
+				return $message . ' ' . HostingMessages::for_deletion(
+					$mapping->host,
+					HostingBinding::current()->site_name
+				);
+			}
+
+			return $message;
 		}
 
 		if ( 'pd_remove_ssl' === $action ) {

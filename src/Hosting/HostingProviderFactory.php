@@ -4,6 +4,7 @@ declare( strict_types = 1 );
 namespace PostDomain\Hosting;
 
 use PostDomain\Contracts\HostingProvider;
+use PostDomain\Contracts\HttpClient;
 use PostDomain\Mapping\Mapping;
 use PostDomain\Support\WpHttpClient;
 
@@ -96,25 +97,62 @@ final class HostingProviderFactory {
 			return null;
 		}
 
-		/** @var HostingCredentialStore $store */
-		$store = apply_filters( 'pd_hosting_credential_store', CredentialOptionStore::for_wordpress() );
-
-		if ( ! $store->status()->configured ) {
+		if ( ! self::credential_store()->status()->configured ) {
 			return null;
 		}
 
+		return new WordifyHostingProvider( self::wordify_client( $environment->team_id ), $environment );
+	}
+
+	/** The configured credential store. One reader, one filter seam. */
+	public static function credential_store(): HostingCredentialStore {
+		/** @var HostingCredentialStore $store */
+		$store = apply_filters( 'pd_hosting_credential_store', CredentialOptionStore::for_wordpress() );
+
+		return $store;
+	}
+
+	/**
+	 * A Wordify client for a team, using the configured credential.
+	 *
+	 * The token is taken as a supplier so it is fetched at the moment a request
+	 * needs it and is never held on an object that something might dump. The
+	 * team is a parameter because site selection happens before any binding
+	 * exists, and a multi-team account needs the header even then.
+	 *
+	 * The outbound HTTP transport is filterable, so an integration test can
+	 * answer requests from memory while every layer above it stays production
+	 * code. Nothing about the credential, the routes or the auth scheme is.
+	 */
+	public static function wordify_client( ?string $team_id = null ): WordifyClient {
+		$store = self::credential_store();
+
+		/**
+		 * Filters the HTTP transport Wordify requests are sent over.
+		 *
+		 * @param HttpClient $http
+		 */
+		/** @var mixed $http */
+		$http = apply_filters( 'pd_wordify_http', new WpHttpClient() );
+
 		$client = new WordifyApiClient(
-			new WpHttpClient(),
+			$http instanceof HttpClient ? $http : new WpHttpClient(),
 			static function () use ( $store ): string {
 				$secret = $store->reveal();
 
 				return null === $secret ? '' : $secret->reveal();
 			},
 			WordifyEndpoints::configured(),
-			$environment->team_id
+			$team_id
 		);
 
-		return new WordifyHostingProvider( $client, $environment );
+		/**
+		 * Filters the Wordify client. For substituting a transport in a test.
+		 *
+		 * @param WordifyClient $client
+		 * @param string|null   $team_id
+		 */
+		return $client;
 	}
 
 	/**

@@ -19,18 +19,42 @@
     "team_header_note": "Carries the bound team for a multi-team account. The team id is an opaque string/ULID and is never treated as an integer."
   },
   "required_abilities": {
-    "needed": ["sites:read", "sites:manage"],
-    "ui_labels": ["Read Sites", "Manage Sites"],
+    "needed": [
+      "sites:read",
+      "sites:manage"
+    ],
+    "ui_labels": [
+      "Read Sites",
+      "Manage Sites"
+    ],
     "not_requested": "*",
     "site_scoping": "Not supported. Evidence supports team-scoped authorization only; the plugin binds its own operations to one selected site, which is not the same as the token being restricted to one."
   },
   "routes": {
-    "me": { "method": "GET", "path": "/api/v1/me" },
-    "sites": { "method": "GET", "path": "/api/v1/sites" },
-    "site": { "method": "GET", "path": "/api/v1/sites/{site_id}" },
-    "domains": { "method": "GET", "path": "/api/v1/sites/{site_id}/domains" },
-    "attach_domain": { "method": "POST", "path": "/api/v1/sites/{site_id}/domains" },
-    "recheck": { "method": "POST", "path": "/api/v1/sites/{site_id}/domains/recheck" }
+    "me": {
+      "method": "GET",
+      "path": "/api/v1/me"
+    },
+    "sites": {
+      "method": "GET",
+      "path": "/api/v1/sites"
+    },
+    "site": {
+      "method": "GET",
+      "path": "/api/v1/sites/{site_id}"
+    },
+    "domains": {
+      "method": "GET",
+      "path": "/api/v1/sites/{site_id}/domains"
+    },
+    "attach_domain": {
+      "method": "POST",
+      "path": "/api/v1/sites/{site_id}/domains"
+    },
+    "recheck": {
+      "method": "POST",
+      "path": "/api/v1/sites/{site_id}/domains/recheck"
+    }
   },
   "route_probe_evidence": {
     "method": "Unauthenticated JSON requests. No credential was sent and nothing was mutated.",
@@ -47,20 +71,42 @@
     "attach_domain": {
       "domain": "the normalized mapped hostname",
       "make_primary": "always boolean false; not exposed as a caller-controlled parameter",
-      "use_www": "not sent — the contract states it is only meaningful when make_primary is true"
+      "use_www": "not sent \u2014 the contract states it is only meaningful when make_primary is true"
     },
     "recheck": "none; the site is already in the path"
   },
   "observed_responses": {
     "me": {
       "shape": "a top-level user record",
-      "fields": ["id", "name", "email", "current_team_id", "teams[]"],
-      "team_fields": ["id (opaque string)", "name", "api_access"]
+      "fields": [
+        "id",
+        "name",
+        "email",
+        "current_team_id",
+        "teams[]"
+      ],
+      "team_fields": [
+        "id (opaque string)",
+        "name",
+        "api_access"
+      ]
     },
     "sites": {
       "shape": "paginated envelope",
-      "fields": ["data[]", "links", "meta"],
-      "site_fields": ["id (26-character ULID)", "display_name", "name", "domain", "provisioning_status", "is_staging", "available_actions[]"]
+      "fields": [
+        "data[]",
+        "links",
+        "meta"
+      ],
+      "site_fields": [
+        "id (26-character ULID)",
+        "display_name",
+        "name",
+        "domain",
+        "provisioning_status",
+        "is_staging",
+        "available_actions[]"
+      ]
     },
     "domains": {
       "shape": "a top-level JSON array",
@@ -87,6 +133,8 @@
   },
   "plugin_position": {
     "wordify_status_is_not_success": "Wordify's dns_status and ssl_status are reported, never acted on. They do not replace the plugin's Cloudflare state, and they do not settle the signed final-origin probe.",
-    "ability_proof": "The API exposes no read-only way to enumerate a token's abilities, so a read-only connection test cannot prove sites:manage. That is surfaced at the first attachment as a typed insufficient-ability failure with instructions, never as a retry and never by attempting a mutation to probe permissions."
+    "ability_proof": "The API exposes no read-only way to enumerate a token's abilities, so a read-only connection test cannot prove sites:manage. That is surfaced at the first attachment as a typed insufficient-ability failure with instructions, never as a retry and never by attempting a mutation to probe permissions.",
+    "production_default": "The transport, the connection test, the site binding, the attachment on mapping creation, and the read-only recovery of an unconfirmed write are all wired into production. An operator pastes a token, tests it, picks a site, and adds a domain; no filter, constant or custom PHP is involved.",
+    "one_mutation": "A mapping row is claimed with a compare-and-swap before the attach call and settled by another afterwards, so a crash, a retry or a second worker produces one attachment rather than two. An unconfirmed write is settled by reading only, bounded, and never by attaching again."
   }
 }

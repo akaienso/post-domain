@@ -26,6 +26,7 @@ final class Errors {
 	public const MUTATION_UNAUTHORIZED    = 'pd_mutation_unauthorized';
 	public const UNOWNED_RESOURCE         = 'pd_unowned_resource';
 	public const CREATE_AMBIGUOUS         = 'pd_provider_create_ambiguous';
+	public const HOSTING_UNAVAILABLE      = 'pd_hosting_unavailable';
 	public const METHOD_UNSUPPORTED       = 'pd_method_unsupported';
 	public const CONFIRMATION_REQUIRED    = 'pd_confirmation_required';
 	public const NO_DRIVER                = 'pd_no_driver';

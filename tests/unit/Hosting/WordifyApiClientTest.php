@@ -335,7 +335,9 @@ final class WordifyApiClientTest extends TestCase {
 
 		$this->assertNotInstanceOf( WordifyFailure::class, $result );
 		$this->assertSame( 'https://host.example/me', $http->calls[0]['url'] );
-		$this->assertSame( array( self::TEAM ), $result->team_ids );
+		$this->assertSame( array( self::TEAM ), $result->team_ids() );
+		$this->assertSame( 'Team', $result->team( self::TEAM )?->name );
+		$this->assertSame( self::TEAM, $result->default_team()?->id );
 	}
 
 	public function test_the_token_is_resolved_per_request_and_is_not_a_property(): void {

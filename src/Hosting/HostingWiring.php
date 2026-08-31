@@ -23,6 +23,35 @@ final class HostingWiring {
 		// choice survives; the authority to act on it does not, until the new
 		// token has proved it can reach that site.
 		add_action( 'pd_wordify_credential_replaced', array( HostingBinding::class, 'invalidate' ) );
+
+		// The production answer to the connection test. Without this the screen
+		// can only report that nothing on the site knows how to test anything.
+		add_filter( 'pd_hosting_test_connection', array( self::class, 'test_connection' ) );
+
+		// Ambiguous attachments are settled by reading, on the existing sweep.
+		HostingRecoveryService::register();
+	}
+
+	/**
+	 * The read-only connection test, adapted to the filter's contract.
+	 *
+	 * The typed result is the internal currency; this is the one place it
+	 * becomes the `ok`/`message` pair the admin action consumes, and the message
+	 * is this plugin's own sentence rather than anything the provider said.
+	 *
+	 * @param mixed $result
+	 * @return array{ok: bool, message: string, outcome: string}
+	 */
+	public static function test_connection( $result ): array {
+		unset( $result );
+
+		$outcome = WordifyConnectionService::test();
+
+		return array(
+			'ok'      => $outcome->is_ready(),
+			'message' => HostingMessages::for_connection( $outcome ),
+			'outcome' => $outcome->outcome->value,
+		);
 	}
 
 	public static function has_credential( bool $configured ): bool {

@@ -19,6 +19,7 @@ final class HostingActions {
 			'pd_set_hosting'         => self::set_provider(),
 			'pd_set_wordify_token'   => self::set_token(),
 			'pd_test_wordify'        => self::test_connection(),
+			'pd_select_wordify_site' => self::select_site(),
 			'pd_disconnect_wordify'  => self::disconnect(),
 			default                  => null,
 		};
@@ -79,15 +80,24 @@ final class HostingActions {
 		Notices::success( __( 'Token saved. Choose Test connection to validate it.', 'post-domain' ) );
 	}
 
+	/**
+	 * Reads the connection and remembers what it found, without binding.
+	 *
+	 * A passing test proves the token works. It does not decide which Wordify
+	 * site this installation is, and it never writes a valid binding — that is
+	 * `select_site()` below, after the operator has said which site and the
+	 * plugin has read that exact site back.
+	 */
 	private static function test_connection(): void {
 		/** @var mixed $result */
 		$result = apply_filters( 'pd_hosting_test_connection', null );
 
-		// Nothing listening is the ordinary case before the provider layer is
-		// wired, and an answer that is not the agreed shape is not an answer.
+		// An answer that is not the agreed shape is not an answer. With the
+		// production listener registered this is unreachable, and it stays as a
+		// floor rather than as an expected state.
 		if ( ! is_array( $result ) || ! array_key_exists( 'ok', $result ) || ! array_key_exists( 'message', $result ) ) {
 			Notices::failure(
-				__( 'The Wordify connection could not be tested on this site yet.', 'post-domain' )
+				__( 'The Wordify connection could not be tested on this site.', 'post-domain' )
 			);
 
 			return;
@@ -100,6 +110,94 @@ final class HostingActions {
 		}
 
 		Notices::failure( (string) $result['message'] );
+	}
+
+	/**
+	 * Binds this installation to exactly one Wordify site.
+	 *
+	 * The posted id is treated as caller input, not as proof: the site is read
+	 * back with the credential, in the team it is claimed to be in, and the
+	 * binding is written only if that read succeeds. A matching domain string is
+	 * never enough on its own — an operator can own the same name on two sites,
+	 * and choosing the wrong one silently sends a domain to the wrong install.
+	 */
+	private static function select_site(): void {
+		// phpcs:disable WordPress.Security.NonceVerification.Missing -- Admin\Actions::handle() verified the nonce for this action before dispatching.
+		$site_id  = isset( $_POST['pd_wordify_site'] ) ? sanitize_text_field( wp_unslash( $_POST['pd_wordify_site'] ) ) : '';
+		$team_id  = isset( $_POST['pd_wordify_team'] ) ? sanitize_text_field( wp_unslash( $_POST['pd_wordify_team'] ) ) : '';
+		$confirms = isset( $_POST['pd_wordify_confirm'] );
+		// phpcs:enable WordPress.Security.NonceVerification.Missing
+
+		if ( '' === $site_id || '' === $team_id ) {
+			Notices::failure( __( 'Choose which Wordify site this WordPress installation is.', 'post-domain' ) );
+
+			return;
+		}
+
+		if ( ! $confirms ) {
+			// An explicit statement, because the consequence of getting it wrong
+			// is a mapped domain pointed at somebody else's site.
+			Notices::failure(
+				__( 'Confirm that the site you chose is this WordPress installation before binding it.', 'post-domain' )
+			);
+
+			return;
+		}
+
+		$service    = WordifyConnectionService::production( $team_id );
+		$connection = $service->probe( $team_id );
+
+		if ( ! $connection->is_ready() || null === $connection->team ) {
+			Notices::failure( HostingMessages::for_connection( $connection ) );
+
+			return;
+		}
+
+		if ( ! hash_equals( $connection->team->id, $team_id ) ) {
+			// The token can no longer act for the team the form was drawn for.
+			Notices::failure(
+				__( 'That Wordify team is no longer available to this token. Test the connection again.', 'post-domain' )
+			);
+
+			return;
+		}
+
+		// The confirming read: addressing the resource, not just finding it in a
+		// collection. This is the authority a binding claims to have.
+		$site = $service->confirm_site( $connection->team, $site_id );
+
+		if ( $site instanceof WordifyFailure ) {
+			Notices::failure(
+				__( 'That Wordify site could not be read with this token, so nothing was bound.', 'post-domain' )
+			);
+
+			return;
+		}
+
+		if ( ! hash_equals( $site->id, $site_id ) ) {
+			Notices::failure( __( 'Wordify answered with a different site, so nothing was bound.', 'post-domain' ) );
+
+			return;
+		}
+
+		if ( ! HostingBinding::bind( $connection->team, $site ) ) {
+			Notices::failure(
+				__( 'The Wordify token could not be read back, so the connection was not bound.', 'post-domain' )
+			);
+
+			return;
+		}
+
+		HostingProviderFactory::reset();
+
+		Notices::success(
+			sprintf(
+				/* translators: 1: Wordify site name, 2: Wordify team name. */
+				__( 'Connected to Wordify site %1$s in team %2$s. You can now add a domain.', 'post-domain' ),
+				$site->label(),
+				$connection->team->label()
+			)
+		);
 	}
 
 	/**

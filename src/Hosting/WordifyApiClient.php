@@ -77,19 +77,23 @@ final class WordifyApiClient implements WordifyClient {
 		}
 
 		$record = $this->record( $payload, array( 'user', 'me' ) );
-		$teams  = $this->list_in( $payload, array( 'teams' ) );
 
-		$team_ids = array();
+		// `teams` sits beside the user in the observed response, so it is looked
+		// for on the record and then on the envelope, rather than assumed.
+		$teams = array();
 
-		foreach ( $teams as $team ) {
-			if ( is_array( $team ) && isset( $team['id'] ) && is_scalar( $team['id'] ) ) {
-				$team_ids[] = (string) $team['id'];
+		foreach ( $this->list_in( isset( $record['teams'] ) ? $record : $payload, array( 'teams' ) ) as $team ) {
+			if ( ! is_array( $team ) || ! isset( $team['id'] ) || ! is_scalar( $team['id'] ) || '' === (string) $team['id'] ) {
+				continue;
 			}
+
+			$teams[] = new WordifyTeam( (string) $team['id'], self::field( $team, array( 'name', 'display_name' ) ) );
 		}
 
 		return new WordifyAccount(
 			isset( $record['id'] ) && is_scalar( $record['id'] ) ? (string) $record['id'] : null,
-			$team_ids
+			$teams,
+			self::field( $record, array( 'current_team_id' ) )
 		);
 	}
 
@@ -120,7 +124,15 @@ final class WordifyApiClient implements WordifyClient {
 			}
 		}
 
-		return new WordifySiteList( $sites );
+		$meta = isset( $payload['meta'] ) && is_array( $payload['meta'] ) ? $payload['meta'] : array();
+
+		return new WordifySiteList(
+			$sites,
+			(int) self::counted( $meta, 'current_page', isset( $filters['page'] ) ? (int) $filters['page'] : 1 ),
+			(int) self::counted( $meta, 'per_page', count( $sites ) ),
+			self::counted( $meta, 'total', null ),
+			self::counted( $meta, 'last_page', null )
+		);
 	}
 
 	/** @return WordifySite|WordifyFailure */
@@ -377,6 +389,15 @@ final class WordifyApiClient implements WordifyClient {
 		return isset( $payload[0] ) ? array_values( $payload ) : array();
 	}
 
+	/**
+	 * A count from a pagination envelope, or the fallback.
+	 *
+	 * @param array<array-key, mixed> $meta
+	 */
+	private static function counted( array $meta, string $key, ?int $fallback ): ?int {
+		return isset( $meta[ $key ] ) && is_numeric( $meta[ $key ] ) ? (int) $meta[ $key ] : $fallback;
+	}
+
 	/** @param array<string, mixed> $record */
 	private function to_site( array $record ): ?WordifySite {
 		if ( ! isset( $record['id'] ) || ! is_scalar( $record['id'] ) || '' === (string) $record['id'] ) {
@@ -385,8 +406,12 @@ final class WordifyApiClient implements WordifyClient {
 
 		return new WordifySite(
 			(string) $record['id'],
-			isset( $record['provisioning_status'] ) && is_scalar( $record['provisioning_status'] )
-				? (string) $record['provisioning_status']
+			self::field( $record, array( 'provisioning_status' ) ),
+			self::field( $record, array( 'display_name' ) ),
+			self::field( $record, array( 'name' ) ),
+			self::field( $record, array( 'domain' ) ),
+			isset( $record['is_staging'] ) && is_scalar( $record['is_staging'] )
+				? (bool) $record['is_staging']
 				: null
 		);
 	}

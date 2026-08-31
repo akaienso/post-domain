@@ -4,9 +4,13 @@ declare( strict_types = 1 );
 namespace PostDomain\Tests\Integration\Hosting;
 
 use PostDomain\Admin\SettingsPage;
+use PostDomain\Hosting\CredentialOptionStore;
+use PostDomain\Hosting\CredentialSecret;
 use PostDomain\Hosting\HostingBinding;
 use PostDomain\Hosting\HostingDetection;
 use PostDomain\Hosting\HostingReadiness;
+use PostDomain\Hosting\WordifySite;
+use PostDomain\Hosting\WordifyTeam;
 use PostDomain\Mapping\ActivationState;
 use PostDomain\Mapping\DbRepository;
 use PostDomain\Mapping\Mapping;
@@ -34,6 +38,7 @@ final class HostingGateTest extends OwnedSessionTestCase {
 		delete_option( 'pd_settings' );
 		delete_option( 'pd_hosting_binding' );
 		delete_option( 'pd_environment_mismatch' );
+		CredentialOptionStore::for_wordpress()->forget();
 		Environment::remember_primary_host();
 
 		$this->repo = new DbRepository();
@@ -44,6 +49,7 @@ final class HostingGateTest extends OwnedSessionTestCase {
 	public function tear_down(): void {
 		delete_option( 'pd_settings' );
 		delete_option( 'pd_hosting_binding' );
+		CredentialOptionStore::for_wordpress()->forget();
 		remove_all_filters( 'pd_hosting_has_credential' );
 		remove_all_filters( 'pd_hosting_platform' );
 		$_GET = array();
@@ -63,19 +69,28 @@ final class HostingGateTest extends OwnedSessionTestCase {
 		update_option( 'pd_settings', array( 'hosting_provider' => $provider ), false );
 	}
 
+	/**
+	 * A real encrypted credential, not a stubbed answer.
+	 *
+	 * A binding is only valid under the credential that proved it, and the
+	 * comparison is against what the store actually holds — so a gate test that
+	 * faked the answer would be testing a state the plugin cannot be in.
+	 */
 	private function credential( bool $present ): void {
-		add_filter( 'pd_hosting_has_credential', $present ? '__return_true' : '__return_false' );
+		$store = CredentialOptionStore::for_wordpress();
+
+		$store->forget();
+
+		if ( $present ) {
+			$store->put( new CredentialSecret( 'wpk_gate-test-token-not-a-credential' ) );
+		}
 	}
 
+	/** Binds the way `HostingActions::select_site()` does, after a confirmed read. */
 	private function bind(): void {
-		HostingBinding::store(
-			array(
-				'team_id'      => 'team_01',
-				'team_name'    => 'Example Team',
-				'site_id'      => '01JEXAMPLEULIDCHARSHERE123',
-				'site_name'    => 'example.test',
-				'validated_at' => gmdate( 'Y-m-d H:i:s' ),
-			)
+		HostingBinding::bind(
+			new WordifyTeam( 'team_01', 'Example Team' ),
+			new WordifySite( '01JEXAMPLEULIDCHARSHERE123', 'active', 'example.test', 'example.test', 'example.test', false )
 		);
 	}
 

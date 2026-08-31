@@ -371,9 +371,20 @@ token, which **you** create — the plugin ships with no credential of any kind.
   no read-only call reports a token's abilities, and the plugin will not perform
   a live mutation to probe for permission. A token missing that ability is
   reported at the first attach, with instructions and no partial state.
-- The connection is bound to **one** Wordify team and site. Until it is, the
-  **Add a domain** form is not shown, because a domain added without it would
-  verify, get a certificate, and still serve your host's placeholder page.
+- The connection is bound to **one** Wordify team and site, chosen explicitly
+  from a searchable, paged list and confirmed by re-reading that exact site with
+  the token. A matching domain string is never enough on its own. Until it is
+  bound, the **Add a domain** form is not shown, because a domain added without
+  it would verify, get a certificate, and still serve your host's placeholder
+  page.
+- The binding is valid only for the installation that made it *and* the
+  credential that proved it. Replacing the token — including a `wp-config.php`
+  constant swapped out with no event to hook — invalidates it, and a restored
+  backup inherits the row and none of the authority.
+- Creating a mapping performs **exactly one** attachment call, claimed durably
+  before the call so a crash or a second worker cannot produce two. An
+  unconfirmed write is settled afterwards by reading, on the existing sweep,
+  bounded, and never by attaching again.
 - If the token is later revoked, new domains cannot be added — and every domain
   already serving keeps serving. A failed provider read never changes stored
   state.

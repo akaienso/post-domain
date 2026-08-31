@@ -327,8 +327,12 @@ plugin has no credential of its own and never will.
    Do not tick full access; Post Domain never needs your billing, your
    primary domain, or your site's settings.
 3. Paste it into **Settings → Domain mappings → Hosting provider**.
-4. Choose **Test connection**, and pick which Wordify site this WordPress
-   installation is.
+4. Choose **Test connection**. Post Domain reads who the token belongs to and
+   lists the sites it can see. Nothing is changed at Wordify.
+5. Pick which Wordify site this WordPress installation is, and tick the box
+   confirming it. The list is searchable and paged, so an account with hundreds
+   of sites stays usable. Post Domain then reads that exact site back with your
+   token before it binds anything.
 
 **What Test connection can and cannot tell you.** It proves the token
 authenticates, that your teams and sites can be read, and that the site you
@@ -358,9 +362,17 @@ your behalf. It does not detach any domain from Wordify and does not delete any
 mapping.
 
 **Deleting a mapping.** No domain-detachment operation appears anywhere in
-Wordify's published API surface. So deleting a mapping here removes the mapping and then tells you
-exactly what to remove in the Wordify console yourself. Post Domain will not
-guess at an operation it cannot verify.
+Wordify's published API surface. So deleting a mapping here removes the mapping
+and then tells you — by name — which hostname is still attached to which Wordify
+site, so you can remove it in the console yourself. Post Domain will not guess at
+an operation it cannot verify, and never implies it tidied up at Wordify.
+
+**What happens when you add a domain.** Post Domain records the domain locally,
+marks it as claimed for one attachment, and then makes exactly one call asking
+Wordify to accept the hostname. It never asks twice. If Wordify does not answer,
+the domain is left in a "not confirmed" state and Post Domain settles it later by
+*reading* — it never repeats the attachment. Until Wordify confirms, the setup
+screen says so plainly rather than calling the domain ready.
 
 ### If your site is hosted anywhere else
 

@@ -4,6 +4,10 @@ declare( strict_types = 1 );
 namespace PostDomain\Application;
 
 use PostDomain\Contracts\MappingRepository;
+use PostDomain\Hosting\HostingProviderFactory;
+use PostDomain\Hosting\HostingProviderUnavailable;
+use PostDomain\Hosting\HostingRegistrationCoordinator;
+use PostDomain\Hosting\HostingRegistrationState;
 use PostDomain\Mapping\ActivationState;
 use PostDomain\Mapping\AliasResolver;
 use PostDomain\Mapping\InvalidMapping;
@@ -38,7 +42,8 @@ final class MappingCommands {
 
 	public function __construct(
 		private readonly MappingRepository $repo,
-		private readonly SslServices $ssl
+		private readonly SslServices $ssl,
+		private readonly HostingRegistrationCoordinator $hosting = new HostingRegistrationCoordinator()
 	) {}
 
 	public static function production( MappingRepository $repo ): self {
@@ -188,6 +193,20 @@ final class MappingCommands {
 			}
 		}
 
+		// The origin is asked *before* anything is written. A mapping created on
+		// a host that was never told about it verifies, gets a certificate, and
+		// then serves the host's placeholder page — the failure that looks like
+		// success, and the one this plugin exists to prevent.
+		$provider = HostingProviderFactory::for_new_mapping();
+
+		if ( $provider instanceof HostingProviderUnavailable ) {
+			return CommandResult::refused(
+				Errors::HOSTING_UNAVAILABLE,
+				'This site\'s hosting is not connected, so a new domain could be set up here and still not reach this site. Connect it under Hosting provider first.',
+				409
+			);
+		}
+
 		try {
 			$mapping = $this->repo->save(
 				new Mapping(
@@ -208,7 +227,28 @@ final class MappingCommands {
 			return CommandResult::refused( Errors::ALIAS_CHAIN, $e->getMessage(), 400 );
 		}
 
-		return CommandResult::ok( 201, $mapping );
+		// An alias serves through its canonical domain's origin, but it is still
+		// its own hostname arriving at the host, so it is registered too.
+		$outcome = $this->hosting->register_new( $mapping, $provider );
+
+		// The row moved: the claim and its settlement each bumped the revision.
+		$mapping = $this->repo->by_id( $mapping->id ) ?? $mapping;
+
+		return CommandResult::ok(
+			201,
+			$mapping,
+			array(
+				'hosting' => array(
+					'state'    => $outcome->state->value,
+					// Never dressed up: a registration that did not complete is
+					// reported as what it was, alongside the mapping that was
+					// created, rather than folded into a plain success.
+					'settled'  => $outcome->succeeded(),
+					'message'  => $outcome->message,
+					'provider' => $provider->id(),
+				),
+			)
+		);
 	}
 
 	public function set_activation( Mapping $mapping, ActivationState $to, ?int $post_id = null ): CommandResult {

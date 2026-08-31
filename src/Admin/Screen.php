@@ -5,7 +5,9 @@ namespace PostDomain\Admin;
 
 use PostDomain\Hosting\HostingBinding;
 use PostDomain\Hosting\HostingDetection;
+use PostDomain\Hosting\HostingMessages;
 use PostDomain\Hosting\HostingReadiness;
+use PostDomain\Hosting\WordifyConnectionService;
 use PostDomain\Mapping\ActivationState;
 use PostDomain\Mapping\DbRepository;
 use PostDomain\Mapping\Mapping;
@@ -324,6 +326,10 @@ final class Screen {
 			$html .= '</form>';
 		}
 
+		if ( $binding->has_credential() && ! $binding->is_bound() ) {
+			$html .= self::wordify_site_selector();
+		}
+
 		if ( $binding->has_credential() ) {
 			$html .= '<div class="pd-actions" style="display:flex;flex-wrap:wrap;gap:.5rem">';
 			$html .= self::form_open( 'pd_test_wordify' )
@@ -345,6 +351,145 @@ final class Screen {
 		}
 
 		return $html;
+	}
+
+	/**
+	 * The bounded site selector.
+	 *
+	 * Bounded and searchable rather than a plain dropdown, because an account
+	 * can hold hundreds of sites and a select element with all of them is
+	 * unusable exactly where it matters most. One page is read at a time, the
+	 * search goes to the provider's own verified `domain` filter, and the
+	 * operator has to state that the site they picked is this installation —
+	 * a matching domain string is a hint, never a decision.
+	 */
+	private static function wordify_site_selector(): string {
+		// phpcs:disable WordPress.Security.NonceVerification.Recommended -- reading a page number and a search term to render a list; nothing is changed.
+		$page   = isset( $_GET['pd_sites_page'] ) ? max( 1, absint( wp_unslash( $_GET['pd_sites_page'] ) ) ) : 1;
+		$search = isset( $_GET['pd_sites_search'] ) ? sanitize_text_field( wp_unslash( $_GET['pd_sites_search'] ) ) : '';
+		// phpcs:enable WordPress.Security.NonceVerification.Recommended
+
+		$binding    = HostingBinding::current();
+		$connection = WordifyConnectionService::production( $binding->team_id )->probe( $binding->team_id, $page, $search );
+
+		$html = '<h4>' . esc_html__( 'Which Wordify site is this?', 'post-domain' ) . '</h4>';
+
+		if ( ! $connection->is_ready() || null === $connection->team || null === $connection->sites ) {
+			return $html . '<p class="description">' . esc_html( HostingMessages::for_connection( $connection ) ) . '</p>';
+		}
+
+		$team  = $connection->team;
+		$sites = $connection->sites;
+
+		$html .= '<p class="description">' . esc_html__(
+			'Post Domain will attach every mapped domain to the site you choose here. Choosing the wrong one sends your domains to the wrong installation, so check the name and address before confirming.',
+			'post-domain'
+		) . '</p>';
+
+		// Search is a GET, so it neither changes anything nor needs a nonce.
+		$html .= '<form method="get" action="">';
+
+		foreach ( array(
+			'page'          => 'pd-settings',
+			'pd_sites_page' => '1',
+		) as $name => $value ) {
+			$html .= sprintf(
+				'<input type="hidden" name="%s" value="%s">',
+				esc_attr( $name ),
+				esc_attr( 'page' === $name ? (string) self::current_page_slug() : $value )
+			);
+		}
+
+		$html .= '<p><label for="pd_sites_search">' . esc_html__( 'Search by domain', 'post-domain' ) . '</label> ';
+		$html .= '<input type="search" id="pd_sites_search" name="pd_sites_search" value="' . esc_attr( $search ) . '"> ';
+		$html .= get_submit_button( __( 'Search sites', 'post-domain' ), 'secondary', 'submit', false );
+		$html .= '</p></form>';
+
+		if ( $sites->is_empty() ) {
+			return $html . '<p class="description">' . esc_html__(
+				'No Wordify site matched that search. Clear the search to see the whole list.',
+				'post-domain'
+			) . '</p>';
+		}
+
+		$html .= self::form_open( 'pd_select_wordify_site' );
+		$html .= '<input type="hidden" name="pd_wordify_team" value="' . esc_attr( $team->id ) . '">';
+		$html .= '<table class="widefat striped"><thead><tr>'
+			. '<th scope="col"><span class="screen-reader-text">' . esc_html__( 'Choose', 'post-domain' ) . '</span></th>'
+			. '<th scope="col">' . esc_html__( 'Site', 'post-domain' ) . '</th>'
+			. '<th scope="col">' . esc_html__( 'Address', 'post-domain' ) . '</th>'
+			. '<th scope="col">' . esc_html__( 'Status', 'post-domain' ) . '</th>'
+			. '</tr></thead><tbody>';
+
+		foreach ( $sites->sites as $site ) {
+			$status = array();
+
+			if ( null !== $site->provisioning_status ) {
+				$status[] = $site->provisioning_status;
+			}
+
+			if ( true === $site->is_staging ) {
+				$status[] = __( 'staging', 'post-domain' );
+			}
+
+			$html .= '<tr><td><input type="radio" name="pd_wordify_site" id="pd_site_' . esc_attr( $site->id ) . '"'
+				. ' value="' . esc_attr( $site->id ) . '"></td>'
+				. '<td><label for="pd_site_' . esc_attr( $site->id ) . '">' . esc_html( $site->label() ) . '</label></td>'
+				. '<td>' . esc_html( (string) ( $site->domain ?? '' ) ) . '</td>'
+				. '<td>' . esc_html( implode( ', ', $status ) ) . '</td></tr>';
+		}
+
+		$html .= '</tbody></table>';
+
+		$html .= '<p><label><input type="checkbox" name="pd_wordify_confirm" value="1"> '
+			. esc_html__( 'This is the Wordify site that runs this WordPress installation.', 'post-domain' )
+			. '</label></p>';
+
+		$html .= get_submit_button( __( 'Use this site', 'post-domain' ), 'primary', 'submit', false );
+		$html .= '</form>';
+
+		$html .= self::site_pagination( $sites, $search );
+
+		return $html;
+	}
+
+	/** Page links for the selector, so a large account stays reachable. */
+	private static function site_pagination( \PostDomain\Hosting\WordifySiteList $sites, string $search ): string {
+		$links = array();
+
+		if ( $sites->page > 1 ) {
+			$links[] = array( $sites->page - 1, __( 'Previous sites', 'post-domain' ) );
+		}
+
+		if ( $sites->has_more() ) {
+			$links[] = array( $sites->page + 1, __( 'More sites', 'post-domain' ) );
+		}
+
+		if ( array() === $links ) {
+			return '';
+		}
+
+		$html = '<p>';
+
+		foreach ( $links as $link ) {
+			$html .= '<a class="button" href="' . esc_url(
+				add_query_arg(
+					array(
+						'page'            => self::current_page_slug(),
+						'pd_sites_page'   => (string) $link[0],
+						'pd_sites_search' => $search,
+					),
+					admin_url( 'options-general.php' )
+				)
+			) . '">' . esc_html( (string) $link[1] ) . '</a> ';
+		}
+
+		return $html . '</p>';
+	}
+
+	/** The settings page slug, so selector links come back to this screen. */
+	private static function current_page_slug(): string {
+		return SettingsPage::SLUG;
 	}
 
 	public static function add_form(): string {

@@ -205,12 +205,10 @@ final class HostingProviderFactoryTest extends WP_UnitTestCase {
 	 * further is required to reach it.
 	 */
 	public function test_configured_wordify_credentials_resolve_to_the_wordify_provider(): void {
-		// Credentials alone are not readiness: with no verified auth header the
-		// client cannot send anything, so the provider is not ready — and the
-		// answer is a refusal, not a silent demotion to the manual workflow.
-		//
 		// The credential and the binding come from the two places that own them,
-		// so this exercises the same path a connected site takes.
+		// so this exercises the same path a connected site takes. The stored
+		// credential is a real encrypted one, because the binding is only valid
+		// under the fingerprint of whatever the store actually holds.
 		add_filter( 'pd_hosting_has_credential', '__return_true' );
 		add_filter(
 			'pd_hosting_credential_store',
@@ -220,7 +218,7 @@ final class HostingProviderFactoryTest extends WP_UnitTestCase {
 				}
 
 				public function reveal(): ?\PostDomain\Hosting\CredentialSecret {
-					return new \PostDomain\Hosting\CredentialSecret( 'wfy_test_0000000000000000' );
+					return new \PostDomain\Hosting\CredentialSecret( 'wpk_test_0000000000000000' );
 				}
 
 				public function put( \PostDomain\Hosting\CredentialSecret $secret ): void {
@@ -239,12 +237,9 @@ final class HostingProviderFactoryTest extends WP_UnitTestCase {
 			}
 		);
 
-		\PostDomain\Hosting\HostingBinding::store(
-			array(
-				'team_id'      => 'team-1',
-				'site_id'      => '01HQ0000000000000000000001',
-				'validated_at' => gmdate( 'Y-m-d H:i:s' ),
-			)
+		\PostDomain\Hosting\HostingBinding::bind(
+			new \PostDomain\Hosting\WordifyTeam( 'team-1', 'Team One' ),
+			new \PostDomain\Hosting\WordifySite( '01HQ0000000000000000000001', 'active' )
 		);
 
 		$this->select( 'wordify' );
