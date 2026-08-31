@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.1.0](https://github.com/akaienso/post-domain/compare/v1.0.2...v1.1.0) (2026-08-31)
+
+
+### Features
+
+* add Wordify hosting integration ([#9](https://github.com/akaienso/post-domain/issues/9)) ([0ad4ef9](https://github.com/akaienso/post-domain/commit/0ad4ef9660d129b3dae6d95a0e86d4026c38192f))
+
 ## [1.0.2](https://github.com/akaienso/post-domain/compare/v1.0.1...v1.0.2) (2026-08-31)
 
 
