@@ -19,6 +19,7 @@ use PostDomain\Support\AuthorityParser;
 use PostDomain\Support\HostNormalizer;
 use PostDomain\Support\IdnaNormalizer;
 use PostDomain\Verification\Challenge;
+use PostDomain\Verification\Cooldown;
 
 /**
  * The operator actions, once, for both surfaces.
@@ -273,9 +274,7 @@ final class MappingCommands {
 	 * cannot hold a request open (spec §15.2). The rate limit is per mapping.
 	 */
 	public function verify_now( Mapping $mapping ): CommandResult {
-		$key = 'pd_verify_rate_' . $mapping->id;
-
-		if ( false !== get_transient( $key ) ) {
+		if ( Cooldown::in_force( $mapping->id ) ) {
 			return CommandResult::refused(
 				Errors::RATE_LIMITED,
 				'This domain was checked less than a minute ago. Wait a moment and try again.',
@@ -283,7 +282,10 @@ final class MappingCommands {
 			);
 		}
 
-		set_transient( $key, 1, MINUTE_IN_SECONDS );
+		// The same representation the screen reads, so the countdown it shows and
+		// the refusal this makes cannot disagree.
+		Cooldown::begin( $mapping->id );
+
 		wp_schedule_single_event( time(), 'pd_verify_now', array( $mapping->id ) );
 
 		return CommandResult::ok( 202, $mapping );
@@ -352,6 +354,12 @@ final class MappingCommands {
 		}
 
 		$after = $this->repo->by_id( $mapping->id );
+
+		if ( null === $after ) {
+			// The row is gone; its test result must not outlive it and be
+			// inherited by whatever next takes that id.
+			\PostDomain\Admin\OriginConfirmation::forget( $mapping->id );
+		}
 
 		return CommandResult::ok( null === $after ? 204 : 202, $after );
 	}

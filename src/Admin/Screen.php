@@ -13,8 +13,10 @@ use PostDomain\Ssl\DriverFactory;
 use PostDomain\Ssl\DriverUnavailable;
 use PostDomain\Ssl\Environment;
 use PostDomain\Ssl\SslResourceContext;
+use PostDomain\Ssl\ValidationPlan;
 use PostDomain\Support\IdnaNormalizer;
 use PostDomain\Verification\Challenge;
+use PostDomain\Verification\Cooldown;
 
 /**
  * The management screen an operator actually uses.
@@ -280,11 +282,20 @@ final class Screen {
 			. esc_html__( 'Start typing to search all of your content. Anything beneath the page you choose is served too.', 'post-domain' )
 			. '</p>';
 
+		// Said rather than implied. The list below is a real control that submits
+		// on its own, but it holds one page: reaching the rest is what needs the
+		// script, and claiming otherwise would be the same overstatement this
+		// release exists to remove.
+		$html .= '<noscript><p class="description">' . esc_html__(
+			'Searching your content needs JavaScript. Without it, only the most recent items listed here can be chosen.',
+			'post-domain'
+		) . '</p></noscript>';
+
 		if ( $found['total'] > count( $found['posts'] ) ) {
 			$html .= '<p class="description">' . esc_html(
 				sprintf(
 					/* translators: %d: total number of eligible items. */
-					__( 'Showing the most recent %1$d of %2$d. Type to search the rest.', 'post-domain' ),
+					__( 'Showing the most recent %1$d of %2$d. Type to search the rest; searching needs JavaScript.', 'post-domain' ),
 					count( $found['posts'] ),
 					$found['total']
 				)
@@ -396,7 +407,11 @@ final class Screen {
 		$html  = '<p><a href="' . esc_url( $back ) . '">'
 			. esc_html__( '← All domains', 'post-domain' ) . '</a></p>';
 		$html .= '<h2>' . esc_html( $idna->to_display( $mapping->host ) ) . '</h2>';
-		$html .= '<p class="description">' . esc_html( Workflow::summary( $mapping ) ) . '</p>';
+		// Built once here and handed to everything that asks a question about it,
+		// so the provider is read a single time per page.
+		$plan = self::validation_plan( $mapping );
+
+		$html .= '<p class="description">' . esc_html( Workflow::summary( $mapping, $plan ) ) . '</p>';
 
 		$html .= '<table class="widefat"><tbody>';
 		$html .= self::status_row( __( 'Verification', 'post-domain' ), Labels::verification( $mapping->verification_state ), $mapping->verification_state->value );
@@ -405,9 +420,9 @@ final class Screen {
 		$html .= '</tbody></table>';
 
 		$html .= self::timings( $mapping );
-		$html .= self::steps( $mapping );
+		$html .= self::steps( $mapping, $plan );
 		$html .= self::ownership( $mapping );
-		$html .= self::dns_requirements( $mapping );
+		$html .= self::dns_requirements( $mapping, $plan );
 		$html .= self::management( $mapping );
 
 		return $html;
@@ -496,29 +511,20 @@ final class Screen {
 	}
 
 	/**
-	 * The verification cooldown, read from the state the server actually
-	 * enforces.
+	 * The verification cooldown, from the same representation the server enforces.
 	 *
-	 * `MappingCommands::verify_now()` refuses while the `pd_verify_rate_` transient
-	 * is set, so its expiry is the authority. The countdown in the page is a
-	 * convenience: a stale or forged client still meets the same refusal.
+	 * Not WordPress's private `_transient_timeout_*` option, which does not exist
+	 * behind an external object cache: reading it there showed no cooldown while
+	 * the server was still refusing. `Cooldown` is the one source both sides use.
 	 */
 	public static function verify_available_at( Mapping $mapping ): ?int {
-		$timeout = get_option( '_transient_timeout_pd_verify_rate_' . $mapping->id );
-
-		if ( ! is_numeric( $timeout ) ) {
-			return null;
-		}
-
-		$at = (int) $timeout;
-
-		return $at > time() ? $at : null;
+		return Cooldown::active_until( $mapping->id );
 	}
 
-	private static function steps( Mapping $mapping ): string {
+	private static function steps( Mapping $mapping, ?ValidationPlan $plan ): string {
 		$html = '<h3>' . esc_html__( 'Setup', 'post-domain' ) . '</h3><ol class="pd-steps">';
 
-		foreach ( Workflow::steps( $mapping ) as $step ) {
+		foreach ( Workflow::steps( $mapping, $plan ) as $step ) {
 			$html .= '<li class="pd-step pd-step--' . esc_attr( $step->status ) . '">';
 			$html .= '<p><strong>' . esc_html( $step->title ) . '</strong> '
 				. '<span class="pd-step__status">' . esc_html( $step->status_text() ) . '</span></p>';
@@ -602,6 +608,9 @@ final class Screen {
 			. '<div class="pd-origin-test" data-pd-origin-test'
 			. ' data-host="' . esc_attr( $mapping->host ) . '"'
 			. ' data-mapping="' . esc_attr( (string) $mapping->id ) . '"'
+			// Issued by the server and spendable once, so a proof cannot be
+			// replayed and the client cannot choose what it will be asked to sign.
+			. ' data-challenge="' . esc_attr( OriginProbe::issue_challenge( $mapping ) ) . '"'
 			. ' data-nonce="' . esc_attr( wp_create_nonce( OriginProbe::nonce_action( $mapping->id ) ) ) . '"'
 			. ' data-endpoint="' . esc_url( admin_url( 'admin-ajax.php' ) ) . '"'
 			. ' data-action="' . esc_attr( OriginProbe::ACTION ) . '">'
@@ -647,12 +656,33 @@ final class Screen {
 	 * ownership TXT that the purpose-grouped output already contains, so the same
 	 * record appeared twice and read as two requirements.
 	 */
-	private static function dns_requirements( Mapping $mapping ): string {
-		$html = '<h3>' . esc_html__( 'DNS records', 'post-domain' ) . '</h3>';
-
+	/**
+	 * The plan for this mapping, or null when no provider is bound to read one
+	 * from. Called once per page render; everything else is handed the result.
+	 */
+	private static function validation_plan( Mapping $mapping ): ?ValidationPlan {
 		$driver = BoundResource::driver_for( $mapping );
 
 		if ( $driver instanceof DriverUnavailable ) {
+			return null;
+		}
+
+		$record_name = Challenge::record_name( $mapping->challenge_label, $mapping->host );
+
+		if ( null === $record_name ) {
+			return null;
+		}
+
+		return $driver->validation_plan(
+			SslResourceContext::from_mapping( $mapping, Environment::installation_id(), $record_name, $driver->id() ),
+			null
+		);
+	}
+
+	private static function dns_requirements( Mapping $mapping, ?ValidationPlan $plan ): string {
+		$html = '<h3>' . esc_html__( 'DNS records', 'post-domain' ) . '</h3>';
+
+		if ( null === $plan ) {
 			$name = Challenge::record_name( $mapping->challenge_label, $mapping->host );
 
 			if ( null === $name ) {
@@ -662,7 +692,7 @@ final class Screen {
 			// Before a provider is bound there is exactly one record to publish,
 			// and it is this plugin's own. Rendered here in the same shape the
 			// purpose-grouped output uses, so nothing appears twice later.
-			return $html . '<h4>' . esc_html__( 'Ownership (post-domain)', 'post-domain' ) . '</h4>'
+			return $html . '<h3>' . esc_html__( 'Ownership (post-domain)', 'post-domain' ) . '</h3>'
 				. '<p class="pd-permanent">' . esc_html__(
 					'Permanent: this record must never be removed while the domain is mapped.',
 					'post-domain'
@@ -678,17 +708,6 @@ final class Screen {
 				)
 				. '</td></tr></tbody></table>';
 		}
-
-		$record_name = Challenge::record_name( $mapping->challenge_label, $mapping->host );
-
-		if ( null === $record_name ) {
-			return $html;
-		}
-
-		$plan = $driver->validation_plan(
-			SslResourceContext::from_mapping( $mapping, Environment::installation_id(), $record_name, $driver->id() ),
-			null
-		);
 
 		// DomainDetail escapes as it builds; it must not be run through an
 		// allowlist that would strip its tables.

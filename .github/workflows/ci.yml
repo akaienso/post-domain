@@ -21,6 +21,15 @@ jobs:
       - run: git diff --exit-code references/cloudflare-status-map.php
       - run: composer lint:plans
       - run: composer lint:js
+      # The admin script is progressive enhancement with no build step, so a
+      # behavioural regression in it — the combobox posting a target the
+      # operator edited away from, say — fails nothing else. jsdom runs the
+      # shipped file the way a page does; `node --check` never could.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - run: npm ci
+      - run: npm run test:js
       - run: composer test
       # The readiness state machine behind composer test:integration, proved
       # without a database so a broken probe fails here rather than as a flake.

@@ -49,7 +49,7 @@ final class ProbeEndpoint {
 		nocache_headers();
 		header( 'Content-Type: text/html; charset=utf-8' );
 
-		echo self::page(); // phpcs:ignore WordPress.Security.EscapeOutput
+		echo self::page( $this->context->serving() ); // phpcs:ignore WordPress.Security.EscapeOutput
 
 		exit;
 	}
@@ -59,11 +59,45 @@ final class ProbeEndpoint {
 	 * `wp_head`, so `wp_enqueue_script()` has nothing to print into. The tag is
 	 * written directly, and it is the only thing on the page.
 	 */
-	public static function page(): string {
+	public static function page( ?\PostDomain\Routing\ServingContext $serving = null ): string {
 		// phpcs:disable WordPress.WP.EnqueuedResources.NonEnqueuedScript
 		return '<!doctype html><meta charset="utf-8"><title>post-domain probe</title>'
+			. self::proof_script( $serving )
 			. '<script src="' . esc_url( plugins_url( 'assets/probe.js', dirname( __DIR__, 2 ) . '/post-domain.php' ) )
 			. '" defer></script>';
 		// phpcs:enable WordPress.WP.EnqueuedResources.NonEnqueuedScript
+	}
+
+	/**
+	 * The signed statement about what this installation just resolved.
+	 *
+	 * Reaching here means the request arrived at *this* installation under the
+	 * mapped Host header and the pipeline resolved it to a mapping — which is
+	 * exactly the fact the origin test needs, and exactly what a hosting
+	 * placeholder or a redirect to the primary domain cannot produce.
+	 *
+	 * The signature is what makes it evidence rather than an assertion: the
+	 * previous design echoed a token from the URL, which anything served at that
+	 * hostname could also have done.
+	 */
+	private static function proof_script( ?\PostDomain\Routing\ServingContext $serving ): string {
+		// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- a public probe page; the challenge is bound into a signature, not trusted as authorization.
+		$challenge = isset( $_GET['challenge'] ) ? sanitize_text_field( wp_unslash( $_GET['challenge'] ) ) : '';
+
+		if ( null === $serving || '' === $challenge ) {
+			return '';
+		}
+
+		$proof = \PostDomain\Admin\OriginProof::issue(
+			$serving->mapping,
+			$challenge,
+			$serving->requested_host
+		);
+
+		// JSON_HEX_TAG so no value can close the script element, whatever the
+		// challenge in the query string contained.
+		return '<script id="pd-origin-proof" type="application/json">'
+			. (string) wp_json_encode( $proof, JSON_HEX_TAG | JSON_HEX_AMP )
+			. '</script>';
 	}
 }

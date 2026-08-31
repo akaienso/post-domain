@@ -8,6 +8,7 @@ use PostDomain\Ssl\ApexRouting;
 use PostDomain\Ssl\CloudflareValidationPlan;
 use PostDomain\Ssl\DnsRecordSpec;
 use PostDomain\Ssl\DnsRequirementSet;
+use PostDomain\Ssl\ProviderRead;
 use PostDomain\Ssl\ValidationPlan;
 use WP_UnitTestCase;
 
@@ -25,7 +26,7 @@ final class CloudflareValidationPlanTest extends WP_UnitTestCase {
 		string $host = self::HOST
 	): ValidationPlan {
 		return CloudflareValidationPlan::build(
-			$payload,
+			array() === $payload ? ProviderRead::absent_unbound() : ProviderRead::present( $payload ),
 			'saas.example.net',
 			$apex ?? new ApexCapability( ApexRouting::CNAME_FLATTENING, 'flattening', array(), null, false ),
 			$is_apex,

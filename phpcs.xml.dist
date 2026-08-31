@@ -5,6 +5,8 @@
 	<file>tests</file>
 	<exclude-pattern>*/vendor/*</exclude-pattern>
 	<exclude-pattern>*/node_modules/*</exclude-pattern>
+	<!-- The JavaScript suite is checked by composer lint:js and test:js. -->
+	<arg name="extensions" value="php"/>
 	<!--
 		A generated artifact: its bytes must equal `composer generate:status-map`
 		output exactly, which a formatter would silently break.

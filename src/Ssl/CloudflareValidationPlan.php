@@ -6,19 +6,18 @@ namespace PostDomain\Ssl;
 final class CloudflareValidationPlan {
 
 	/**
-	 * @param array<string, mixed> $payload The custom hostname payload.
-	 * @param string               $host    The normalised mapped hostname. Routing
-	 *                                      records name this host, so it is passed
-	 *                                      in rather than derived: the challenge
-	 *                                      label in $core_record_name is filterable
-	 *                                      and is not a hostname. The parameter is
-	 *                                      optional only so the plan keeps building
-	 *                                      until the one production caller is wired
-	 *                                      to pass $ctx->host; the provider payload
-	 *                                      is the fallback, never the challenge name.
+	 * @param ProviderRead $read The typed outcome of the provider read. The raw
+	 *                           payload is never passed on its own: an empty one
+	 *                           used to mean absence, failure, an unreadable body
+	 *                           and an anomalous 404 all at once, and collapsing
+	 *                           those hid required records and real blockers.
+	 * @param string       $host The normalised mapped hostname. Routing records
+	 *                           name this host, so it is passed in rather than
+	 *                           derived: the challenge label in $core_record_name
+	 *                           is filterable and is not a hostname.
 	 */
 	public static function build(
-		array $payload,
+		ProviderRead $read,
 		string $cname_target,
 		ApexCapability $apex,
 		bool $is_apex,
@@ -26,6 +25,7 @@ final class CloudflareValidationPlan {
 		string $core_record_value,
 		string $host = ''
 	): ValidationPlan {
+		$payload  = $read->payload;
 		$dns      = array();
 		$http     = array();
 		$manual   = array();
@@ -37,14 +37,42 @@ final class CloudflareValidationPlan {
 		}
 
 		/**
-		 * An empty payload is what an absent provider resource looks like: the
-		 * read either returned nothing or was never made. Nothing about such a
-		 * resource is outstanding, so the provider-issued purposes contribute
-		 * neither requirements nor a wait. Claiming records are "not yet issued"
-		 * for a resource that does not exist is the root of the false
-		 * "Awaiting provider" notice on a revoked mapping.
+		 * Only a confirmed absence against an unbound row means "nothing is
+		 * outstanding". That is what keeps the false "Awaiting provider" notice
+		 * off a revoked mapping. Every other non-present outcome is a failure to
+		 * learn anything, and a failure to learn is reported, never silently
+		 * rendered as an empty plan.
 		 */
-		$resource_exists = array() !== $payload;
+		$resource_exists = ProviderReadState::PRESENT === $read->state;
+
+		if ( ProviderReadState::TRANSIENT === $read->state ) {
+			$blockers[] = new DnsBlocker(
+				'provider_read_unavailable',
+				'The certificate provider could not be reached, so any outstanding records are unknown.',
+				'This is usually temporary. Re-check shortly; if it persists, verify the provider credentials and the provider\'s own status.',
+				'cloudflare-saas'
+			);
+
+			$pending[] = new ValidationPending( 'provider_read', 'provider_unreachable', $read->retry_after );
+		}
+
+		if ( ProviderReadState::MALFORMED === $read->state ) {
+			$blockers[] = new DnsBlocker(
+				'provider_read_malformed',
+				'The certificate provider returned a response that could not be understood, so any outstanding records are unknown.',
+				'Re-check shortly; if it persists, verify the API token permissions and the configured zone.',
+				'cloudflare-saas'
+			);
+		}
+
+		if ( ProviderReadState::MISSING_BOUND === $read->state ) {
+			$blockers[] = new DnsBlocker(
+				'provider_resource_missing',
+				'A certificate resource is recorded for this mapping, but the provider reports that it does not exist.',
+				'Reconcile the mapping: clear the recorded provider reference and request the certificate again.',
+				'cloudflare-saas'
+			);
+		}
 
 		// Purpose 1: the plugin's own permanent challenge.
 		$dns['ownership'] = array(

@@ -11,24 +11,33 @@
 	var parent = params.get( 'parent' );
 
 	/*
-	 * Reaching this line at all is the result the origin test wants: the page is
-	 * served by the plugin on the mapped host, so the request arrived at this
-	 * WordPress installation under the mapped Host header. A hosting placeholder
-	 * or a redirect to the primary domain serves something else and runs nothing,
-	 * which is why silence is reported as "not confirmed" rather than a failure
-	 * anyone has to interpret.
+	 * The signed statement this installation embedded when it served this page.
+	 *
+	 * Its presence is the evidence: a hosting placeholder or a redirect to the
+	 * primary domain serves something else, cannot produce the signature, and
+	 * reports nothing at all — which the parent reads as "not confirmed" rather
+	 * than as a failure anyone has to interpret. Nothing is asserted here about
+	 * the hostname or the scheme, because a claim from this side is worth
+	 * nothing; the server checks the signed payload instead.
 	 */
-	if ( parent && params.get( 'origin' ) ) {
-		window.parent.postMessage(
-			{
-				source: 'post-domain-probe',
-				kind: 'origin',
-				host: window.location.hostname,
-				secure: 'https:' === window.location.protocol,
-				token: params.get( 'origin' )
-			},
-			parent
-		);
+	var proofNode = document.getElementById( 'pd-origin-proof' );
+
+	if ( parent && proofNode ) {
+		try {
+			var proof = JSON.parse( proofNode.textContent || '{}' );
+
+			window.parent.postMessage(
+				{
+					source: 'post-domain-probe',
+					kind: 'origin',
+					payload: proof.payload,
+					signature: proof.signature
+				},
+				parent
+			);
+		} catch ( error ) {
+			// A malformed proof is silence, which is the honest answer.
+		}
 	}
 
 	if ( ! asset || ! parent ) {

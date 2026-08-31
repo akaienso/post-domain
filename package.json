@@ -1,7 +1,11 @@
 {
 	"name": "post-domain",
 	"private": true,
+	"scripts": {
+		"test:js": "node --test \"tests/js/**/*.test.js\""
+	},
 	"devDependencies": {
-		"@wordpress/env": "^10.0.0"
+		"@wordpress/env": "^10.0.0",
+		"jsdom": "^30.0.1"
 	}
 }

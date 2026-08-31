@@ -7,6 +7,7 @@ use PostDomain\Mapping\ActivationState;
 use PostDomain\Mapping\Mapping;
 use PostDomain\Mapping\SslState;
 use PostDomain\Mapping\VerificationState;
+use PostDomain\Ssl\ValidationPlan;
 
 /**
  * Setting a domain up, in the order it actually happens.
@@ -23,11 +24,13 @@ use PostDomain\Mapping\VerificationState;
  */
 final class Workflow {
 
-	/** The one thing stored state cannot tell us: does the host route the domain here. */
-	public const ORIGIN_CONFIRMED_META = 'pd_origin_confirmed_at';
-
-	/** @return Step[] */
-	public static function steps( Mapping $mapping ): array {
+	/**
+	 * @param ValidationPlan|null $plan The plan already built for this screen, so
+	 *                                  the provider is read once rather than once
+	 *                                  per question asked about it.
+	 * @return Step[]
+	 */
+	public static function steps( Mapping $mapping, ?ValidationPlan $plan = null ): array {
 		$verified = VerificationState::VERIFIED === $mapping->verification_state;
 		$serving  = ActivationState::ACTIVE === $mapping->activation_state;
 		$leased   = null !== $mapping->ssl_mutation_token;
@@ -52,18 +55,24 @@ final class Workflow {
 		);
 
 		// 2. Routing ----------------------------------------------------------
-		// Nothing on the server can observe this record, so it is never "done"
-		// on its own evidence. It becomes done when the domain is serving,
-		// because that is the point at which it starts to matter.
+		// Nothing here can observe this record. Switching serving on is a local
+		// decision and says nothing about DNS, so it used to mark this done on no
+		// evidence at all. The only thing that actually demonstrates the routing
+		// record exists is the final test reaching this installation over the
+		// mapped name, so that is what settles it.
+		$reached = null !== self::origin_confirmed_at( $mapping );
+
 		$steps[] = new Step(
 			2,
 			__( 'Point the domain at this site', 'post-domain' ),
 			match ( true ) {
 				! $verified => Step::UPCOMING,
-				$serving    => Step::DONE,
+				$reached    => Step::DONE,
 				default     => Step::CURRENT,
 			},
-			__( 'Publish the routing record shown below at your DNS provider. It stays for as long as the domain is mapped.', 'post-domain' ),
+			$reached
+				? __( 'The domain reached this site, so the routing record is working. It stays for as long as the domain is mapped.', 'post-domain' )
+				: __( 'Publish the routing record shown below at your DNS provider. Nothing here can see that record, so this stays open until the final test succeeds.', 'post-domain' ),
 			null,
 			null,
 			$verified ? null : __( 'Confirm ownership first.', 'post-domain' )
@@ -119,43 +128,123 @@ final class Workflow {
 		);
 
 		// 5 and 6. Provider records ------------------------------------------
-		// These exist only while the provider is asking for them, which the
-		// validation plan reports. They are steps rather than notes because the
-		// operator has to go and publish something.
-		$awaiting_provider = in_array(
-			$mapping->ssl_state,
-			array( SslState::REQUESTED, SslState::PENDING_VALIDATION ),
-			true
-		);
-
-		$steps[] = new Step(
+		// Derived from the plan's own purposes rather than from the breadth of
+		// the SSL state. `REQUESTED` and `PENDING_VALIDATION` used to mark both
+		// steps current at once — including when only one kind of record existed,
+		// when neither had been issued, and when the provider had already
+		// finished one phase.
+		$steps[] = self::provider_step(
 			5,
+			'provider_ownership',
 			__( 'Complete provider hostname ownership', 'post-domain' ),
-			match ( true ) {
-				! $verified || ! $serving => Step::UPCOMING,
-				$has_certificate          => Step::DONE,
-				$awaiting_provider        => Step::CURRENT,
-				default                   => Step::UPCOMING,
-			},
-			__( 'If the provider asks for its own ownership record, publish it. It may be removed once the provider reports the hostname active.', 'post-domain' )
+			__( 'The provider is asking for its own ownership record. Publish the record shown below; it may be removed once the provider reports the hostname active.', 'post-domain' ),
+			$mapping,
+			$plan,
+			$verified && $serving,
+			$has_certificate
 		);
 
-		$steps[] = new Step(
+		$steps[] = self::provider_step(
 			6,
+			'ssl_validation',
 			__( 'Complete certificate validation', 'post-domain' ),
-			match ( true ) {
-				! $verified || ! $serving => Step::UPCOMING,
-				$has_certificate          => Step::DONE,
-				$awaiting_provider        => Step::CURRENT,
-				default                   => Step::UPCOMING,
-			},
-			__( 'Publish the certificate validation record if one is shown. Keep it: the provider may need it again when the certificate renews.', 'post-domain' )
+			__( 'Publish the certificate validation record shown below. Keep it: the provider may need it again when the certificate renews.', 'post-domain' ),
+			$mapping,
+			$plan,
+			$verified && $serving,
+			$has_certificate
 		);
 
 		// 7. The one thing stored state cannot prove ---------------------------
 		$steps[] = self::origin_step( $mapping, $has_certificate );
 
 		return $steps;
+	}
+
+	/**
+	 * One provider phase, read from the plan rather than guessed from the state.
+	 *
+	 * CURRENT only when there is something the operator can actually publish for
+	 * this purpose; WAITING when the provider has not issued it yet; DONE when
+	 * the provider says the phase is finished; FAILED when the plan reports a
+	 * blocker that belongs to it.
+	 */
+	private static function provider_step(
+		int $number,
+		string $purpose,
+		string $title,
+		string $detail,
+		Mapping $mapping,
+		?ValidationPlan $plan,
+		bool $reachable,
+		bool $has_certificate
+	): Step {
+		if ( ! $reachable ) {
+			return new Step( $number, $title, Step::UPCOMING, $detail, null, null, __( 'Start serving first.', 'post-domain' ) );
+		}
+
+		// Without a plan the honest answer is that nothing is known yet, not that
+		// the operator has work waiting.
+		if ( null === $plan ) {
+			return new Step(
+				$number,
+				$title,
+				$has_certificate ? Step::DONE : Step::UPCOMING,
+				$detail
+			);
+		}
+
+		$blocker = null;
+
+		foreach ( $plan->blockers as $candidate ) {
+			if ( str_contains( $candidate->code, $purpose ) || str_contains( $candidate->message, $purpose ) ) {
+				$blocker = $candidate;
+
+				break;
+			}
+		}
+
+		if ( null !== $blocker ) {
+			return new Step( $number, $title, Step::FAILED, $blocker->message, null, null, $blocker->remedy );
+		}
+
+		$actionable = array() !== ( $plan->dns[ $purpose ] ?? array() );
+
+		foreach ( $plan->http as $token ) {
+			if ( $token->purpose === $purpose ) {
+				$actionable = true;
+			}
+		}
+
+		foreach ( $plan->manual as $manual ) {
+			if ( property_exists( $manual, 'purpose' ) && $manual->purpose === $purpose ) {
+				$actionable = true;
+			}
+		}
+
+		$waiting = false;
+
+		foreach ( $plan->pending as $pending ) {
+			if ( $pending->purpose === $purpose ) {
+				$waiting = true;
+			}
+		}
+
+		return new Step(
+			$number,
+			$title,
+			match ( true ) {
+				$actionable      => Step::CURRENT,
+				$waiting         => Step::WAITING,
+				$has_certificate => Step::DONE,
+				default          => Step::DONE,
+			},
+			match ( true ) {
+				$actionable => $detail,
+				$waiting    => __( 'The provider has not issued this record yet. This is a wait, not a failure.', 'post-domain' ),
+				default     => __( 'The provider reports this phase complete.', 'post-domain' ),
+			}
+		);
 	}
 
 	/**
@@ -192,35 +281,45 @@ final class Workflow {
 	}
 
 	public static function origin_confirmed_at( Mapping $mapping ): ?string {
-		$value = get_option( self::ORIGIN_CONFIRMED_META . '_' . $mapping->id );
-
-		return is_string( $value ) && '' !== $value ? $value : null;
+		return OriginConfirmation::confirmed_at( $mapping );
 	}
 
 	/**
-	 * Recorded only from a probe that ran on the mapped origin and reached this
-	 * installation. The revision is stored with it so a later change to the row
-	 * does not keep claiming a test that was run against something else.
+	 * Recorded only from a signed proof that this installation served the mapped
+	 * host, and bound to the state it was made about, so any later change to the
+	 * row retires it rather than inheriting it.
 	 */
 	public static function record_origin_confirmed( Mapping $mapping ): void {
-		update_option(
-			self::ORIGIN_CONFIRMED_META . '_' . $mapping->id,
-			gmdate( 'Y-m-d H:i:s' ),
-			false
-		);
+		OriginConfirmation::record( $mapping );
 	}
 
 	public static function forget_origin_confirmation( int $mapping_id ): void {
-		delete_option( self::ORIGIN_CONFIRMED_META . '_' . $mapping_id );
+		OriginConfirmation::forget( $mapping_id );
 	}
 
 	/** The headline, which must not overstate what is known. */
-	public static function summary( Mapping $mapping ): string {
-		$steps = self::steps( $mapping );
+	public static function summary( Mapping $mapping, ?ValidationPlan $plan = null ): string {
+		$steps = self::steps( $mapping, $plan );
 
 		foreach ( $steps as $step ) {
 			if ( Step::FAILED === $step->status ) {
 				return __( 'Something needs your attention below.', 'post-domain' );
+			}
+		}
+
+		foreach ( $steps as $step ) {
+			if ( Step::UNCONFIRMED === $step->status ) {
+				// Deliberately not "fully set up". Three green states prove the
+				// control plane and TLS, not that the host routes the domain here.
+				//
+				// This outranks the routing step still being open, because the
+				// same test settles both: nothing else here can observe a DNS
+				// record, so asking the operator to prove routing separately would
+				// be asking twice for one answer.
+				return __(
+					'DNS and certificate setup are complete. Test the domain to confirm that your hosting routes it to this WordPress site.',
+					'post-domain'
+				);
 			}
 		}
 
@@ -230,15 +329,6 @@ final class Workflow {
 					/* translators: %s: the title of the step to do next. */
 					__( 'Next: %s', 'post-domain' ),
 					$step->title
-				);
-			}
-
-			if ( Step::UNCONFIRMED === $step->status ) {
-				// Deliberately not "fully set up". Three green states prove the
-				// control plane and TLS, not that the host routes the domain here.
-				return __(
-					'DNS and certificate setup are complete. Test the domain to confirm that your hosting routes it to this WordPress site.',
-					'post-domain'
 				);
 			}
 

@@ -7,12 +7,13 @@ use PHPUnit\Framework\TestCase;
 use PostDomain\Ssl\ApexCapability;
 use PostDomain\Ssl\ApexRouting;
 use PostDomain\Ssl\CloudflareValidationPlan;
+use PostDomain\Ssl\ProviderRead;
 
 final class CloudflareValidationPlanTest extends TestCase {
 
 	private function build( array $payload, bool $is_apex = false, ?ApexCapability $apex = null ) {
 		return CloudflareValidationPlan::build(
-			$payload,
+			array() === $payload ? ProviderRead::absent_unbound() : ProviderRead::present( $payload ),
 			'saas.example.net',
 			$apex ?? new ApexCapability( ApexRouting::CNAME_FLATTENING, 'zone on Cloudflare', array(), null, false ),
 			$is_apex,

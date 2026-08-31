@@ -143,6 +143,10 @@ final class Environment {
 			);
 		}
 
+		// A clone has tested nothing. Every stored confirmation describes work
+		// done by the installation this was copied from.
+		\PostDomain\Admin\OriginConfirmation::forget_all();
+
 		delete_option( 'pd_installation_id' );
 		self::installation_id();
 		self::remember_primary_host();

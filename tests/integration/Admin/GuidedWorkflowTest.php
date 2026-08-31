@@ -151,8 +151,12 @@ final class GuidedWorkflowTest extends OwnedSessionTestCase {
 		);
 
 		$this->assertSame( Step::WAITING, $statuses[4] );
-		$this->assertSame( Step::CURRENT, $statuses[5], 'provider ownership may be outstanding' );
-		$this->assertSame( Step::CURRENT, $statuses[6], 'so may certificate validation' );
+
+		// Steps 5 and 6 are no longer inferred from the breadth of the SSL state;
+		// with no plan in hand nothing is known about either phase, and claiming
+		// both are outstanding is what CooldownAndStepsTest now pins down.
+		$this->assertNotSame( Step::CURRENT, $statuses[5] );
+		$this->assertNotSame( Step::CURRENT, $statuses[6] );
 	}
 
 	public function test_the_page_does_not_invite_steps_out_of_order(): void {
@@ -253,8 +257,9 @@ final class GuidedWorkflowTest extends OwnedSessionTestCase {
 
 		$this->assertNull( Screen::verify_available_at( $mapping ), 'no cooldown before a check' );
 
-		// Exactly the state MappingCommands::verify_now() sets.
-		set_transient( 'pd_verify_rate_' . $mapping->id, 1, MINUTE_IN_SECONDS );
+		// Exactly the state MappingCommands::verify_now() sets, through the same
+		// representation both it and the screen read.
+		\PostDomain\Verification\Cooldown::begin( $mapping->id );
 
 		$available = Screen::verify_available_at( $mapping );
 
@@ -266,9 +271,8 @@ final class GuidedWorkflowTest extends OwnedSessionTestCase {
 	public function test_an_expired_cooldown_stops_disabling_the_action(): void {
 		$mapping = $this->mapping();
 
-		set_transient( 'pd_verify_rate_' . $mapping->id, 1, MINUTE_IN_SECONDS );
-		// The boundary: a timeout in the past is not a cooldown.
-		update_option( '_transient_timeout_pd_verify_rate_' . $mapping->id, time() - 1 );
+		// The boundary: a stored instant in the past is not a cooldown.
+		set_transient( 'pd_verify_rate_' . $mapping->id, time() - 1, MINUTE_IN_SECONDS );
 
 		$this->assertNull( Screen::verify_available_at( $mapping ) );
 	}
@@ -276,7 +280,7 @@ final class GuidedWorkflowTest extends OwnedSessionTestCase {
 	public function test_the_page_disables_the_check_and_carries_a_countdown(): void {
 		$mapping = $this->mapping();
 
-		set_transient( 'pd_verify_rate_' . $mapping->id, 1, MINUTE_IN_SECONDS );
+		\PostDomain\Verification\Cooldown::begin( $mapping->id );
 
 		$html = $this->page( $mapping->id );
 

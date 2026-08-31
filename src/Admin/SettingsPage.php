@@ -58,9 +58,16 @@ final class SettingsPage {
 			return;
 		}
 
+		wp_enqueue_style(
+			'post-domain-admin',
+			plugins_url( 'assets/admin.css', dirname( __DIR__, 2 ) . '/post-domain.php' ),
+			array(),
+			self::asset_version()
+		);
+
 		wp_enqueue_script(
 			'post-domain-admin',
-			plugins_url( 'assets/admin.js', dirname( __DIR__ ) . '/post-domain.php' ),
+			plugins_url( 'assets/admin.js', dirname( __DIR__, 2 ) . '/post-domain.php' ),
 			array(),
 			self::asset_version(),
 			true
@@ -86,7 +93,7 @@ final class SettingsPage {
 
 	/** The plugin version, so a released change busts the cache. */
 	private static function asset_version(): string {
-		$data = get_file_data( dirname( __DIR__ ) . '/post-domain.php', array( 'version' => 'Version' ) );
+		$data = get_file_data( dirname( __DIR__, 2 ) . '/post-domain.php', array( 'version' => 'Version' ) );
 
 		return is_string( $data['version'] ?? null ) && '' !== $data['version'] ? $data['version'] : '0';
 	}
