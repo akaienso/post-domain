@@ -3,6 +3,9 @@ declare( strict_types = 1 );
 
 namespace PostDomain\Admin;
 
+use PostDomain\Hosting\HostingBinding;
+use PostDomain\Hosting\HostingDetection;
+use PostDomain\Hosting\HostingReadiness;
 use PostDomain\Mapping\ActivationState;
 use PostDomain\Mapping\DbRepository;
 use PostDomain\Mapping\Mapping;
@@ -66,6 +69,7 @@ final class Screen {
 			return;
 		}
 
+		echo self::hosting_form(); // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped
 		echo self::driver_form(); // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped
 		echo self::add_form(); // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped
 		echo self::list_table(); // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped
@@ -202,7 +206,149 @@ final class Screen {
 		);
 	}
 
+	/**
+	 * The hosting provider, and what it still needs.
+	 *
+	 * Deliberately above the certificate provider: hosting is the layer that
+	 * finally answers with the page, and a domain set up without it verifies,
+	 * gets a certificate, and then serves the host's placeholder.
+	 */
+	public static function hosting_form(): string {
+		$detected  = HostingDetection::detect();
+		$selected  = HostingDetection::selected();
+		$binding   = HostingBinding::current();
+		$readiness = HostingReadiness::evaluate();
+
+		$html  = '<h2>' . esc_html__( 'Hosting provider', 'post-domain' ) . '</h2>';
+		$html .= '<p class="description">' . esc_html__(
+			'Three different things have to know about a mapped domain: your hosting, which finally serves the page; your certificate provider, which answers the secure connection; and your DNS provider, which points the name at them. They are set separately here and need not be the same company.',
+			'post-domain'
+		) . '</p>';
+
+		if ( array() !== $detected['signals'] && ! HostingDetection::is_chosen_explicitly() ) {
+			$html .= '<p class="description">' . esc_html(
+				HostingDetection::WORDIFY === $detected['provider']
+					? __( 'This looks like a Wordify site, so that path is selected below. Detection only chooses what to show you — it grants no access, and you can change it.', 'post-domain' )
+					: __( 'No hosting platform was detected, so the manual path is selected below. You can change it.', 'post-domain' )
+			) . '</p>';
+		}
+
+		$html .= self::form_open( 'pd_set_hosting' );
+		$html .= '<p><label for="pd_hosting_provider">' . esc_html__( 'Hosting', 'post-domain' ) . '</label><br>';
+		$html .= '<select name="pd_hosting_provider" id="pd_hosting_provider">';
+
+		foreach (
+			array(
+				HostingDetection::WORDIFY => __( 'Wordify', 'post-domain' ),
+				HostingDetection::MANUAL  => __( 'Manual or another host', 'post-domain' ),
+			) as $value => $label
+		) {
+			$html .= sprintf(
+				'<option value="%s"%s>%s</option>',
+				esc_attr( $value ),
+				selected( $selected, $value, false ),
+				esc_html( $label )
+			);
+		}
+
+		$html .= '</select> ';
+		$html .= get_submit_button( __( 'Save hosting', 'post-domain' ), 'secondary', 'submit', false );
+		$html .= '</form>';
+
+		if ( HostingDetection::WORDIFY === $selected ) {
+			$html .= self::wordify_connection( $binding );
+		} else {
+			$html .= '<p class="description">' . esc_html__(
+				'Manual hosting: you arrange for your web server to accept the mapped domain yourself. Post Domain will not contact a hosting API.',
+				'post-domain'
+			) . '</p>';
+		}
+
+		if ( ! $readiness->may_add_domains ) {
+			$html .= '<div class="notice notice-warning inline"><p><strong>'
+				. esc_html( (string) $readiness->blocker ) . '</strong><br>'
+				. esc_html( (string) $readiness->remedy ) . '</p></div>';
+		}
+
+		return $html;
+	}
+
+	/** The Wordify credential and binding, never showing the credential. */
+	private static function wordify_connection( HostingBinding $binding ): string {
+		$external = (bool) apply_filters( 'pd_hosting_credential_is_external', false );
+
+		$html = '<h3>' . esc_html__( 'Wordify connection', 'post-domain' ) . '</h3>';
+
+		if ( $binding->has_credential() ) {
+			// Never the token, and never anything reversible into it.
+			$html .= '<p>' . esc_html(
+				$external
+					? __( 'A Wordify token is configured in wp-config.php. It cannot be changed from here.', 'post-domain' )
+					: __( 'A Wordify token is saved. It is stored encrypted and is never shown again.', 'post-domain' )
+			) . '</p>';
+
+			if ( $binding->is_bound() ) {
+				$html .= '<p>' . sprintf(
+					/* translators: 1: Wordify team name, 2: Wordify site name. */
+					esc_html__( 'Connected to team %1$s, site %2$s.', 'post-domain' ),
+					'<strong>' . esc_html( (string) ( $binding->team_name ?? $binding->team_id ) ) . '</strong>',
+					'<strong>' . esc_html( (string) ( $binding->site_name ?? $binding->site_id ) ) . '</strong>'
+				) . '</p>';
+			}
+		} else {
+			$html .= '<p>' . esc_html__( 'No Wordify token is configured.', 'post-domain' ) . '</p>';
+		}
+
+		if ( ! $external ) {
+			$html .= self::form_open( 'pd_set_wordify_token' );
+			$html .= '<p><label for="pd_wordify_token">' . esc_html(
+				$binding->has_credential()
+					? __( 'Replace the API token', 'post-domain' )
+					: __( 'Wordify API token', 'post-domain' )
+			) . '</label><br>';
+			$html .= '<input type="password" class="regular-text" name="pd_wordify_token" id="pd_wordify_token"'
+				. ' autocomplete="off" spellcheck="false">';
+			$html .= '</p><p class="description">' . esc_html__(
+				'Create a token in the Wordify console with only the abilities Post Domain needs. It is stored encrypted and never displayed again.',
+				'post-domain'
+			) . '</p>';
+			$html .= get_submit_button( __( 'Save token', 'post-domain' ), 'secondary', 'submit', false );
+			$html .= '</form>';
+		}
+
+		if ( $binding->has_credential() ) {
+			$html .= '<div class="pd-actions" style="display:flex;flex-wrap:wrap;gap:.5rem">';
+			$html .= self::form_open( 'pd_test_wordify' )
+				. '<button type="submit" class="button">' . esc_html__( 'Test connection', 'post-domain' )
+				. '</button></form>';
+
+			if ( ! $external ) {
+				$html .= self::form_open( 'pd_disconnect_wordify' )
+					. '<button type="submit" class="button" onclick="return confirm(' . esc_attr(
+						(string) wp_json_encode(
+							__( 'Disconnect Wordify? Domains already attached to your Wordify site are left exactly as they are, and no mapping is deleted.', 'post-domain' )
+						)
+					) . ');">'
+					. esc_html__( 'Disconnect', 'post-domain' )
+					. '</button></form>';
+			}
+
+			$html .= '</div>';
+		}
+
+		return $html;
+	}
+
 	public static function add_form(): string {
+		$readiness = HostingReadiness::evaluate();
+
+		// Withheld rather than shown-and-refused: a domain added here without a
+		// working hosting connection would verify, get a certificate, and still
+		// serve the host's placeholder page.
+		if ( ! $readiness->may_add_domains ) {
+			return '';
+		}
+
 		$html  = '<h2>' . esc_html__( 'Add a domain', 'post-domain' ) . '</h2>';
 		$html .= self::form_open( 'pd_add_mapping' );
 		$html .= '<table class="form-table" role="presentation"><tbody>';

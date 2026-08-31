@@ -27,6 +27,10 @@ final class Wiring {
 			OriginProbe::register();
 		}
 
+		// The hosting credential seam is needed wherever a mapping is created,
+		// which is not only the admin screen.
+		\PostDomain\Hosting\HostingWiring::register();
+
 		// The probe page is served on a MAPPED host, never in the admin, so it
 		// registers unconditionally.
 		ProbeEndpoint::boot();

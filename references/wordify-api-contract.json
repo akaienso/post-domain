@@ -1,0 +1,66 @@
+{
+  "source": "Wordify MCP server tool schemas, as exposed to this session",
+  "captured_at": "2026-08-31",
+  "openapi_document": {
+    "url": "https://console.wordify.com/docs/api.json",
+    "obtained": false,
+    "observed_status": 200,
+    "observed_content_type": "text/html",
+    "note": "The document is behind console authentication. An unauthenticated request returns the console SPA shell rather than JSON, so no HTTP paths, request/response schemas, auth header name, error codes, scope names or idempotency mechanism could be verified from it."
+  },
+  "verified_operations": {
+    "get_me": {
+      "read_only": true,
+      "parameters": {},
+      "returns": "the authenticated user plus an inline list of every team they belong to",
+      "notes": "Orientation call. For multi-team users a team is selected before site, billing or task calls."
+    },
+    "list_sites": {
+      "read_only": true,
+      "http": "GET /api/v1/sites",
+      "http_confidence": "stated in the tool description; the only HTTP path this session could verify",
+      "filters": ["php_version", "cdn_enabled", "provisioning_status", "domain", "has_plugin", "plugin_version", "cache_enabled", "is_staging"],
+      "pagination": ["page", "per_page (default 25, max 100)", "links.next"],
+      "provisioning_status_values": ["pending", "provisioning", "active", "syncing", "deleting", "failed"],
+      "sort_fields": ["created_at", "updated_at", "domain", "name", "id"]
+    },
+    "get_site": {
+      "read_only": true,
+      "parameters": { "site_id": "26-char base32 ULID or a bare domain", "include": "php_config, cdn_config, cache_config, basic_auth, redis, wordpress_settings, cron_config, plugins, themes, team, wp_options" },
+      "authorisation": "enforced by the site policy; a token scoped to one team cannot read sites on another team"
+    },
+    "list_domains": {
+      "read_only": true,
+      "parameters": { "site_id": "ULID or bare domain" },
+      "returns": "every domain attached to the site, primary first then newest",
+      "record_fields": ["ssl_state", "dns_verified_at", "is_primary"]
+    },
+    "add_domain": {
+      "read_only": false,
+      "parameters": {
+        "site_id": "ULID or bare domain",
+        "domain": "without www prefix, public TLD only, max 253 chars",
+        "make_primary": "default false; promotes to primary once DNS verifies",
+        "use_www": "only meaningful with make_primary"
+      },
+      "behaviour": "creates a parked domain pointer, then asynchronously verifies DNS and provisions an SSL certificate; returns the created domain record immediately",
+      "rejects": "temporary wordify.io-style subdomains"
+    },
+    "recheck_domain_dns": {
+      "read_only": false,
+      "parameters": { "site_id": "ULID or bare domain" },
+      "behaviour": "synchronous; refreshes dns_verified_at and ssl_state for every domain on the site",
+      "side_effects": "live DNS queries and, when SSL state is missing or stale, a fresh Let's Encrypt issuance request",
+      "rate_limit": "Let's Encrypt rate-limits per registered domain per week; tight retry loops must be avoided"
+    }
+  },
+  "not_verified": {
+    "http_paths": "Every path except GET /api/v1/sites. Not guessed.",
+    "auth_header": "The bearer header name and format could not be read from the specification.",
+    "response_envelopes": "Field names beyond those the tool schemas state.",
+    "error_codes": "HTTP status codes and error body shape for refusals, rate limits and conflicts.",
+    "idempotency": "Whether the API exposes an idempotency key on writes, and under what header or field.",
+    "abilities": "The exact token ability/scope names, and whether a token can be restricted to a single site rather than a team.",
+    "domain_detachment": "No domain deletion or detachment operation is exposed by the MCP surface, and none could be confirmed from the specification."
+  }
+}

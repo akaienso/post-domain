@@ -300,3 +300,79 @@ In each of those, start with the hosting configuration for the mapped domain,
 then check the plugin's diagnostics for anything it has already flagged. Clear
 any caching layer in front of the site before re-testing, so you are not looking
 at an old answer.
+
+## 12. Hosting, certificates and DNS are three different things
+
+They are easy to confuse because all three are "where the domain points", and
+they can be three different companies.
+
+| | What it does | Who it is |
+|---|---|---|
+| **Hosting / origin** | Finally serves your page. It has to recognise the mapped domain as one of its own names. | Wordify, or whoever runs your site |
+| **Certificate / edge** | Issues the certificate and answers the secure connection. | Cloudflare for SaaS |
+| **Authoritative DNS** | Answers questions about your domain. | Your registrar or DNS host — anywhere |
+
+Your mapped domain's DNS does not have to be in the same Cloudflare account as
+anything else. Post Domain never assumes it is.
+
+### If your site is on Wordify
+
+Post Domain can tell Wordify about each mapped domain for you, so the origin
+accepts it. To do that it needs a Wordify API token that **you** create — the
+plugin has no credential of its own and never will.
+
+1. In the Wordify console, create an API token.
+2. Give it the narrowest abilities that work. Post Domain needs to read who the
+   token belongs to, list your sites, list a site's domains, and attach a
+   domain. It never needs to change your primary domain, your billing, or your
+   site's settings.
+3. Paste it into **Settings → Domain mappings → Hosting provider**.
+4. Choose **Test connection**, and pick which Wordify site this WordPress
+   installation is.
+
+Until that connection is made and bound to one site, the **Add a domain** form
+is not shown. That is deliberate. A domain added without it would verify, get a
+certificate, and then show your host's placeholder page — a failure that looks
+like everything worked.
+
+**What Post Domain never does to your Wordify site.** It never makes a mapped
+domain primary. It never changes your main site's domain, your WordPress
+address, or your site address. It never changes your DNS.
+
+**If the token stops working** — revoked, expired, or scoped too narrowly — you
+will not be able to add new domains until you replace it. Every domain already
+serving keeps serving. A failed read never changes anything that was already
+set up.
+
+**Disconnecting** removes Post Domain's permission to make further changes on
+your behalf. It does not detach any domain from Wordify and does not delete any
+mapping.
+
+**Deleting a mapping.** Wordify's API, as published, offers no way to detach a
+domain. So deleting a mapping here removes the mapping and then tells you
+exactly what to remove in the Wordify console yourself. Post Domain will not
+guess at an operation it cannot verify.
+
+### If your site is hosted anywhere else
+
+Choose **Manual or another host**. No token is needed and no hosting API is
+contacted. You arrange for your web server, panel or CDN to accept the mapped
+domain, as section 2 describes.
+
+### Keeping the token out of harm's way
+
+The token is stored encrypted, and is never shown again once saved — only the
+fact that one is configured. If you would rather it never touched the database,
+define it in `wp-config.php` instead:
+
+```php
+define( 'PD_WORDIFY_TOKEN', 'your-token-here' );
+```
+
+A token defined there takes precedence and cannot be changed from the admin
+screen.
+
+Encryption is a second line of defence, not the first. Someone with full
+database *and* filesystem access can decrypt it, so the real protection is
+scope: give the token only the abilities listed above, so that even in the worst
+case it cannot do much.

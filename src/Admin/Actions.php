@@ -4,6 +4,7 @@ declare( strict_types = 1 );
 namespace PostDomain\Admin;
 
 use PostDomain\Application\CommandResult;
+use PostDomain\Hosting\HostingActions;
 use PostDomain\Application\MappingCommands;
 use PostDomain\Mapping\ActivationState;
 use PostDomain\Mapping\DbRepository;
@@ -34,6 +35,10 @@ final class Actions {
 		'pd_provision_ssl',
 		'pd_remove_ssl',
 		'pd_delete_mapping',
+		'pd_set_hosting',
+		'pd_set_wordify_token',
+		'pd_test_wordify',
+		'pd_disconnect_wordify',
 	);
 
 	public static function capability(): string {
@@ -98,6 +103,11 @@ final class Actions {
 
 		if ( 'pd_set_driver' === $action ) {
 			self::set_driver();
+			self::redirect( 0 );
+		}
+
+		if ( in_array( $action, array( 'pd_set_hosting', 'pd_set_wordify_token', 'pd_test_wordify', 'pd_disconnect_wordify' ), true ) ) {
+			HostingActions::dispatch( $action );
 			self::redirect( 0 );
 		}
 

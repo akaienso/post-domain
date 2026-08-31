@@ -79,6 +79,11 @@ final class Environment {
 				// without the rest is exactly the partial state the repository
 				// invariant forbids (spec §12.2, §14.9).
 				array(
+					'hosting_provider'          => null,
+					'hosting_environment'       => null,
+					'hosting_ref'               => null,
+					'hosting_state'             => null,
+					'hosting_registered_at'     => null,
 					'ssl_provider'              => null,
 					'ssl_provider_environment'  => null,
 					'ssl_ref'                   => null,
@@ -147,6 +152,14 @@ final class Environment {
 		// done by the installation this was copied from.
 		\PostDomain\Admin\OriginConfirmation::forget_all();
 		\PostDomain\Admin\OriginChallenge::forget_all();
+
+		// A clone inherits the hosting binding too, and those domains belong to
+		// the installation this was copied from. The site choice is kept — it is
+		// ordinary configuration and an operator may well want it again — but the
+		// validation is not, so nothing can be attached, detached or reconciled
+		// until someone reconnects deliberately from one installation.
+		\PostDomain\Hosting\HostingBinding::invalidate();
+		do_action( 'pd_hosting_authority_revoked' );
 
 		delete_option( 'pd_installation_id' );
 		self::installation_id();

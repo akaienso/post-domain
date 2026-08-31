@@ -337,7 +337,54 @@ account that has never heard of it.
 
 Diagnostics lists every such certificate, with the environment to restore.
 
-## 25. Releases
+## 25. Hosting providers
+
+Three separate things have to know about a mapped domain, and they need not be
+the same company:
+
+| Layer | What it does | Configured as |
+|---|---|---|
+| **Hosting / origin** | Finally serves the page. Must accept the mapped `Host` header. | Wordify, or Manual/Other |
+| **Certificate / edge** | Issues the certificate and terminates TLS. | Cloudflare for SaaS, or another driver |
+| **Authoritative DNS** | Answers queries for the domain. | Anywhere. Not configured here. |
+
+A mapped domain's DNS does **not** have to live in the Wordify customer's
+Cloudflare account, and the plugin never assumes it does.
+
+### Wordify
+
+When hosting is set to Wordify, Post Domain attaches each mapped hostname to
+your Wordify site so the origin recognises it. That requires a Wordify REST API
+token, which **you** create — the plugin ships with no credential of any kind.
+
+- The token is entered once, stored encrypted, and **never displayed again**.
+  Only "a token is configured" is ever shown back.
+- It can also be supplied from `wp-config.php` for operators who do not permit
+  database-stored secrets. See §12 of the operator guide.
+- Give it the narrowest abilities that work. Post Domain reads your identity,
+  lists sites, lists a site's domains, and attaches a domain. It never promotes
+  a domain to primary and never changes your main site's domain.
+- The connection is bound to **one** Wordify team and site. Until it is, the
+  **Add a domain** form is not shown, because a domain added without it would
+  verify, get a certificate, and still serve your host's placeholder page.
+- If the token is later revoked, new domains cannot be added — and every domain
+  already serving keeps serving. A failed provider read never changes stored
+  state.
+
+**Disconnecting removes local authority only.** No domain is detached at
+Wordify and no mapping is deleted.
+
+**Deletion.** The verified Wordify API surface exposes no domain-detachment
+operation. Deleting a mapping therefore removes the mapping here and tells you
+exactly what to remove in the Wordify console by hand. Nothing is invented.
+
+### Manual or another host
+
+Choose this and the plugin contacts no hosting API at all. You arrange for your
+web server to accept the mapped domain, exactly as §2 describes. This is the
+default when no platform is detected.
+
+## 26. Releases
 
 Releases are cut by [Release Please](https://github.com/googleapis/release-please)
 from [Conventional Commits](https://www.conventionalcommits.org/) on `main`.
