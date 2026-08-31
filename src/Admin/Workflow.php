@@ -167,7 +167,13 @@ final class Workflow {
 	 * CURRENT only when there is something the operator can actually publish for
 	 * this purpose; WAITING when the provider has not issued it yet; DONE when
 	 * the provider says the phase is finished; FAILED when the plan reports a
-	 * blocker that belongs to it.
+	 * blocker that belongs to it; BLOCKED when the read that would have told us
+	 * about this phase failed outright.
+	 *
+	 * Ownership is read from the blocker's own metadata. It used to be guessed by
+	 * looking for the purpose string inside the code or the translated message,
+	 * which missed `provider_record_malformed` entirely and reported the phase
+	 * DONE while the plan was saying the record was malformed.
 	 */
 	private static function provider_step(
 		int $number,
@@ -194,18 +200,19 @@ final class Workflow {
 			);
 		}
 
-		$blocker = null;
-
+		// A blocker naming this phase is that phase's failure. A global one is a
+		// failed read: it proves nothing about this phase, and in particular an
+		// empty plan behind it is not evidence the phase is finished.
 		foreach ( $plan->blockers as $candidate ) {
-			if ( str_contains( $candidate->code, $purpose ) || str_contains( $candidate->message, $purpose ) ) {
-				$blocker = $candidate;
-
-				break;
+			if ( $purpose === $candidate->purpose ) {
+				return new Step( $number, $title, Step::FAILED, $candidate->message, null, null, $candidate->remedy );
 			}
 		}
 
-		if ( null !== $blocker ) {
-			return new Step( $number, $title, Step::FAILED, $blocker->message, null, null, $blocker->remedy );
+		foreach ( $plan->blockers as $candidate ) {
+			if ( $candidate->is_global() ) {
+				return new Step( $number, $title, Step::BLOCKED, $candidate->message, null, null, $candidate->remedy );
+			}
 		}
 
 		$actionable = array() !== ( $plan->dns[ $purpose ] ?? array() );
@@ -302,9 +309,17 @@ final class Workflow {
 		$steps = self::steps( $mapping, $plan );
 
 		foreach ( $steps as $step ) {
-			if ( Step::FAILED === $step->status ) {
+			if ( Step::FAILED === $step->status || Step::BLOCKED === $step->status ) {
 				return __( 'Something needs your attention below.', 'post-domain' );
 			}
+		}
+
+		// A blocker that belongs to no step still belongs to this domain. Routing
+		// is the standing case: nothing here can observe that record, so an
+		// unsupported apex would otherwise leave the headline free to claim the
+		// domain is set up while the plan says it cannot be routed at all.
+		if ( null !== $plan && array() !== $plan->blockers ) {
+			return __( 'Something needs your attention below.', 'post-domain' );
 		}
 
 		foreach ( $steps as $step ) {

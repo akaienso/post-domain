@@ -202,16 +202,36 @@ final class CooldownAndStepsTest extends OwnedSessionTestCase {
 	}
 
 	public function test_a_blocker_marks_its_phase_as_needing_attention(): void {
+		// The phase is named by the blocker, not spelled inside its code: the
+		// workflow used to read ownership out of `str_contains( $code, $purpose )`,
+		// so a code that did not embed the purpose was silently dropped.
 		$statuses = $this->statuses(
 			$this->mapping(),
 			$this->plan(
 				array(),
 				array(),
-				array( new DnsBlocker( 'ssl_validation_unsupported', 'ssl_validation cannot proceed', 'Change the method.', 'recording' ) )
+				array( new DnsBlocker( 'method_unsupported', 'That method cannot be used here.', 'Change the method.', 'recording', 'ssl_validation' ) )
 			)
 		);
 
 		$this->assertSame( Step::FAILED, $statuses[6] );
+		$this->assertNotSame( Step::FAILED, $statuses[5], 'and it belongs to one phase only' );
+	}
+
+	public function test_a_global_blocker_blocks_every_provider_phase(): void {
+		// No purpose: the read itself failed, so nothing at all is known. An empty
+		// plan behind a failed read is not evidence that a phase is finished.
+		$statuses = $this->statuses(
+			$this->mapping(),
+			$this->plan(
+				array(),
+				array(),
+				array( new DnsBlocker( 'provider_read_unavailable', 'The provider could not be reached.', 'Try again shortly.', 'recording' ) )
+			)
+		);
+
+		$this->assertSame( Step::BLOCKED, $statuses[5] );
+		$this->assertSame( Step::BLOCKED, $statuses[6] );
 	}
 
 	/** The sequence observed in live acceptance testing, in order. */

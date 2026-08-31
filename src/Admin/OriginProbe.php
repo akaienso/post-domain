@@ -28,9 +28,6 @@ final class OriginProbe {
 
 	public const ACTION = 'pd_origin_confirmed';
 
-	/** The one-time challenge the page issued, kept server-side. */
-	private const CHALLENGE_PREFIX = 'pd_origin_challenge_';
-
 	public static function register(): void {
 		add_action( 'wp_ajax_' . self::ACTION, array( self::class, 'respond' ) );
 	}
@@ -40,31 +37,14 @@ final class OriginProbe {
 	}
 
 	/**
-	 * Mints the challenge the probe must sign, and remembers it.
+	 * Mints the challenge the probe must sign.
 	 *
-	 * Server-issued and single use, so a proof cannot be replayed: the second
-	 * presentation finds nothing to match against.
+	 * Independently addressable, so a second tab rendering the page leaves the
+	 * first tab's test working. Single-use is enforced when it is claimed, not by
+	 * being the only one that exists.
 	 */
 	public static function issue_challenge( Mapping $mapping ): string {
-		$challenge = bin2hex( random_bytes( 16 ) );
-
-		set_transient(
-			self::CHALLENGE_PREFIX . $mapping->id,
-			$challenge,
-			OriginProof::TTL
-		);
-
-		return $challenge;
-	}
-
-	private static function take_challenge( int $mapping_id ): ?string {
-		$stored = get_transient( self::CHALLENGE_PREFIX . $mapping_id );
-
-		return is_string( $stored ) && '' !== $stored ? $stored : null;
-	}
-
-	private static function spend_challenge( int $mapping_id ): void {
-		delete_transient( self::CHALLENGE_PREFIX . $mapping_id );
+		return OriginChallenge::issue( $mapping );
 	}
 
 	public static function respond(): void {
@@ -101,31 +81,35 @@ final class OriginProbe {
 			self::fail( $precondition, 409 );
 		}
 
-		$challenge = self::take_challenge( $mapping->id );
+		/** @var array<string, mixed> $payload */
+		$payload   = isset( $_POST['payload'] ) && is_array( $_POST['payload'] ) // phpcs:ignore WordPress.Security.NonceVerification.Missing -- verified above.
+			? map_deep( wp_unslash( $_POST['payload'] ), 'sanitize_text_field' ) // phpcs:ignore WordPress.Security.NonceVerification.Missing -- verified above.
+			: array();
+		$signature = isset( $_POST['signature'] ) ? sanitize_text_field( wp_unslash( $_POST['signature'] ) ) : ''; // phpcs:ignore WordPress.Security.NonceVerification.Missing -- verified above.
+		$challenge = isset( $payload['challenge'] ) ? (string) $payload['challenge'] : '';
 
-		if ( null === $challenge ) {
+		// Claimed before it is trusted, and claimed exactly once. Two requests
+		// presenting the same proof are resolved here: one removes the row and
+		// continues, the other is told it removed nothing and stops. Only this
+		// challenge is touched, so a failed attempt cannot spend another tab's.
+		if ( ! OriginChallenge::claim( $mapping->id, $challenge ) ) {
 			self::fail(
 				__( 'This test has expired or was already recorded. Reload the page and test again.', 'post-domain' ),
 				409
 			);
 		}
 
-		/** @var array<string, mixed> $payload */
-		$payload   = isset( $_POST['payload'] ) && is_array( $_POST['payload'] ) // phpcs:ignore WordPress.Security.NonceVerification.Missing -- verified above.
-			? map_deep( wp_unslash( $_POST['payload'] ), 'sanitize_text_field' ) // phpcs:ignore WordPress.Security.NonceVerification.Missing -- verified above.
-			: array();
-		$signature = isset( $_POST['signature'] ) ? sanitize_text_field( wp_unslash( $_POST['signature'] ) ) : ''; // phpcs:ignore WordPress.Security.NonceVerification.Missing -- verified above.
-
+		// Two independent facts, and neither alone is enough. The claim proves the
+		// challenge was issued by this server and has not been spent; the
+		// signature proves the probe endpoint signed this exact payload, that
+		// challenge included. An attacker cannot invent a challenge — the claim
+		// finds nothing — and cannot reuse a signed one, because the claim
+		// succeeds only once.
 		$rejection = OriginProof::verify( $payload, $signature, $mapping, $challenge );
 
 		if ( null !== $rejection ) {
-			// Spent either way: a rejected attempt must not leave a challenge
-			// lying around for a second try at guessing.
-			self::spend_challenge( $mapping->id );
 			self::fail( self::explain( $rejection ), 409 );
 		}
-
-		self::spend_challenge( $mapping->id );
 
 		OriginConfirmation::record( $mapping );
 

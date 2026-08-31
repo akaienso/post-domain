@@ -204,7 +204,15 @@
 			input.setCustomValidity( '' );
 		}
 
-		function close() {
+		/**
+		 * Nothing in the list is the active option any more.
+		 *
+		 * Split out of close() because an edit has to drop the highlight without
+		 * necessarily tearing the list down: whatever was highlighted answered
+		 * the previous term, and Enter must not be able to choose it once the
+		 * visible query has moved on.
+		 */
+		function clearActive() {
 			var options = list.querySelectorAll( '[role="option"]' );
 
 			for ( var i = 0; i < options.length; i++ ) {
@@ -212,10 +220,15 @@
 				options[ i ].classList.remove( 'is-active' );
 			}
 
-			list.hidden = true;
-			input.setAttribute( 'aria-expanded', 'false' );
 			input.removeAttribute( 'aria-activedescendant' );
 			active = -1;
+		}
+
+		function close() {
+			clearActive();
+
+			list.hidden = true;
+			input.setAttribute( 'aria-expanded', 'false' );
 		}
 
 		function highlight( next ) {
@@ -364,6 +377,29 @@
 			invalidate();
 		}
 
+		/**
+		 * Retires every answer still owed to an earlier ask.
+		 *
+		 * The id is a monotonic generation, so an answer is accepted only by the
+		 * request that asked for it; the abort is the courtesy. This has to be
+		 * callable on its own because the debounce leaves a 200 ms window
+		 * between an edit and the search it will eventually start, and a slow
+		 * answer to the previous term — a "Show more results" page most of all —
+		 * can land inside it. Establishing the generation only when the search
+		 * finally begins leaves that window open, and the operator can click a
+		 * row belonging to a term that is no longer on screen.
+		 */
+		function supersede() {
+			requestId += 1;
+
+			if ( controller ) {
+				controller.abort();
+				controller = null;
+			}
+
+			clearActive();
+		}
+
 		function runSearch( page, append ) {
 			var query = input.value.trim();
 
@@ -371,16 +407,9 @@
 				term = query;
 			}
 
-			// A monotonic id, so a slow answer to an older keystroke can never
-			// overwrite the list a newer one is showing. The abort is the
-			// courtesy; the id is the guarantee.
-			requestId += 1;
+			supersede();
 
 			var id = requestId;
-
-			if ( controller ) {
-				controller.abort();
-			}
 
 			controller = window.AbortController ? new window.AbortController() : null;
 
@@ -445,6 +474,14 @@
 			// network round trip. Otherwise the operator chooses A, types over
 			// the text looking for B, submits, and the domain silently goes to A.
 			invalidate();
+
+			// And it retires the previous term's outstanding answers just as
+			// immediately — the debounce below must not be a window in which one
+			// of them can still land and paint rows for a term the operator has
+			// already typed over. The search this schedules starts a later
+			// generation still, so nothing older can be accepted by it either.
+			supersede();
+
 			nextPage = 1;
 			window.clearTimeout( timer );
 			timer = window.setTimeout( function () {

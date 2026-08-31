@@ -153,6 +153,26 @@ function createScreen( options ) {
 	};
 }
 
+/**
+ * A body the test decides when to send.
+ *
+ * Returned from a `handler`, it lets a test hold one answer open, do something
+ * else, and then choose the exact moment that answer lands.
+ */
+function deferred() {
+	let release;
+	const promise = new Promise( ( resolve ) => {
+		release = resolve;
+	} );
+
+	return {
+		promise,
+		send( body ) {
+			release( body );
+		}
+	};
+}
+
 /** The debounce in the script is real, so the suite waits it out rather than faking it. */
 function settle( ms ) {
 	return new Promise( ( resolve ) => setTimeout( resolve, undefined === ms ? 260 : ms ) );
@@ -163,4 +183,4 @@ function flush() {
 	return new Promise( ( resolve ) => setImmediate( resolve ) );
 }
 
-module.exports = { createScreen, settle, flush, ok, error };
+module.exports = { createScreen, settle, flush, deferred, ok, error };

@@ -50,7 +50,9 @@ final class CloudflareValidationPlan {
 				'provider_read_unavailable',
 				'The certificate provider could not be reached, so any outstanding records are unknown.',
 				'This is usually temporary. Re-check shortly; if it persists, verify the provider credentials and the provider\'s own status.',
-				'cloudflare-saas'
+				'cloudflare-saas',
+				// Global: the read failed, so nothing is known about any phase.
+				null
 			);
 
 			$pending[] = new ValidationPending( 'provider_read', 'provider_unreachable', $read->retry_after );
@@ -61,7 +63,8 @@ final class CloudflareValidationPlan {
 				'provider_read_malformed',
 				'The certificate provider returned a response that could not be understood, so any outstanding records are unknown.',
 				'Re-check shortly; if it persists, verify the API token permissions and the configured zone.',
-				'cloudflare-saas'
+				'cloudflare-saas',
+				null
 			);
 		}
 
@@ -70,7 +73,8 @@ final class CloudflareValidationPlan {
 				'provider_resource_missing',
 				'A certificate resource is recorded for this mapping, but the provider reports that it does not exist.',
 				'Reconcile the mapping: clear the recorded provider reference and request the certificate again.',
-				'cloudflare-saas'
+				'cloudflare-saas',
+				null
 			);
 		}
 
@@ -101,7 +105,8 @@ final class CloudflareValidationPlan {
 						'provider_record_malformed',
 						'Cloudflare returned an incomplete ownership record.',
 						'Re-read the custom hostname; if it persists, recreate it.',
-						'cloudflare-saas'
+						'cloudflare-saas',
+						'provider_ownership'
 					);
 				} else {
 					$dns['provider_ownership'] = array(
@@ -205,7 +210,8 @@ final class CloudflareValidationPlan {
 					'provider_record_malformed',
 					'Cloudflare returned a validation record in an unrecognised shape.',
 					'Re-read the custom hostname; if it persists, change the validation method.',
-					'cloudflare-saas'
+					'cloudflare-saas',
+					'ssl_validation'
 				);
 			}
 		}
@@ -256,7 +262,8 @@ final class CloudflareValidationPlan {
 				'apex_routing_unsupported',
 				'This apex domain has no supported routing mechanism: ' . $apex->reason,
 				'Move the zone to a provider with CNAME flattening, ALIAS, or ANAME, or configure attested Apex Proxying or BYOIP targets.',
-				'cloudflare-saas'
+				'cloudflare-saas',
+				'routing'
 			);
 		}
 

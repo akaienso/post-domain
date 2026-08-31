@@ -40,6 +40,7 @@ foreach ( $pd_options as $pd_option ) {
 // One option per mapping that was tested, so they are removed by pattern rather
 // than by name. Leaving them would outlive the tables they describe.
 \PostDomain\Admin\OriginConfirmation::forget_all();
+\PostDomain\Admin\OriginChallenge::forget_all();
 
 $pd_hooks = array(
 	'pd_verify_pending',
