@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.0.2](https://github.com/akaienso/post-domain/compare/v1.0.1...v1.0.2) (2026-08-31)
+
+
+### Bug Fixes
+
+* **admin:** guide domain setup and testing ([#7](https://github.com/akaienso/post-domain/issues/7)) ([4f9920f](https://github.com/akaienso/post-domain/commit/4f9920f4566a2e024625eeee27ecb16caa08484c))
+
 ## [1.0.1](https://github.com/akaienso/post-domain/compare/v1.0.0...v1.0.1) (2026-08-30)
 
 
