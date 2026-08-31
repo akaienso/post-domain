@@ -20,6 +20,11 @@ final class Wiring {
 		// exist only where an operator can see them.
 		if ( is_admin() ) {
 			SettingsPage::register();
+
+			// Both answer admin-ajax, which is an admin surface even though the
+			// request does not render a screen.
+			TargetSearch::register();
+			OriginProbe::register();
 		}
 
 		// The probe page is served on a MAPPED host, never in the admin, so it

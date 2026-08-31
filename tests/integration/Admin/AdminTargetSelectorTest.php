@@ -6,6 +6,7 @@ namespace PostDomain\Tests\Integration\Admin;
 use PostDomain\Admin\Actions;
 use PostDomain\Admin\RedirectedAway;
 use PostDomain\Admin\Screen;
+use PostDomain\Admin\TargetSearch;
 use PostDomain\Admin\SettingsPage;
 use PostDomain\Application\MappingCommands;
 use PostDomain\Mapping\DbRepository;
@@ -90,15 +91,12 @@ final class AdminTargetSelectorTest extends OwnedSessionTestCase {
 	public function test_a_target_beyond_the_old_cutoff_can_be_found_and_submitted(): void {
 		$needle = $this->seed_many();
 
-		// Searching is how an operator reaches it; the page never renders them all.
-		$html = $this->page(
-			array(
-				'page'        => SettingsPage::SLUG,
-				'pd_target_q' => 'Zebra pavilion',
-			)
-		);
+		// The page never renders them all; the combobox reaches the rest through
+		// the same bounded server-side search the operator types into.
+		$hits = TargetSearch::results( 'Zebra pavilion' );
+		$ids  = array_column( $hits, 'id' );
 
-		$this->assertStringContainsString( 'value="' . $needle . '"', $html );
+		$this->assertContains( $needle, $ids, 'a target past the old cutoff must be findable' );
 
 		$_SERVER['REQUEST_METHOD'] = 'POST';
 		$_POST                     = array(
@@ -139,91 +137,10 @@ final class AdminTargetSelectorTest extends OwnedSessionTestCase {
 		);
 	}
 
-	public function test_truncation_is_stated_rather_than_silent(): void {
-		$this->seed_many();
 
-		$html = $this->page( array( 'page' => SettingsPage::SLUG ) );
 
-		$this->assertStringContainsString( 'Showing', $html );
-		$this->assertStringContainsString( 'Next', $html, 'the operator must be able to reach the rest' );
-	}
 
-	public function test_paging_reaches_content_the_first_page_omits(): void {
-		$this->seed_many();
 
-		$first  = $this->page( array( 'page' => SettingsPage::SLUG ) );
-		$second = $this->page(
-			array(
-				'page'           => SettingsPage::SLUG,
-				'pd_target_page' => '2',
-			)
-		);
-
-		preg_match_all( '/<option value="(\d+)"/', $first, $a );
-		preg_match_all( '/<option value="(\d+)"/', $second, $b );
-
-		$this->assertNotEmpty( $b[1] );
-		$this->assertSame(
-			array(),
-			array_intersect( $a[1], $b[1] ),
-			'the second page must show different content, not the same window again'
-		);
-	}
-
-	public function test_a_search_with_no_matches_says_so(): void {
-		$this->seed_many();
-
-		$html = $this->page(
-			array(
-				'page'        => SettingsPage::SLUG,
-				'pd_target_q' => 'nothing matches this string at all',
-			)
-		);
-
-		$this->assertStringContainsString( 'Nothing matched that search', $html );
-		$this->assertStringNotContainsString( '<select name="pd_post_id"', $html );
-	}
-
-	public function test_the_selector_works_without_javascript(): void {
-		$this->seed_many();
-
-		$html = $this->page( array( 'page' => SettingsPage::SLUG ) );
-
-		$this->assertStringNotContainsString( '<script', $html, 'no JavaScript-only path' );
-		$this->assertMatchesRegularExpression( '/<form[^>]*method="get"/', $html, 'search is a plain GET form' );
-		$this->assertStringContainsString( 'aria-describedby="pd_post_id_help"', $html );
-		$this->assertStringContainsString( '<label for="pd_post_id">', $html );
-		$this->assertStringContainsString( '<label for="pd_target_q">', $html );
-	}
-
-	public function test_every_declared_post_type_is_searchable(): void {
-		register_post_type(
-			'pd_venue',
-			array(
-				'public' => true,
-				'label'  => 'Venue',
-			)
-		);
-
-		$venue = self::factory()->post->create(
-			array(
-				'post_type'   => 'pd_venue',
-				'post_status' => 'publish',
-				'post_title'  => 'Aardvark hall',
-			)
-		);
-
-		$html = $this->page(
-			array(
-				'page'        => SettingsPage::SLUG,
-				'pd_target_q' => 'Aardvark hall',
-			)
-		);
-
-		$this->assertStringContainsString( 'value="' . $venue . '"', $html );
-
-		unregister_post_type( 'pd_venue' );
-	}
 
 	// -- server-side validation ---------------------------------------------
 
@@ -302,6 +219,84 @@ final class AdminTargetSelectorTest extends OwnedSessionTestCase {
 		);
 
 		unset( $ids );
+	}
+
+	public function test_the_control_says_how_much_it_is_showing(): void {
+		$this->seed_many();
+
+		$html = $this->page( array( 'page' => SettingsPage::SLUG ) );
+
+		$this->assertStringContainsString( 'Showing the most recent', $html );
+		$this->assertStringContainsString( 'Type to search the rest', $html );
+	}
+
+	public function test_there_is_one_content_control_and_no_separate_search_form(): void {
+		$this->seed_many();
+
+		$html = $this->page( array( 'page' => SettingsPage::SLUG ) );
+
+		$this->assertStringNotContainsString( 'pd_target_q', $html, 'no separate search field' );
+		$this->assertStringNotContainsString( 'value="Search"', $html, 'no separate Search button' );
+		$this->assertStringNotContainsString( 'pd_target_page', $html, 'no paging links beside the control' );
+		$this->assertSame( 1, substr_count( $html, 'name="pd_post_id"' ), 'exactly one content control' );
+	}
+
+	public function test_the_control_works_with_no_javascript(): void {
+		$this->seed_many();
+
+		$html = $this->page( array( 'page' => SettingsPage::SLUG ) );
+
+		// A real select that submits on its own; the script upgrades it in place.
+		$this->assertMatchesRegularExpression( '/<select[^>]*name="pd_post_id"/', $html );
+		$this->assertStringContainsString( '<label for="pd_post_id">', $html );
+		$this->assertStringContainsString( 'aria-describedby="pd_post_id_help"', $html );
+		$this->assertStringNotContainsString( '<script', $html );
+	}
+
+	public function test_the_search_endpoint_is_bounded_and_covers_every_declared_type(): void {
+		register_post_type(
+			'pd_venue',
+			array(
+				'public' => true,
+				'label'  => 'Venue',
+			)
+		);
+
+		self::factory()->post->create(
+			array(
+				'post_type'   => 'pd_venue',
+				'post_status' => 'publish',
+				'post_title'  => 'Aardvark hall',
+			)
+		);
+
+		$hits = TargetSearch::results( 'Aardvark hall' );
+
+		$this->assertNotEmpty( $hits );
+		$this->assertSame( 'Aardvark hall', $hits[0]['title'] );
+		$this->assertSame( 'Venue', $hits[0]['type'] );
+
+		$this->seed_many();
+
+		$this->assertLessThanOrEqual(
+			TargetSearch::LIMIT,
+			count( TargetSearch::results( '' ) ),
+			'the endpoint never returns an unbounded page'
+		);
+
+		unregister_post_type( 'pd_venue' );
+	}
+
+	public function test_the_search_endpoint_never_returns_unreadable_content(): void {
+		$this->seed_unreadable_block();
+
+		wp_set_current_user( $this->manager_who_cannot_read_private() );
+
+		foreach ( TargetSearch::results( 'Confidential dossier' ) as $hit ) {
+			$this->fail( 'the search returned content this operator cannot read: ' . $hit['title'] );
+		}
+
+		$this->assertTrue( true, 'no unreadable content was returned' );
 	}
 
 	// -- authorization belongs in the query, not after it ---------------------

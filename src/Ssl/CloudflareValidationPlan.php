@@ -6,21 +6,77 @@ namespace PostDomain\Ssl;
 final class CloudflareValidationPlan {
 
 	/**
-	 * @param array<string, mixed> $payload The custom hostname payload.
+	 * @param ProviderRead $read The typed outcome of the provider read. The raw
+	 *                           payload is never passed on its own: an empty one
+	 *                           used to mean absence, failure, an unreadable body
+	 *                           and an anomalous 404 all at once, and collapsing
+	 *                           those hid required records and real blockers.
+	 * @param string       $host The normalised mapped hostname. Routing records
+	 *                           name this host, so it is passed in rather than
+	 *                           derived: the challenge label in $core_record_name
+	 *                           is filterable and is not a hostname.
 	 */
 	public static function build(
-		array $payload,
+		ProviderRead $read,
 		string $cname_target,
 		ApexCapability $apex,
 		bool $is_apex,
 		string $core_record_name,
-		string $core_record_value
+		string $core_record_value,
+		string $host = ''
 	): ValidationPlan {
+		$payload  = $read->payload;
 		$dns      = array();
 		$http     = array();
 		$manual   = array();
 		$pending  = array();
 		$blockers = array();
+
+		if ( '' === $host ) {
+			$host = (string) ( $payload['hostname'] ?? '' );
+		}
+
+		/**
+		 * Only a confirmed absence against an unbound row means "nothing is
+		 * outstanding". That is what keeps the false "Awaiting provider" notice
+		 * off a revoked mapping. Every other non-present outcome is a failure to
+		 * learn anything, and a failure to learn is reported, never silently
+		 * rendered as an empty plan.
+		 */
+		$resource_exists = ProviderReadState::PRESENT === $read->state;
+
+		if ( ProviderReadState::TRANSIENT === $read->state ) {
+			$blockers[] = new DnsBlocker(
+				'provider_read_unavailable',
+				'The certificate provider could not be reached, so any outstanding records are unknown.',
+				'This is usually temporary. Re-check shortly; if it persists, verify the provider credentials and the provider\'s own status.',
+				'cloudflare-saas',
+				// Global: the read failed, so nothing is known about any phase.
+				null
+			);
+
+			$pending[] = new ValidationPending( 'provider_read', 'provider_unreachable', $read->retry_after );
+		}
+
+		if ( ProviderReadState::MALFORMED === $read->state ) {
+			$blockers[] = new DnsBlocker(
+				'provider_read_malformed',
+				'The certificate provider returned a response that could not be understood, so any outstanding records are unknown.',
+				'Re-check shortly; if it persists, verify the API token permissions and the configured zone.',
+				'cloudflare-saas',
+				null
+			);
+		}
+
+		if ( ProviderReadState::MISSING_BOUND === $read->state ) {
+			$blockers[] = new DnsBlocker(
+				'provider_resource_missing',
+				'A certificate resource is recorded for this mapping, but the provider reports that it does not exist.',
+				'Reconcile the mapping: clear the recorded provider reference and request the certificate again.',
+				'cloudflare-saas',
+				null
+			);
+		}
 
 		// Purpose 1: the plugin's own permanent challenge.
 		$dns['ownership'] = array(
@@ -38,7 +94,7 @@ final class CloudflareValidationPlan {
 		// Purpose 2: Cloudflare hostname ownership.
 		$hostname_status = (string) ( $payload['status'] ?? '' );
 
-		if ( 'active' !== $hostname_status ) {
+		if ( $resource_exists && 'active' !== $hostname_status ) {
 			$ownership = $payload['ownership_verification'] ?? null;
 			$http_own  = $payload['ownership_verification_http'] ?? null;
 			$found     = false;
@@ -49,7 +105,8 @@ final class CloudflareValidationPlan {
 						'provider_record_malformed',
 						'Cloudflare returned an incomplete ownership record.',
 						'Re-read the custom hostname; if it persists, recreate it.',
-						'cloudflare-saas'
+						'cloudflare-saas',
+						'provider_ownership'
 					);
 				} else {
 					$dns['provider_ownership'] = array(
@@ -98,7 +155,7 @@ final class CloudflareValidationPlan {
 		$ssl_status = (string) ( $ssl['status'] ?? '' );
 		$records    = is_array( $ssl['validation_records'] ?? null ) ? $ssl['validation_records'] : array();
 
-		if ( 'active' !== $ssl_status ) {
+		if ( $resource_exists && 'active' !== $ssl_status ) {
 			if ( array() === $records ) {
 				$pending[] = new ValidationPending( 'ssl_validation', 'provider_records_not_yet_issued' );
 			}
@@ -153,7 +210,8 @@ final class CloudflareValidationPlan {
 					'provider_record_malformed',
 					'Cloudflare returned a validation record in an unrecognised shape.',
 					'Re-read the custom hostname; if it persists, change the validation method.',
-					'cloudflare-saas'
+					'cloudflare-saas',
+					'ssl_validation'
 				);
 			}
 		}
@@ -165,7 +223,7 @@ final class CloudflareValidationPlan {
 					'routing',
 					'routing-cname',
 					'Point the hostname at the SaaS target',
-					array( new DnsRecordSpec( 'CNAME', 'mapped host', $cname_target ) ),
+					array( new DnsRecordSpec( 'CNAME', $host, $cname_target ) ),
 					false,
 					'cloudflare-saas'
 				),
@@ -179,7 +237,7 @@ final class CloudflareValidationPlan {
 					array_map(
 						static fn( string $ip ): DnsRecordSpec => new DnsRecordSpec(
 							false === filter_var( $ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6 ) ? 'A' : 'AAAA',
-							'mapped host',
+							$host,
 							$ip
 						),
 						$apex->targets
@@ -194,7 +252,7 @@ final class CloudflareValidationPlan {
 					'routing',
 					'routing-apex-cname',
 					'Point the apex at the SaaS target (flattened)',
-					array( new DnsRecordSpec( 'CNAME', 'mapped host', $cname_target ) ),
+					array( new DnsRecordSpec( 'CNAME', $host, $cname_target ) ),
 					true,
 					'cloudflare-saas'
 				),
@@ -204,7 +262,8 @@ final class CloudflareValidationPlan {
 				'apex_routing_unsupported',
 				'This apex domain has no supported routing mechanism: ' . $apex->reason,
 				'Move the zone to a provider with CNAME flattening, ALIAS, or ANAME, or configure attested Apex Proxying or BYOIP targets.',
-				'cloudflare-saas'
+				'cloudflare-saas',
+				'routing'
 			);
 		}
 

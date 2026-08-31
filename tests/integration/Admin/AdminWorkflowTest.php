@@ -210,7 +210,7 @@ final class AdminWorkflowTest extends OwnedSessionTestCase {
 		$this->assertStringContainsString( 'Not verified yet', $html );
 		$this->assertStringContainsString( 'Not serving', $html );
 		$this->assertStringContainsString( 'No certificate', $html );
-		$this->assertStringContainsString( 'Publish the TXT record below', $html );
+		$this->assertStringContainsString( 'Publish the ownership TXT record shown below', $html );
 
 		// The technical name stays available, but not as the explanation.
 		$this->assertLessThan(
@@ -225,7 +225,7 @@ final class AdminWorkflowTest extends OwnedSessionTestCase {
 
 		$html = $this->page( $mapping->id );
 
-		$this->assertStringContainsString( 'DNS records to publish', $html );
+		$this->assertStringContainsString( 'DNS records', $html );
 		$this->assertStringContainsString( '_post-domain-challenge.' . $mapping->host, $html );
 		$this->assertStringContainsString( 'post-domain-verify=', $html );
 	}

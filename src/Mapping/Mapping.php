@@ -40,7 +40,14 @@ final class Mapping {
 		public readonly ?string $ssl_checked_at = null,
 		public readonly ?string $deletion_requested_at = null,
 		public readonly int $deletion_attempts = 0,
-		public readonly ?string $ssl_removal_scope = null
+		public readonly ?string $ssl_removal_scope = null,
+		// Read-only for the admin: what the verification sweep last observed and
+		// when it will look again. The screen tells an operator when something
+		// will happen next, and it must read that from the state the server acts
+		// on rather than restating a schedule from memory.
+		public readonly ?string $last_checked_at = null,
+		public readonly ?string $verify_next_attempt_at = null,
+		public readonly ?string $verified_at = null
 	) {}
 
 	/**
@@ -79,7 +86,10 @@ final class Mapping {
 			$row['ssl_checked_at'],
 			$row['deletion_requested_at'],
 			(int) ( $row['deletion_attempts'] ?? 0 ),
-			$row['ssl_removal_scope'] ?? null
+			$row['ssl_removal_scope'] ?? null,
+			$row['last_checked_at'] ?? null,
+			$row['verify_next_attempt_at'] ?? null,
+			$row['verified_at'] ?? null
 		);
 	}
 

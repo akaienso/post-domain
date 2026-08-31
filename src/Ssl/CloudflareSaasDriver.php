@@ -242,20 +242,27 @@ final class CloudflareSaasDriver implements SslDriver {
 	}
 
 	public function validation_plan( SslResourceContext $ctx, ?object $apex ): ValidationPlan {
-		/** @var array<string, mixed> $payload */
-		$payload = $this->get_hostname( $ctx )['payload'] ?? array();
+		$response = $this->get_hostname( $ctx );
+
+		// The HTTP outcome is classified, never discarded. An empty payload alone
+		// cannot tell a confirmed absence from a rate limit, a timeout, an
+		// unreadable body or a 404 against a resource we have a reference for.
+		$read = ProviderRead::classify( $response['response'], $response['payload'], null !== $ctx->provider_ref );
 
 		$capability = $apex instanceof ApexCapability
 			? $apex
 			: ApexCapability::validated( apply_filters( 'pd_apex_capability', $this->derive_apex(), $ctx->host, null ) );
 
 		return CloudflareValidationPlan::build(
-			$payload,
+			$read,
 			$this->cname_target,
 			$capability,
 			PublicSuffix::is_apex( $ctx->host ),
 			$ctx->challenge_name,
-			$ctx->challenge_value
+			$ctx->challenge_value,
+			// The routing record names the real hostname. The challenge name
+			// cannot stand in for it: its label is filterable.
+			$ctx->host
 		);
 	}
 

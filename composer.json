@@ -46,6 +46,8 @@
         "analyse": "phpstan analyse --memory-limit=1G",
         "lint:plans": "php bin/check-plan-examples.php",
         "test:integration:wp-env": "wp-env run tests-cli --env-cwd=wp-content/plugins/post-domain vendor/bin/phpunit -c phpunit-integration.xml.dist",
-        "generate:status-map": "php bin/generate-cloudflare-status-map.php"
+        "generate:status-map": "php bin/generate-cloudflare-status-map.php",
+        "lint:js": "bin/lint-js.sh",
+        "test:js": "npm run test:js"
     }
 }

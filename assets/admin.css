@@ -1,0 +1,597 @@
+/**
+ * Domain mappings screen.
+ *
+ * Loaded only on `settings_page_post-domain`, and scoped twice over: every rule
+ * is written under one of the plugin's own `pd-` classes, or under the
+ * `.settings_page_post-domain` body class WordPress puts on this screen alone.
+ * Nothing here can reach another plugin's admin page, and nothing styles a bare
+ * `table`, `button`, `input`, `.wrap`, `.widefat` or `.button`.
+ *
+ * Colours lean on the admin colour scheme's own custom properties where they
+ * exist, with a literal fallback for the installs (and the older admin colour
+ * schemes) that do not define them.
+ */
+
+.settings_page_post-domain {
+	/* The accent WordPress itself uses for focus and primary buttons. */
+	--pd-accent: var( --wp-admin-theme-color, #2271b1 );
+	--pd-accent-dark: var( --wp-admin-theme-color-darker-20, #135e96 );
+	--pd-border: #c3c4c7;
+	--pd-border-soft: #dcdcde;
+	--pd-surface: #f6f7f7;
+	--pd-surface-raised: #fff;
+	--pd-text: #1d2327;
+	--pd-text-muted: #50575e;
+	--pd-good: #007017;
+	--pd-warn: #8a6116;
+	--pd-bad: #b32d2e;
+	--pd-radius: 4px;
+	--pd-gap: 0.75rem;
+	--pd-mono: Menlo, Consolas, monaco, monospace;
+}
+
+/* ------------------------------------------------------------ copy blocks */
+
+/*
+ * A code block with its copy control in the upper right, the way a familiar one
+ * does it. The value keeps a right gutter the width of the button, so the two
+ * never overlap however narrowly the value wraps.
+ */
+.pd-copy {
+	position: relative;
+	display: block;
+	max-width: 100%;
+	padding: 0.5rem 2.5rem 0.5rem 0.6rem;
+	border: 1px solid var( --pd-border-soft );
+	border-radius: var( --pd-radius );
+	background: var( --pd-surface );
+}
+
+.pd-copy__value {
+	display: block;
+	padding: 0;
+	background: none;
+	color: var( --pd-text );
+	font-family: var( --pd-mono );
+	font-size: 12px;
+	line-height: 1.5;
+	/* Long hostnames and TXT values must wrap rather than widen the table. */
+	overflow-wrap: anywhere;
+	word-break: break-word;
+	/* The value is meant to be dragged over and copied by hand. */
+	user-select: text;
+}
+
+.pd-copy__button {
+	position: absolute;
+	top: 0.25rem;
+	right: 0.25rem;
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	width: 28px;
+	height: 28px;
+	padding: 0;
+	border: 1px solid transparent;
+	border-radius: var( --pd-radius );
+	background: var( --pd-surface-raised );
+	color: var( --pd-text-muted );
+	line-height: 1;
+	text-decoration: none;
+	cursor: pointer;
+	transition: background-color 0.15s ease, color 0.15s ease;
+}
+
+.pd-copy__button:hover,
+.pd-copy__button:focus {
+	border-color: var( --pd-border );
+	background: var( --pd-surface-raised );
+	color: var( --pd-accent-dark );
+}
+
+.pd-copy__button:focus-visible {
+	outline: 2px solid var( --pd-accent );
+	outline-offset: 1px;
+}
+
+.pd-copy__button .dashicons {
+	width: 18px;
+	height: 18px;
+	font-size: 18px;
+}
+
+/*
+ * Both the "Copied" confirmation and the "press Ctrl/Cmd+C" fallback land here.
+ * It is a live region that is empty most of the time; an empty badge would
+ * otherwise leave a stray outline under every value.
+ */
+.pd-copy__status {
+	display: block;
+	margin-top: 0.35rem;
+	color: var( --pd-good );
+	font-size: 11px;
+	font-weight: 600;
+	line-height: 1.4;
+}
+
+.pd-copy__status:empty {
+	display: none;
+}
+
+/* --------------------------------------------------------- target search */
+
+.pd-combobox {
+	position: relative;
+	max-width: 32rem;
+}
+
+/*
+ * The input is created by admin.js inside this container; there is no input at
+ * all without script, so this selector cannot catch anything else.
+ */
+.pd-combobox input[role="combobox"] {
+	width: 100%;
+	box-sizing: border-box;
+}
+
+.pd-combobox input[role="combobox"]:focus-visible {
+	outline: 2px solid var( --pd-accent );
+	outline-offset: 0;
+}
+
+.pd-combobox__list {
+	position: absolute;
+	z-index: 100;
+	right: 0;
+	left: 0;
+	max-height: 16rem;
+	margin: 2px 0 0;
+	padding: 0;
+	overflow-y: auto;
+	border: 1px solid var( --pd-border );
+	border-radius: var( --pd-radius );
+	background: var( --pd-surface-raised );
+	box-shadow: 0 2px 8px rgba( 0, 0, 0, 0.12 );
+	list-style: none;
+}
+
+/*
+ * Written as :not([hidden]) rather than a plain `display`, so the script's
+ * `list.hidden = true` keeps working — a bare display rule would defeat it.
+ */
+.pd-combobox__list:not( [hidden] ) {
+	display: block;
+}
+
+.pd-combobox__list [role="option"] {
+	margin: 0;
+	padding: 0.45rem 0.6rem;
+	border-bottom: 1px solid var( --pd-border-soft );
+	color: var( --pd-text );
+	line-height: 1.4;
+	cursor: pointer;
+}
+
+.pd-combobox__list [role="option"]:last-child {
+	border-bottom: 0;
+}
+
+.pd-combobox__list [role="option"]:hover {
+	background: var( --pd-surface );
+}
+
+/* The keyboard-active option. Not colour alone: it also carries a left rule. */
+.pd-combobox__list [role="option"][aria-selected="true"] {
+	box-shadow: inset 3px 0 0 var( --pd-accent );
+	background: var( --pd-surface );
+	font-weight: 600;
+}
+
+.pd-combobox__list [role="option"]:focus-visible {
+	outline: 2px solid var( --pd-accent );
+	outline-offset: -2px;
+}
+
+/*
+ * Searching, "nothing matched", and "that search could not be completed" all
+ * arrive as text in this one live region — admin.js sets no state class and is
+ * owned by another track, so the three share one treatment rather than being
+ * split by a selector that does not exist. If a `data-state` is added there
+ * later, the loading and error variants can be separated here.
+ */
+.pd-combobox__status {
+	margin: 0.4rem 0 0;
+	padding: 0.3rem 0.5rem;
+	border-left: 3px solid var( --pd-border );
+	background: var( --pd-surface );
+	color: var( --pd-text-muted );
+	font-size: 12px;
+	font-style: italic;
+	line-height: 1.5;
+}
+
+.pd-combobox__status:empty {
+	display: none;
+}
+
+/*
+ * The original <select> stays in the DOM as the field that submits. admin.js
+ * hides it with inline styles; this only makes sure nothing here re-exposes it.
+ */
+.pd-combobox__native {
+	pointer-events: none;
+}
+
+/* ------------------------------------------------------- workflow steps */
+
+.pd-steps {
+	margin: 0.5rem 0 1.5rem;
+	padding: 0;
+	list-style: none;
+	counter-reset: pd-step;
+}
+
+.pd-step {
+	position: relative;
+	margin: 0 0 0.5rem;
+	padding: 0.75rem 1rem;
+	border: 1px solid var( --pd-border-soft );
+	border-left-width: 4px;
+	border-radius: var( --pd-radius );
+	background: var( --pd-surface-raised );
+}
+
+.pd-step > p {
+	margin: 0 0 0.35rem;
+}
+
+.pd-step > p:last-child {
+	margin-bottom: 0;
+}
+
+/*
+ * The status word is already in the markup, so it reads as a badge rather than
+ * being replaced by a colour. Each status also differs in border weight or
+ * style, so the seven are still distinguishable without colour.
+ */
+.pd-step__status {
+	display: inline-block;
+	margin-left: 0.35rem;
+	padding: 0.05rem 0.5rem;
+	border: 1px solid var( --pd-border );
+	border-radius: 999px;
+	background: var( --pd-surface );
+	color: var( --pd-text-muted );
+	font-size: 11px;
+	font-weight: 600;
+	line-height: 1.7;
+	text-transform: uppercase;
+	letter-spacing: 0.02em;
+	white-space: nowrap;
+}
+
+.pd-step--done {
+	border-left-color: var( --pd-good );
+}
+
+.pd-step--done .pd-step__status {
+	border-color: var( --pd-good );
+	color: var( --pd-good );
+}
+
+.pd-step--current {
+	border-left-color: var( --pd-accent );
+	background: var( --pd-surface );
+}
+
+.pd-step--current .pd-step__status {
+	border-color: var( --pd-accent );
+	background: var( --pd-accent );
+	color: #fff;
+}
+
+.pd-step--waiting {
+	border-left-color: var( --pd-warn );
+	border-left-style: dashed;
+}
+
+.pd-step--waiting .pd-step__status {
+	border-style: dashed;
+	border-color: var( --pd-warn );
+	color: var( --pd-warn );
+}
+
+.pd-step--blocked {
+	border-left-color: var( --pd-bad );
+	border-left-style: double;
+	border-left-width: 6px;
+}
+
+.pd-step--blocked .pd-step__status {
+	border-color: var( --pd-bad );
+	color: var( --pd-bad );
+}
+
+.pd-step--failed {
+	border-left-color: var( --pd-bad );
+}
+
+.pd-step--failed .pd-step__status {
+	border-width: 2px;
+	border-color: var( --pd-bad );
+	background: var( --pd-bad );
+	color: #fff;
+}
+
+.pd-step--upcoming {
+	border-left-color: var( --pd-border-soft );
+	background: var( --pd-surface );
+	color: var( --pd-text-muted );
+}
+
+.pd-step--upcoming .pd-step__status {
+	border-color: var( --pd-border-soft );
+	color: var( --pd-text-muted );
+}
+
+.pd-step--unconfirmed {
+	border-left-color: var( --pd-warn );
+	border-left-style: dotted;
+}
+
+.pd-step--unconfirmed .pd-step__status {
+	border-style: dotted;
+	border-width: 2px;
+	border-color: var( --pd-warn );
+	color: var( --pd-warn );
+}
+
+.pd-step button:focus-visible,
+.pd-step a:focus-visible {
+	outline: 2px solid var( --pd-accent );
+	outline-offset: 1px;
+}
+
+/* The rate-limit countdown inside a disabled "Check verification" button. */
+.pd-countdown {
+	font-variant-numeric: tabular-nums;
+	font-weight: 600;
+}
+
+.pd-countdown:empty {
+	display: none;
+}
+
+/* ---------------------------------------------------------- origin test */
+
+.pd-origin-test {
+	margin: 0.5rem 0 0;
+	padding: 0.6rem 0.75rem;
+	border: 1px dashed var( --pd-border );
+	border-radius: var( --pd-radius );
+	background: var( --pd-surface );
+}
+
+.pd-origin-test > p {
+	margin: 0 0 0.4rem;
+}
+
+.pd-origin-test > p:last-child {
+	margin-bottom: 0;
+}
+
+.pd-origin-test button:focus-visible {
+	outline: 2px solid var( --pd-accent );
+	outline-offset: 1px;
+}
+
+.pd-origin-test__result {
+	color: var( --pd-text-muted );
+	font-size: 13px;
+	line-height: 1.5;
+}
+
+.pd-origin-test__result:empty {
+	display: none;
+}
+
+/* ------------------------------------------------- DNS record annotations */
+
+.pd-permanent,
+.pd-removable,
+.pd-provider-controlled,
+.pd-blocker {
+	margin: 0.5rem 0;
+	padding: 0.5rem 0.75rem;
+	border-left: 4px solid var( --pd-border );
+	border-radius: 0 var( --pd-radius ) var( --pd-radius ) 0;
+	background: var( --pd-surface );
+	font-size: 13px;
+	line-height: 1.6;
+}
+
+.pd-permanent {
+	border-left-color: var( --pd-good );
+}
+
+.pd-removable {
+	border-left-style: dashed;
+	border-left-color: var( --pd-warn );
+}
+
+.pd-provider-controlled {
+	border-left-style: dotted;
+	border-left-color: var( --pd-accent );
+}
+
+.pd-blocker {
+	border-left-color: var( --pd-bad );
+	color: var( --pd-text );
+}
+
+/* ----------------------------------------------------- deletion checklist */
+
+.pd-deletion-checklist {
+	margin: 0.5rem 0;
+	padding: 0;
+	list-style: none;
+}
+
+.pd-deletion-checklist li {
+	margin: 0;
+	padding: 0.3rem 0.5rem;
+	border-left: 3px solid var( --pd-border );
+	line-height: 1.6;
+}
+
+.pd-check-passed {
+	border-left-color: var( --pd-good );
+}
+
+.pd-check-failed {
+	border-left-style: dotted;
+	border-left-color: var( --pd-bad );
+	font-weight: 600;
+}
+
+/* ------------------------------------------------------------ setup guide */
+
+.pd-guide {
+	margin-top: 1.5rem;
+}
+
+.pd-guide-section {
+	padding: 0.4rem 0.6rem;
+	border: 1px solid var( --pd-border-soft );
+	border-radius: var( --pd-radius );
+	background: var( --pd-surface-raised );
+}
+
+.pd-guide-section[open] {
+	background: var( --pd-surface );
+}
+
+.pd-guide-section > summary:focus-visible {
+	outline: 2px solid var( --pd-accent );
+	outline-offset: 2px;
+}
+
+.pd-guide-section > summary::marker {
+	color: var( --pd-text-muted );
+}
+
+/* --------------------------------------------------- manage / danger zone */
+
+.pd-actions {
+	margin: 0.5rem 0 1rem;
+	align-items: center;
+}
+
+.pd-actions form {
+	margin: 0;
+}
+
+.pd-actions button:focus-visible,
+.pd-actions a:focus-visible {
+	outline: 2px solid var( --pd-accent );
+	outline-offset: 1px;
+}
+
+/*
+ * "Danger zone" is an <h3> with its explanation and its own .pd-actions as
+ * following siblings, so the separation is drawn as a rule above the heading
+ * and an accent down the destructive controls. Only the .pd-actions after the
+ * heading is matched — the Manage one precedes it.
+ */
+.pd-danger {
+	margin-top: 2rem;
+	padding-top: 1rem;
+	border-top: 1px solid var( --pd-border );
+	color: var( --pd-bad );
+}
+
+.pd-danger ~ .pd-actions {
+	padding: 0.6rem 0.75rem;
+	border: 1px solid var( --pd-bad );
+	border-radius: var( --pd-radius );
+	background: #fcf0f1;
+}
+
+/* The plugin's own variant class — `button-delete` is not a core admin class. */
+.pd-actions .button-delete {
+	border-color: var( --pd-bad );
+	background: var( --pd-surface-raised );
+	color: var( --pd-bad );
+}
+
+.pd-actions .button-delete:hover,
+.pd-actions .button-delete:focus {
+	border-color: var( --pd-bad );
+	background: var( --pd-bad );
+	color: #fff;
+}
+
+/* ------------------------------------------------------ mapped domains */
+
+/*
+ * Scoped to the body class WordPress gives this screen and no other, because
+ * Screen::list_table() renders a plain `.widefat` this stylesheet cannot add a
+ * class to. Everything on this screen is the plugin's own markup.
+ */
+.settings_page_post-domain .widefat td {
+	vertical-align: top;
+}
+
+.settings_page_post-domain .widefat td .pd-copy {
+	min-width: 12rem;
+}
+
+.settings_page_post-domain .widefat .button-small {
+	margin: 0 0.25rem 0.25rem 0;
+}
+
+.settings_page_post-domain .widefat .button-small:focus-visible {
+	outline: 2px solid var( --pd-accent );
+	outline-offset: 1px;
+}
+
+@media screen and ( max-width: 782px ) {
+
+	.settings_page_post-domain .widefat td,
+	.settings_page_post-domain .widefat th {
+		padding: 0.5rem 0.4rem;
+		overflow-wrap: anywhere;
+	}
+
+	.settings_page_post-domain .widefat td .pd-copy {
+		min-width: 0;
+	}
+
+	/* Stacked, full-width action controls are the reachable ones on a phone. */
+	.settings_page_post-domain .widefat .button-small {
+		display: block;
+		margin-right: 0;
+		text-align: center;
+	}
+
+	.pd-combobox {
+		max-width: none;
+	}
+
+	.pd-step {
+		padding: 0.6rem 0.7rem;
+	}
+
+	.pd-step__status {
+		display: inline-block;
+		margin-top: 0.25rem;
+		margin-left: 0;
+	}
+}
+
+@media ( prefers-reduced-motion: reduce ) {
+
+	.pd-copy__button {
+		transition: none;
+	}
+}
