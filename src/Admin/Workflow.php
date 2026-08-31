@@ -3,6 +3,7 @@ declare( strict_types = 1 );
 
 namespace PostDomain\Admin;
 
+use PostDomain\Hosting\HostingState;
 use PostDomain\Mapping\ActivationState;
 use PostDomain\Mapping\Mapping;
 use PostDomain\Mapping\SslState;
@@ -62,17 +63,28 @@ final class Workflow {
 		// mapped name, so that is what settles it.
 		$reached = null !== self::origin_confirmed_at( $mapping );
 
+		// The hosting half of the same question. A routing record that resolves
+		// still produces the host's placeholder page when the origin was never
+		// told to answer for this name, so a provider that did not confirm the
+		// attachment holds this step open however good the DNS is.
+		$hosting = HostingState::of( $mapping->hosting_state );
+		$origin  = null === $hosting || $hosting->is_settled_ok();
+
 		$steps[] = new Step(
 			2,
 			__( 'Point the domain at this site', 'post-domain' ),
 			match ( true ) {
-				! $verified => Step::UPCOMING,
-				$reached    => Step::DONE,
-				default     => Step::CURRENT,
+				! $verified                                            => Step::UPCOMING,
+				! $origin && null !== $hosting && $hosting->is_outstanding() => Step::WAITING,
+				! $origin                                              => Step::FAILED,
+				$reached                                               => Step::DONE,
+				default                                                => Step::CURRENT,
 			},
-			$reached
-				? __( 'The domain reached this site, so the routing record is working. It stays for as long as the domain is mapped.', 'post-domain' )
-				: __( 'Publish the routing record shown below at your DNS provider. Nothing here can see that record, so this stays open until the final test succeeds.', 'post-domain' ),
+			match ( true ) {
+				! $origin => self::hosting_detail( null === $hosting ? '' : $hosting->value ),
+				$reached  => __( 'The domain reached this site, so the routing record is working. It stays for as long as the domain is mapped.', 'post-domain' ),
+				default   => __( 'Publish the routing record shown below at your DNS provider. Nothing here can see that record, so this stays open until the final test succeeds.', 'post-domain' ),
+			},
 			null,
 			null,
 			$verified ? null : __( 'Confirm ownership first.', 'post-domain' )
@@ -159,6 +171,18 @@ final class Workflow {
 		$steps[] = self::origin_step( $mapping, $has_certificate );
 
 		return $steps;
+	}
+
+	/** What the hosting provider's answer means for the routing step. */
+	private static function hosting_detail( string $state ): string {
+		return match ( HostingState::tryFrom( $state ) ) {
+			HostingState::RESERVED,
+			HostingState::AMBIGUOUS => __( 'Your hosting has not confirmed this domain yet. Post Domain is still checking and will not ask again. Until it confirms, the domain can resolve and still show your host\'s placeholder page.', 'post-domain' ),
+			HostingState::FOREIGN   => __( 'Your hosting reports this domain attached to a different site on the same account. Nothing was changed there. Detach it from that site, then delete and re-add this mapping.', 'post-domain' ),
+			HostingState::REFUSED   => __( 'Your hosting refused to accept this domain, so it will not reach this site. Check that the API token still works and has the Manage Sites ability, then delete and re-add this mapping.', 'post-domain' ),
+			HostingState::MANUAL_REVIEW => __( 'Your hosting never settled this domain after several checks. Look at it in your hosting console: the domain may or may not be attached there.', 'post-domain' ),
+			default                 => __( 'Your hosting has not accepted this domain.', 'post-domain' ),
+		};
 	}
 
 	/**
@@ -350,6 +374,15 @@ final class Workflow {
 			if ( Step::WAITING === $step->status ) {
 				return __( 'Waiting on the certificate provider.', 'post-domain' );
 			}
+		}
+
+		$hosting = HostingState::of( $mapping->hosting_state );
+
+		if ( null !== $hosting && ! $hosting->is_settled_ok() ) {
+			// Every local step is green and the origin still never accepted the
+			// hostname. Saying "set up and tested" here is the exact falsehood
+			// this workflow exists to prevent.
+			return __( 'Your hosting has not confirmed this domain, so it may not reach this site.', 'post-domain' );
 		}
 
 		return __( 'This domain is set up and tested.', 'post-domain' );

@@ -34,8 +34,13 @@ final class CommandResult {
 		return new self( true, $status, null, null, $mapping, $payload );
 	}
 
-	public static function refused( string $code, string $message, int $status ): self {
-		return new self( false, $status, $code, $message );
+	/**
+	 * @param Mapping|null $mapping The row that survives, when one does. A
+	 *                              hosting refusal leaves a durable mapping the
+	 *                              operator has to be able to reach.
+	 */
+	public static function refused( string $code, string $message, int $status, ?Mapping $mapping = null ): self {
+		return new self( false, $status, $code, $message, $mapping );
 	}
 
 	public function refused_as( string $code ): bool {

@@ -155,6 +155,37 @@ final class Guide {
 				),
 			),
 			array(
+				'id'     => 'hosting-provider',
+				'title'  => __( 'Hosting, certificates and DNS are three different things', 'post-domain' ),
+				'blocks' => array(
+					array(
+						'kind'  => 'p',
+						'items' => array(
+							__( 'They are easy to confuse because all three are, in some sense, "where the domain points". They can be three different companies, and this plugin never assumes otherwise.', 'post-domain' ),
+						),
+					),
+					array(
+						'kind'  => 'ul',
+						'items' => array(
+							__( 'Hosting, or origin: whatever finally serves your page. It has to recognise the mapped domain as one of its own names.', 'post-domain' ),
+							__( 'The certificate service: it issues the certificate and answers the secure connection.', 'post-domain' ),
+							__( 'Authoritative DNS: whoever answers questions about your domain. It can be anywhere, and it does not have to be the same account as anything else.', 'post-domain' ),
+						),
+					),
+					array(
+						'kind'  => 'p',
+						'items' => array(
+							__( 'If your site is on Wordify, Post Domain can tell Wordify about each mapped domain for you. That needs an API token you create in the Wordify console — the plugin has no credential of its own and never will. Give it exactly two abilities: Read Sites and Manage Sites. Both are needed — reading alone finds your site but cannot attach a domain to it. Do not give it full access. After saving it, choose Test connection and then pick which Wordify site this installation is; Post Domain reads that site back before it binds anything.', 'post-domain' ),
+							__( 'Until that connection is made and bound to one site, the Add a domain form is not shown. That is deliberate: a domain added without it would verify, get a certificate, and then show your host\'s placeholder page — a failure that looks like everything worked.', 'post-domain' ),
+							__( 'Post Domain never makes a mapped domain your primary domain, and never changes your main site\'s domain, WordPress address or site address.', 'post-domain' ),
+							__( 'If the token is later revoked you will not be able to add new domains until you replace it, and every domain already serving keeps serving. Disconnecting removes the plugin\'s permission to act — it detaches no domain and deletes no mapping.', 'post-domain' ),
+							__( 'The token is stored encrypted and never shown again; only the fact that one is configured. If you would rather it never touched the database, define PD_WORDIFY_TOKEN in wp-config.php instead, which takes precedence.', 'post-domain' ),
+							__( 'Hosted anywhere else? Choose "Manual or another host". No token is needed and no hosting API is contacted.', 'post-domain' ),
+						),
+					),
+				),
+			),
+			array(
 				'id'     => 'hosting-prerequisite',
 				'title'  => __( 'Before you begin: your hosting must accept the domain', 'post-domain' ),
 				'blocks' => array(

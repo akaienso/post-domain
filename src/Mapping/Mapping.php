@@ -47,7 +47,15 @@ final class Mapping {
 		// on rather than restating a schedule from memory.
 		public readonly ?string $last_checked_at = null,
 		public readonly ?string $verify_next_attempt_at = null,
-		public readonly ?string $verified_at = null
+		public readonly ?string $verified_at = null,
+		// The hosting/origin side of a mapping. Separate from the five SSL
+		// binding columns because it is a different account with a different
+		// credential: a site can have a certificate and still not be routed.
+		public readonly ?string $hosting_provider = null,
+		public readonly ?string $hosting_environment = null,
+		public readonly ?string $hosting_ref = null,
+		public readonly ?string $hosting_state = null,
+		public readonly ?string $hosting_registered_at = null
 	) {}
 
 	/**
@@ -89,7 +97,12 @@ final class Mapping {
 			$row['ssl_removal_scope'] ?? null,
 			$row['last_checked_at'] ?? null,
 			$row['verify_next_attempt_at'] ?? null,
-			$row['verified_at'] ?? null
+			$row['verified_at'] ?? null,
+			$row['hosting_provider'] ?? null,
+			$row['hosting_environment'] ?? null,
+			$row['hosting_ref'] ?? null,
+			$row['hosting_state'] ?? null,
+			$row['hosting_registered_at'] ?? null
 		);
 	}
 

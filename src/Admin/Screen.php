@@ -3,6 +3,11 @@ declare( strict_types = 1 );
 
 namespace PostDomain\Admin;
 
+use PostDomain\Hosting\HostingBinding;
+use PostDomain\Hosting\HostingDetection;
+use PostDomain\Hosting\HostingMessages;
+use PostDomain\Hosting\HostingReadiness;
+use PostDomain\Hosting\WordifyConnectionService;
 use PostDomain\Mapping\ActivationState;
 use PostDomain\Mapping\DbRepository;
 use PostDomain\Mapping\Mapping;
@@ -66,6 +71,7 @@ final class Screen {
 			return;
 		}
 
+		echo self::hosting_form(); // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped
 		echo self::driver_form(); // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped
 		echo self::add_form(); // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped
 		echo self::list_table(); // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped
@@ -202,7 +208,352 @@ final class Screen {
 		);
 	}
 
+	/**
+	 * The hosting provider, and what it still needs.
+	 *
+	 * Deliberately above the certificate provider: hosting is the layer that
+	 * finally answers with the page, and a domain set up without it verifies,
+	 * gets a certificate, and then serves the host's placeholder.
+	 */
+	public static function hosting_form(): string {
+		$detected  = HostingDetection::detect();
+		$selected  = HostingDetection::selected();
+		$binding   = HostingBinding::current();
+		$readiness = HostingReadiness::evaluate();
+
+		$html  = '<h2>' . esc_html__( 'Hosting provider', 'post-domain' ) . '</h2>';
+		$html .= '<p class="description">' . esc_html__(
+			'Three different things have to know about a mapped domain: your hosting, which finally serves the page; your certificate provider, which answers the secure connection; and your DNS provider, which points the name at them. They are set separately here and need not be the same company.',
+			'post-domain'
+		) . '</p>';
+
+		if ( array() !== $detected['signals'] && ! HostingDetection::is_chosen_explicitly() ) {
+			$html .= '<p class="description">' . esc_html(
+				HostingDetection::WORDIFY === $detected['provider']
+					? __( 'This looks like a Wordify site, so that path is selected below. Detection only chooses what to show you — it grants no access, and you can change it.', 'post-domain' )
+					: __( 'No hosting platform was detected, so the manual path is selected below. You can change it.', 'post-domain' )
+			) . '</p>';
+		}
+
+		$html .= self::form_open( 'pd_set_hosting' );
+		$html .= '<p><label for="pd_hosting_provider">' . esc_html__( 'Hosting', 'post-domain' ) . '</label><br>';
+		$html .= '<select name="pd_hosting_provider" id="pd_hosting_provider">';
+
+		foreach (
+			array(
+				HostingDetection::WORDIFY => __( 'Wordify', 'post-domain' ),
+				HostingDetection::MANUAL  => __( 'Manual or another host', 'post-domain' ),
+			) as $value => $label
+		) {
+			$html .= sprintf(
+				'<option value="%s"%s>%s</option>',
+				esc_attr( $value ),
+				selected( $selected, $value, false ),
+				esc_html( $label )
+			);
+		}
+
+		$html .= '</select> ';
+		$html .= get_submit_button( __( 'Save hosting', 'post-domain' ), 'secondary', 'submit', false );
+		$html .= '</form>';
+
+		if ( HostingDetection::WORDIFY === $selected ) {
+			$html .= self::wordify_connection( $binding );
+		} else {
+			$html .= '<p class="description">' . esc_html__(
+				'Manual hosting: you arrange for your web server to accept the mapped domain yourself. Post Domain will not contact a hosting API.',
+				'post-domain'
+			) . '</p>';
+		}
+
+		if ( ! $readiness->may_add_domains ) {
+			$html .= '<div class="notice notice-warning inline"><p><strong>'
+				. esc_html( (string) $readiness->blocker ) . '</strong><br>'
+				. esc_html( (string) $readiness->remedy ) . '</p></div>';
+		}
+
+		return $html;
+	}
+
+	/** The Wordify credential and binding, never showing the credential. */
+	private static function wordify_connection( HostingBinding $binding ): string {
+		$external = (bool) apply_filters( 'pd_hosting_credential_is_external', false );
+
+		$html = '<h3>' . esc_html__( 'Wordify connection', 'post-domain' ) . '</h3>';
+
+		if ( $binding->has_credential() ) {
+			// Never the token, and never anything reversible into it.
+			$html .= '<p>' . esc_html(
+				$external
+					? __( 'A Wordify token is configured in wp-config.php. It cannot be changed from here.', 'post-domain' )
+					: __( 'A Wordify token is saved. It is stored encrypted and is never shown again.', 'post-domain' )
+			) . '</p>';
+
+			if ( $binding->is_bound() ) {
+				$html .= '<p>' . sprintf(
+					/* translators: 1: Wordify team name, 2: Wordify site name. */
+					esc_html__( 'Connected to team %1$s, site %2$s.', 'post-domain' ),
+					'<strong>' . esc_html( (string) ( $binding->team_name ?? $binding->team_id ) ) . '</strong>',
+					'<strong>' . esc_html( (string) ( $binding->site_name ?? $binding->site_id ) ) . '</strong>'
+				) . '</p>';
+			}
+		} else {
+			$html .= '<p>' . esc_html__( 'No Wordify token is configured.', 'post-domain' ) . '</p>';
+		}
+
+		if ( ! $external ) {
+			$html .= self::form_open( 'pd_set_wordify_token' );
+			$html .= '<p><label for="pd_wordify_token">' . esc_html(
+				$binding->has_credential()
+					? __( 'Replace the API token', 'post-domain' )
+					: __( 'Wordify API token', 'post-domain' )
+			) . '</label><br>';
+			$html .= '<input type="password" class="regular-text" name="pd_wordify_token" id="pd_wordify_token"'
+				. ' autocomplete="off" spellcheck="false">';
+			$html .= '</p><p class="description">' . esc_html__(
+				'Create a token in the Wordify console with exactly two abilities: Read Sites and Manage Sites. Both are required — reading alone can find your site but cannot attach a domain to it. Do not grant full access. The token is stored encrypted and never displayed again.',
+				'post-domain'
+			) . '</p>';
+			// Saying what the test proves is part of not overstating it: no
+			// read-only call reports a token's abilities, and probing for one by
+			// performing a live mutation is not something to do behind an
+			// operator's back.
+			$html .= '<p class="description">' . esc_html__(
+				'Test connection checks that the token authenticates and that your teams and sites can be read. It cannot confirm the Manage Sites ability, which is only exercised when a domain is first attached.',
+				'post-domain'
+			) . '</p>';
+			$html .= get_submit_button( __( 'Save token', 'post-domain' ), 'secondary', 'submit', false );
+			$html .= '</form>';
+		}
+
+		if ( $binding->has_credential() && ! $binding->is_bound() ) {
+			$html .= self::wordify_site_selector();
+		}
+
+		if ( $binding->has_credential() ) {
+			$html .= '<div class="pd-actions" style="display:flex;flex-wrap:wrap;gap:.5rem">';
+			$html .= self::form_open( 'pd_test_wordify' )
+				. '<button type="submit" class="button">' . esc_html__( 'Test connection', 'post-domain' )
+				. '</button></form>';
+
+			if ( ! $external ) {
+				$html .= self::form_open( 'pd_disconnect_wordify' )
+					. '<button type="submit" class="button" onclick="return confirm(' . esc_attr(
+						(string) wp_json_encode(
+							__( 'Disconnect Wordify? Domains already attached to your Wordify site are left exactly as they are, and no mapping is deleted.', 'post-domain' )
+						)
+					) . ');">'
+					. esc_html__( 'Disconnect', 'post-domain' )
+					. '</button></form>';
+			}
+
+			$html .= '</div>';
+		}
+
+		return $html;
+	}
+
+	/**
+	 * The bounded site selector.
+	 *
+	 * Bounded and searchable rather than a plain dropdown, because an account
+	 * can hold hundreds of sites and a select element with all of them is
+	 * unusable exactly where it matters most. One page is read at a time, the
+	 * search goes to the provider's own verified `domain` filter, and the
+	 * operator has to state that the site they picked is this installation —
+	 * a matching domain string is a hint, never a decision.
+	 */
+	private static function wordify_site_selector(): string {
+		// phpcs:disable WordPress.Security.NonceVerification.Recommended -- reading a page number and a search term to render a list; nothing is changed.
+		$page   = isset( $_GET['pd_sites_page'] ) ? max( 1, absint( wp_unslash( $_GET['pd_sites_page'] ) ) ) : 1;
+		$search = isset( $_GET['pd_sites_search'] ) ? sanitize_text_field( wp_unslash( $_GET['pd_sites_search'] ) ) : '';
+		// phpcs:enable WordPress.Security.NonceVerification.Recommended
+
+		$binding    = HostingBinding::current();
+		$connection = WordifyConnectionService::production( $binding->team_id )->probe( $binding->team_id, $page, $search );
+
+		// Several teams and none chosen: that is a question, not a dead end. The
+		// service already honours a stated team; without this the operator had
+		// no way to state one and setup could not be completed at all.
+		if ( $connection->needs_team() ) {
+			return self::wordify_team_selector( $connection );
+		}
+
+		$html = '<h4>' . esc_html__( 'Which Wordify site is this?', 'post-domain' ) . '</h4>';
+
+		if ( ! $connection->is_ready() || null === $connection->team || null === $connection->sites ) {
+			return $html . '<p class="description">' . esc_html( HostingMessages::for_connection( $connection ) ) . '</p>';
+		}
+
+		$team  = $connection->team;
+		$sites = $connection->sites;
+
+		$html .= '<p class="description">' . sprintf(
+			/* translators: %s: Wordify team name. */
+			esc_html__( 'Showing sites in team %s.', 'post-domain' ),
+			'<strong>' . esc_html( $team->label() ) . '</strong>'
+		);
+
+		if ( null !== $connection->account && count( $connection->account->teams ) > 1 ) {
+			// Its own action. Posting an empty team to the selector is a mistake
+			// the selector is right to refuse, so asking to choose again cannot
+			// be expressed as one.
+			$html .= ' ' . self::form_open( 'pd_clear_wordify_team' )
+				. '<button type="submit" class="button-link">' . esc_html__( 'Choose a different team', 'post-domain' )
+				. '</button></form>';
+		}
+
+		$html .= '</p>';
+
+		$html .= '<p class="description">' . esc_html__(
+			'Post Domain will attach every mapped domain to the site you choose here. Choosing the wrong one sends your domains to the wrong installation, so check the name and address before confirming.',
+			'post-domain'
+		) . '</p>';
+
+		// Search is a GET, so it neither changes anything nor needs a nonce.
+		$html .= '<form method="get" action="">';
+
+		foreach ( array(
+			'page'          => 'pd-settings',
+			'pd_sites_page' => '1',
+		) as $name => $value ) {
+			$html .= sprintf(
+				'<input type="hidden" name="%s" value="%s">',
+				esc_attr( $name ),
+				esc_attr( 'page' === $name ? (string) self::current_page_slug() : $value )
+			);
+		}
+
+		$html .= '<p><label for="pd_sites_search">' . esc_html__( 'Search by domain', 'post-domain' ) . '</label> ';
+		$html .= '<input type="search" id="pd_sites_search" name="pd_sites_search" value="' . esc_attr( $search ) . '"> ';
+		$html .= get_submit_button( __( 'Search sites', 'post-domain' ), 'secondary', 'submit', false );
+		$html .= '</p></form>';
+
+		if ( $sites->is_empty() ) {
+			return $html . '<p class="description">' . esc_html__(
+				'No Wordify site matched that search. Clear the search to see the whole list.',
+				'post-domain'
+			) . '</p>';
+		}
+
+		$html .= self::form_open( 'pd_select_wordify_site' );
+		$html .= '<input type="hidden" name="pd_wordify_team" value="' . esc_attr( $team->id ) . '">';
+		$html .= '<table class="widefat striped"><thead><tr>'
+			. '<th scope="col"><span class="screen-reader-text">' . esc_html__( 'Choose', 'post-domain' ) . '</span></th>'
+			. '<th scope="col">' . esc_html__( 'Site', 'post-domain' ) . '</th>'
+			. '<th scope="col">' . esc_html__( 'Address', 'post-domain' ) . '</th>'
+			. '<th scope="col">' . esc_html__( 'Status', 'post-domain' ) . '</th>'
+			. '</tr></thead><tbody>';
+
+		foreach ( $sites->sites as $site ) {
+			$status = array();
+
+			if ( null !== $site->provisioning_status ) {
+				$status[] = $site->provisioning_status;
+			}
+
+			if ( true === $site->is_staging ) {
+				$status[] = __( 'staging', 'post-domain' );
+			}
+
+			$html .= '<tr><td><input type="radio" name="pd_wordify_site" id="pd_site_' . esc_attr( $site->id ) . '"'
+				. ' value="' . esc_attr( $site->id ) . '"></td>'
+				. '<td><label for="pd_site_' . esc_attr( $site->id ) . '">' . esc_html( $site->label() ) . '</label></td>'
+				. '<td>' . esc_html( (string) ( $site->domain ?? '' ) ) . '</td>'
+				. '<td>' . esc_html( implode( ', ', $status ) ) . '</td></tr>';
+		}
+
+		$html .= '</tbody></table>';
+
+		$html .= '<p><label><input type="checkbox" name="pd_wordify_confirm" value="1"> '
+			. esc_html__( 'This is the Wordify site that runs this WordPress installation.', 'post-domain' )
+			. '</label></p>';
+
+		$html .= get_submit_button( __( 'Use this site', 'post-domain' ), 'primary', 'submit', false );
+		$html .= '</form>';
+
+		$html .= self::site_pagination( $sites, $search );
+
+		return $html;
+	}
+
+	/**
+	 * The team choice, offered only from the authenticated account's own teams.
+	 *
+	 * Never a guess between them: a token that can act for three teams says
+	 * nothing about which installation this is, and picking one on the
+	 * operator's behalf would list — and could bind — the wrong site.
+	 */
+	public static function wordify_team_selector( \PostDomain\Hosting\ConnectionResult $connection ): string {
+		$html = '<h4>' . esc_html__( 'Which Wordify team is this site in?', 'post-domain' ) . '</h4>';
+
+		$html .= '<p class="description">' . esc_html( HostingMessages::for_connection( $connection ) ) . '</p>';
+
+		if ( null === $connection->account ) {
+			return $html;
+		}
+
+		$html .= self::form_open( 'pd_select_wordify_team' );
+
+		foreach ( $connection->account->teams as $team ) {
+			$html .= '<p><label><input type="radio" name="pd_wordify_team" value="' . esc_attr( $team->id ) . '"> '
+				. esc_html( $team->label() ) . '</label></p>';
+		}
+
+		$html .= get_submit_button( __( 'Use this team', 'post-domain' ), 'primary', 'submit', false );
+
+		return $html . '</form>';
+	}
+
+	/** Page links for the selector, so a large account stays reachable. */
+	private static function site_pagination( \PostDomain\Hosting\WordifySiteList $sites, string $search ): string {
+		$links = array();
+
+		if ( $sites->page > 1 ) {
+			$links[] = array( $sites->page - 1, __( 'Previous sites', 'post-domain' ) );
+		}
+
+		if ( $sites->has_more() ) {
+			$links[] = array( $sites->page + 1, __( 'More sites', 'post-domain' ) );
+		}
+
+		if ( array() === $links ) {
+			return '';
+		}
+
+		$html = '<p>';
+
+		foreach ( $links as $link ) {
+			$html .= '<a class="button" href="' . esc_url(
+				add_query_arg(
+					array(
+						'page'            => self::current_page_slug(),
+						'pd_sites_page'   => (string) $link[0],
+						'pd_sites_search' => $search,
+					),
+					admin_url( 'options-general.php' )
+				)
+			) . '">' . esc_html( (string) $link[1] ) . '</a> ';
+		}
+
+		return $html . '</p>';
+	}
+
+	/** The settings page slug, so selector links come back to this screen. */
+	private static function current_page_slug(): string {
+		return SettingsPage::SLUG;
+	}
+
 	public static function add_form(): string {
+		$readiness = HostingReadiness::evaluate();
+
+		// Withheld rather than shown-and-refused: a domain added here without a
+		// working hosting connection would verify, get a certificate, and still
+		// serve the host's placeholder page.
+		if ( ! $readiness->may_add_domains ) {
+			return '';
+		}
+
 		$html  = '<h2>' . esc_html__( 'Add a domain', 'post-domain' ) . '</h2>';
 		$html .= self::form_open( 'pd_add_mapping' );
 		$html .= '<table class="form-table" role="presentation"><tbody>';
@@ -749,6 +1100,14 @@ final class Screen {
 
 		if ( null !== $mapping->ssl_ref ) {
 			$buttons[] = self::button( 'pd_remove_ssl', $mapping, __( 'Remove the certificate', 'post-domain' ), 'secondary' );
+		}
+
+		// Offered only for a refusal, which is the one hosting outcome that
+		// definitely did nothing at the provider. An unconfirmed write may
+		// already have landed and a foreign one belongs elsewhere; asking again
+		// in either case is the duplicate mutation the whole design prevents.
+		if ( \PostDomain\Hosting\HostingState::REFUSED === \PostDomain\Hosting\HostingState::of( $mapping->hosting_state ) ) {
+			$buttons[] = self::button( 'pd_retry_hosting', $mapping, __( 'Ask your hosting again', 'post-domain' ), 'secondary' );
 		}
 
 		$html .= '<div class="pd-actions" style="display:flex;flex-wrap:wrap;gap:.5rem">'

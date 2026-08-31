@@ -5,7 +5,7 @@ namespace PostDomain\Support;
 
 final class Schema {
 
-	public const VERSION = 2;
+	public const VERSION = 4;
 
 	public static function domains_table(): string {
 		global $wpdb;
@@ -75,6 +75,12 @@ final class Schema {
 				ssl_mutation_environment varchar(190) NULL,
 				deletion_requested_at datetime NULL,
 				ssl_removal_scope varchar(20) NULL,
+				hosting_provider varchar(60) NULL,
+				hosting_environment varchar(190) NULL,
+				hosting_ref varchar(190) NULL,
+				hosting_state varchar(40) NULL,
+				hosting_registered_at datetime NULL,
+				hosting_attempts smallint unsigned NOT NULL DEFAULT 0,
 				deletion_attempts smallint(5) unsigned NOT NULL DEFAULT 0,
 				deletion_next_attempt_at datetime NULL,
 				title varchar(255) NULL,
@@ -90,7 +96,8 @@ final class Schema {
 				KEY verify_due (verification_state, verify_next_attempt_at),
 				KEY ssl_due (ssl_state, ssl_next_attempt_at),
 				KEY deletion_due (deletion_next_attempt_at),
-				KEY ssl_lease (ssl_mutation_expires_at)
+				KEY ssl_lease (ssl_mutation_expires_at),
+				KEY hosting_due (hosting_environment, hosting_state)
 			) {$charset} ENGINE=InnoDB"
 		);
 

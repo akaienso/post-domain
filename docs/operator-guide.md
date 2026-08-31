@@ -300,3 +300,110 @@ In each of those, start with the hosting configuration for the mapped domain,
 then check the plugin's diagnostics for anything it has already flagged. Clear
 any caching layer in front of the site before re-testing, so you are not looking
 at an old answer.
+
+## 12. Hosting, certificates and DNS are three different things
+
+They are easy to confuse because all three are "where the domain points", and
+they can be three different companies.
+
+| | What it does | Who it is |
+|---|---|---|
+| **Hosting / origin** | Finally serves your page. It has to recognise the mapped domain as one of its own names. | Wordify, or whoever runs your site |
+| **Certificate / edge** | Issues the certificate and answers the secure connection. | Cloudflare for SaaS |
+| **Authoritative DNS** | Answers questions about your domain. | Your registrar or DNS host — anywhere |
+
+Your mapped domain's DNS does not have to be in the same Cloudflare account as
+anything else. Post Domain never assumes it is.
+
+### If your site is on Wordify
+
+Post Domain can tell Wordify about each mapped domain for you, so the origin
+accepts it. To do that it needs a Wordify API token that **you** create — the
+plugin has no credential of its own and never will.
+
+1. In the Wordify console, create an API token.
+2. Tick exactly two abilities: **Read Sites** and **Manage Sites**. Both are
+   required — reading alone finds your site but cannot attach a domain to it.
+   Do not tick full access; Post Domain never needs your billing, your
+   primary domain, or your site's settings.
+3. Paste it into **Settings → Domain mappings → Hosting provider**.
+4. Choose **Test connection**. Post Domain reads who the token belongs to and
+   lists the sites it can see. Nothing is changed at Wordify. If your token can
+   act for more than one Wordify team, you are asked which one first — Post
+   Domain will not pick for you, and only the teams your token actually names
+   are offered.
+5. Pick which Wordify site this WordPress installation is, and tick the box
+   confirming it. The list is searchable and paged, so an account with hundreds
+   of sites stays usable. Post Domain then reads that exact site back with your
+   token before it binds anything.
+
+**What Test connection can and cannot tell you.** It proves the token
+authenticates, that your teams and sites can be read, and that the site you
+picked is one this token can see. It cannot prove the token has **Manage
+Sites**, because Wordify offers no read-only way to ask what a token is
+allowed to do, and Post Domain will not attach a throwaway domain to find
+out. If the ability is missing, you will learn it the first time you add a
+domain: the attach step stops with a message telling you to add **Manage
+Sites** to the token. Nothing is half-done and nothing is retried blindly.
+
+Until that connection is made and bound to one site, the **Add a domain** form
+is not shown. That is deliberate. A domain added without it would verify, get a
+certificate, and then show your host's placeholder page — a failure that looks
+like everything worked.
+
+**What Post Domain never does to your Wordify site.** It never makes a mapped
+domain primary. It never changes your main site's domain, your WordPress
+address, or your site address. It never changes your DNS.
+
+**If the token stops working** — revoked, expired, or scoped too narrowly — you
+will not be able to add new domains until you replace it. Every domain already
+serving keeps serving. A failed read never changes anything that was already
+set up.
+
+**Disconnecting** removes Post Domain's permission to make further changes on
+your behalf. It does not detach any domain from Wordify and does not delete any
+mapping.
+
+**Deleting a mapping.** No domain-detachment operation appears anywhere in
+Wordify's published API surface. So deleting a mapping here removes the mapping
+and then tells you — by name — which hostname is still attached to which Wordify
+site, so you can remove it in the console yourself. Post Domain will not guess at
+an operation it cannot verify, and never implies it tidied up at Wordify.
+
+**What happens when you add a domain.** Post Domain records the domain locally,
+marks it as claimed for one attachment, and then makes exactly one call asking
+Wordify to accept the hostname. It never asks twice. If Wordify does not answer,
+the domain is left in a "not confirmed" state and Post Domain settles it later by
+*reading* — it never repeats the attachment. Until Wordify confirms, the setup
+screen says so plainly rather than calling the domain ready.
+
+The message you get says which of three things happened. If Wordify accepted the
+domain, that is a plain success. If it did not answer, the domain is added and
+marked unconfirmed, and Post Domain settles it later by checking. If Wordify
+refused — usually a token missing **Manage Sites** — you get a failure, the
+mapping is kept, and once you have fixed the token you can choose **Ask your
+hosting again** on that domain rather than deleting and rebuilding it.
+
+### If your site is hosted anywhere else
+
+Choose **Manual or another host**. No token is needed and no hosting API is
+contacted. You arrange for your web server, panel or CDN to accept the mapped
+domain, as section 2 describes.
+
+### Keeping the token out of harm's way
+
+The token is stored encrypted, and is never shown again once saved — only the
+fact that one is configured. If you would rather it never touched the database,
+define it in `wp-config.php` instead:
+
+```php
+define( 'PD_WORDIFY_TOKEN', 'your-token-here' );
+```
+
+A token defined there takes precedence and cannot be changed from the admin
+screen.
+
+Encryption is a second line of defence, not the first. Someone with full
+database *and* filesystem access can decrypt it, so the real protection is
+scope: give the token only the abilities listed above, so that even in the worst
+case it cannot do much.
