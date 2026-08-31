@@ -384,13 +384,6 @@ refused — usually a token missing **Manage Sites** — you get a failure, the
 mapping is kept, and once you have fixed the token you can choose **Ask your
 hosting again** on that domain rather than deleting and rebuilding it.
 
-The message you get says which of three things happened. If Wordify accepted the
-domain, that is a plain success. If it did not answer, the domain is added and
-marked unconfirmed, and Post Domain settles it later by checking. If Wordify
-refused — usually a token missing **Manage Sites** — you get a failure, the
-mapping is kept, and once you have fixed the token you can choose **Ask your
-hosting again** on that domain rather than deleting and rebuilding it.
-
 ### If your site is hosted anywhere else
 
 Choose **Manual or another host**. No token is needed and no hosting API is
