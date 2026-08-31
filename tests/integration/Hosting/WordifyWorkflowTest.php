@@ -1275,4 +1275,93 @@ final class WordifyWorkflowTest extends OwnedSessionTestCase {
 		$this->assertCount( $before, $this->http->attach_calls() );
 		$this->assertSame( HostingState::FOREIGN->value, $this->repo->by_id( $foreign->id )?->hosting_state );
 	}
+
+	// -------------------------------------------------- manual convergence --
+
+	/**
+	 * Manual hosting, with the row advancing underneath the transition.
+	 *
+	 * There is no external mutation to fence here and no provider to ask, so a
+	 * transition that loses a revision pin has nothing to recover *from* — and
+	 * `HostingRecoveryService` returns immediately for a provider with no
+	 * environment, so a fenced result would promise a check that never happens
+	 * and leave `hosting_state` null forever.
+	 */
+	public function test_manual_creation_converges_even_when_the_row_advances_underneath(): void {
+		$this->post( 'pd_set_hosting', array( 'pd_hosting_provider' => HostingDetection::MANUAL ) );
+
+		// An ordinary edit lands between the row being written and its hosting
+		// state being recorded, exactly as a concurrent request would.
+		add_action(
+			'pd_test_before_hosting_not_required',
+			static function ( int $mapping_id ): void {
+				global $wpdb;
+
+				$table = Schema::domains_table();
+
+				// phpcs:disable WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- $table is Schema::domains_table(); every value is a placeholder.
+				$wpdb->query( // phpcs:ignore WordPress.DB
+					$wpdb->prepare( // phpcs:ignore WordPress.DB
+						"UPDATE {$table} SET integrity_error = %s, revision = revision + 1 WHERE id = %d",
+						'an unrelated concurrent edit',
+						$mapping_id
+					)
+				);
+				// phpcs:enable WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+			}
+		);
+
+		$outcome = $this->add_domain( 'manual-race.example.org' );
+
+		remove_all_actions( 'pd_test_before_hosting_not_required' );
+
+		$this->assertTrue( $outcome['ok'], 'Manual hosting asked nothing of anyone; this completed.' );
+		$this->assertSame( 201, $outcome['status'], 'A completed manual creation, never 202.' );
+		$this->assertSame( 'unsupported', $outcome['hosting'], 'Never fenced: there is nothing to settle later.' );
+		$this->assertStringStartsWith( 'success:', $outcome['notice'] );
+		$this->assertStringNotContainsString( 'settle it by checking', $outcome['notice'] );
+
+		$mapping = $this->repo->by_host( 'manual-race.example.org' );
+
+		$this->assertNotNull( $mapping );
+		$this->assertSame( HostingState::NOT_REQUIRED->value, $mapping->hosting_state, 'The state converged.' );
+		$this->assertSame( 'manual', $mapping->hosting_provider );
+		$this->assertSame(
+			'an unrelated concurrent edit',
+			$mapping->integrity_error,
+			'And the concurrent edit survived it.'
+		);
+
+		$this->assertSame( array(), $this->http->calls, 'No hosting API was contacted at any point.' );
+
+		// Nothing is left for a recovery pass to do, which matters because
+		// manual hosting has no environment and the sweep exits immediately.
+		$outstanding = ( new HostingTransitions() )->outstanding( 'manual', 10 );
+
+		$this->assertSame( array(), $outstanding );
+
+		do_action( HostingRecoveryService::HOOK );
+
+		$this->assertSame( HostingState::NOT_REQUIRED->value, $this->repo->by_id( $mapping->id )?->hosting_state );
+	}
+
+	public function test_recording_manual_hosting_twice_is_not_a_failure(): void {
+		$this->post( 'pd_set_hosting', array( 'pd_hosting_provider' => HostingDetection::MANUAL ) );
+		$this->post(
+			'pd_add_mapping',
+			array(
+				'pd_host'    => 'manual-twice.example.org',
+				'pd_post_id' => $this->target(),
+			)
+		);
+
+		$mapping = $this->repo->by_host( 'manual-twice.example.org' );
+		$this->assertNotNull( $mapping );
+
+		$this->assertTrue(
+			( new HostingTransitions() )->not_required( $mapping->id, $mapping->revision, 'manual' ),
+			'A state that is already what it should be is a success, not a fence.'
+		);
+		$this->assertSame( HostingState::NOT_REQUIRED->value, $this->repo->by_id( $mapping->id )?->hosting_state );
+	}
 }

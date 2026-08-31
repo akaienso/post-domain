@@ -117,25 +117,58 @@ final class HostingTransitions {
 	 * The manual provider's ordinary answer. Recorded rather than left null so a
 	 * later screen can tell "no provider was involved" from "nothing has
 	 * happened yet".
+	 *
+	 * Deliberately not pinned to a revision, unlike every other transition here.
+	 * A revision pin is a fence against a mutation that may already have been
+	 * sent to a provider — and this transition sends nothing anywhere. Pinning
+	 * it protected nothing and cost a great deal: an unrelated edit landing in
+	 * the same instant made the write lose, and since manual hosting has no
+	 * environment for the recovery sweep to select on, the row's hosting state
+	 * stayed null forever while the operator was told it would be settled by
+	 * checking.
+	 *
+	 * The invariant that does matter is the state one: never overwrite a hosting
+	 * state that has already been established. That is what the `WHERE` still
+	 * enforces, and it is why a row already carrying `not_required` is a success
+	 * rather than a fence — the state is what it should be, whoever wrote it.
 	 */
 	public function not_required( int $mapping_id, int $revision, string $provider ): bool {
 		global $wpdb;
 
+		unset( $revision );
+
 		$table = Schema::domains_table();
 
-		return 1 === $wpdb->query( // phpcs:ignore WordPress.DB
+		// The window a concurrent ordinary edit lands in. Nothing production
+		// listens to it; it exists so a test can take the interleaving this
+		// method has to survive.
+		do_action( 'pd_test_before_hosting_not_required', $mapping_id );
+
+		$affected = $wpdb->query( // phpcs:ignore WordPress.DB
 			$wpdb->prepare( // phpcs:ignore WordPress.DB
 				"UPDATE {$table}
 				    SET hosting_provider = %s, hosting_state = %s,
 				        revision = revision + 1, updated_at = %s
-				  WHERE id = %d AND revision = %d AND hosting_state IS NULL",
+				  WHERE id = %d AND hosting_state IS NULL",
 				$provider,
 				HostingState::NOT_REQUIRED->value,
 				gmdate( 'Y-m-d H:i:s' ),
-				$mapping_id,
-				$revision
+				$mapping_id
 			)
 		);
+
+		if ( 1 === $affected ) {
+			return true;
+		}
+
+		// Zero rows means the state was already set. That is only a success when
+		// it was already set to this — a row claimed for a provider attachment
+		// must not be quietly relabelled as needing none.
+		$state = $wpdb->get_var( // phpcs:ignore WordPress.DB
+			$wpdb->prepare( "SELECT hosting_state FROM {$table} WHERE id = %d", $mapping_id ) // phpcs:ignore WordPress.DB
+		);
+
+		return HostingState::NOT_REQUIRED->value === $state;
 	}
 
 	/**

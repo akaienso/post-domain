@@ -308,4 +308,123 @@ final class WordifyTeamSelectionTest extends OwnedSessionTestCase {
 		$this->assertNull( $rebound->site_id );
 		$this->assertSame( FakeWordifyTransport::TEAM2, $rebound->team_id );
 	}
+
+	/**
+	 * The rendered control, not a hand-built POST.
+	 *
+	 * The earlier tests posted a real team id directly, which is a path the
+	 * screen never takes. This one reads the form the page actually draws and
+	 * submits exactly the fields it carries — which is how the empty hidden
+	 * value went unnoticed.
+	 *
+	 * @return array<string, string>
+	 */
+	private function change_team_form( string $page ): array {
+		$start = strpos( $page, 'Choose a different team' );
+
+		$this->assertNotFalse( $start, 'The page offers no way to change team.' );
+
+		$open = strrpos( substr( $page, 0, $start ), '<form' );
+
+		$this->assertNotFalse( $open );
+
+		$close = strpos( $page, '</form>', (int) $open );
+		$form  = substr( $page, (int) $open, ( false === $close ? 0 : $close ) - (int) $open );
+		$found = array();
+
+		if ( preg_match_all( '/<input[^>]*name="([^"]+)"[^>]*value="([^"]*)"/', $form, $matches, PREG_SET_ORDER ) > 0 ) {
+			foreach ( $matches as $match ) {
+				$found[ $match[1] ] = $match[2];
+			}
+		}
+
+		$this->assertArrayHasKey( 'pd_action', $found, 'The change-team control posts no action.' );
+
+		return $found;
+	}
+
+	public function test_the_rendered_change_team_control_returns_to_the_team_choice(): void {
+		$this->choose_second_team();
+
+		$page = $this->page();
+
+		$this->assertStringContainsString( 'Second Team', $page );
+		$this->assertStringContainsString( 'site-9.example', $page, 'A team is chosen and its sites are listed.' );
+
+		$fields = $this->change_team_form( $page );
+		$action = $fields['pd_action'];
+
+		unset( $fields['pd_action'], $fields['_wpnonce'], $fields['_wp_http_referer'] );
+
+		$before = count( $this->http->calls );
+
+		$this->post( $action, $fields );
+
+		$this->assertStringStartsWith(
+			'success:',
+			$this->notice(),
+			'Submitting the control the page drew must not produce an error.'
+		);
+
+		$cleared = HostingBinding::current();
+
+		$this->assertNull( $cleared->team_id, 'The provisional team is cleared.' );
+		$this->assertNull( $cleared->team_name );
+		$this->assertNull( $cleared->site_id, 'And so is the site chosen under it.' );
+		$this->assertNull( $cleared->site_name );
+		$this->assertNull( $cleared->fingerprint, 'Validation goes with them.' );
+		$this->assertFalse( $cleared->is_valid() );
+		$this->assertFalse( $cleared->is_bound() );
+
+		$this->assertSame(
+			array(),
+			array_filter(
+				array_slice( $this->http->calls, $before ),
+				static fn ( array $c ): bool => 'GET' !== $c['method']
+			),
+			'Changing team mutates nothing at Wordify.'
+		);
+
+		$again = $this->page();
+
+		$this->assertStringContainsString( 'First Team', $again, 'Both authenticated teams are offered again.' );
+		$this->assertStringContainsString( 'Second Team', $again );
+		$this->assertStringContainsString( 'pd_select_wordify_team', $again );
+		$this->assertStringNotContainsString( 'pd_add_mapping', $again, 'And nothing may be added until a site is confirmed again.' );
+
+		// The teams offered are the ones the next authenticated read named.
+		$this->assertNotEmpty(
+			array_filter(
+				$this->http->calls,
+				static fn ( array $c ): bool => str_ends_with( (string) wp_parse_url( $c['url'], PHP_URL_PATH ), '/me' )
+			)
+		);
+	}
+
+	public function test_a_cleared_team_can_be_chosen_again_and_bound(): void {
+		$this->choose_second_team();
+
+		$fields = $this->change_team_form( $this->page() );
+		$action = $fields['pd_action'];
+
+		unset( $fields['pd_action'], $fields['_wpnonce'], $fields['_wp_http_referer'] );
+
+		$this->post( $action, $fields );
+
+		$this->post( 'pd_select_wordify_team', array( 'pd_wordify_team' => FakeWordifyTransport::TEAM ) );
+		$this->post(
+			'pd_select_wordify_site',
+			array(
+				'pd_wordify_team'    => FakeWordifyTransport::TEAM,
+				'pd_wordify_site'    => $this->http->site_id( 2 ),
+				'pd_wordify_confirm' => '1',
+			)
+		);
+
+		$binding = HostingBinding::current();
+
+		$this->assertTrue( $binding->is_bound() );
+		$this->assertSame( FakeWordifyTransport::TEAM, $binding->team_id );
+		$this->assertSame( $this->http->site_id( 2 ), $binding->site_id );
+	}
 }

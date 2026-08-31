@@ -44,8 +44,12 @@ final class HostingRegistrationCoordinator {
 		$environment = $provider->environment();
 
 		if ( null === $environment ) {
-			// The manual provider: there is no origin API to tell. The row still
-			// records that, and a CAS that lost its row has recorded nothing.
+			// The manual provider: there is no origin API to tell, so this
+			// converges rather than fencing — there would be nothing for a later
+			// pass to settle, and manual hosting has no environment for the
+			// recovery sweep to select on. It fails only if the row already
+			// belongs to a provider registration, which is not this one's to
+			// relabel.
 			return $this->transitions->not_required( $mapping->id, $mapping->revision, $provider->id() )
 				? RegistrationOutcome::unsupported()
 				: RegistrationOutcome::fenced();

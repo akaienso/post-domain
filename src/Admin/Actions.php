@@ -45,6 +45,7 @@ final class Actions {
 		'pd_set_wordify_token',
 		'pd_test_wordify',
 		'pd_select_wordify_team',
+		'pd_clear_wordify_team',
 		'pd_select_wordify_site',
 		'pd_disconnect_wordify',
 	);
@@ -187,7 +188,7 @@ final class Actions {
 			self::redirect( 0 );
 		}
 
-		if ( in_array( $action, array( 'pd_set_hosting', 'pd_set_wordify_token', 'pd_test_wordify', 'pd_select_wordify_team', 'pd_select_wordify_site', 'pd_disconnect_wordify' ), true ) ) {
+		if ( in_array( $action, array( 'pd_set_hosting', 'pd_set_wordify_token', 'pd_test_wordify', 'pd_select_wordify_team', 'pd_clear_wordify_team', 'pd_select_wordify_site', 'pd_disconnect_wordify' ), true ) ) {
 			HostingActions::dispatch( $action );
 			self::redirect( 0 );
 		}

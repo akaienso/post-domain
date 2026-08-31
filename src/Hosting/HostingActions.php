@@ -20,6 +20,7 @@ final class HostingActions {
 			'pd_set_wordify_token'   => self::set_token(),
 			'pd_test_wordify'        => self::test_connection(),
 			'pd_select_wordify_team' => self::select_team(),
+			'pd_clear_wordify_team'  => self::clear_team(),
 			'pd_select_wordify_site' => self::select_site(),
 			'pd_disconnect_wordify'  => self::disconnect(),
 			default                  => null,
@@ -111,6 +112,38 @@ final class HostingActions {
 		}
 
 		Notices::failure( (string) $result['message'] );
+	}
+
+	/**
+	 * Puts the operator back at the team choice.
+	 *
+	 * A separate action from `select_team()` rather than an empty team id posted
+	 * to it: "which team" and "none yet" are different requests, and a blank
+	 * value arriving at the selector is a mistake worth rejecting. Rendering the
+	 * change-team control as an empty selection made the one legitimate way to
+	 * change team indistinguishable from that mistake.
+	 *
+	 * Clearing is purely local. Nothing is detached, nothing at Wordify is
+	 * asked, and the site chosen under the old team goes with it, because a site
+	 * in one team is not a site in another. Validation goes through the same
+	 * safe path everything else does — `store()` cannot write it back.
+	 */
+	private static function clear_team(): void {
+		HostingBinding::store(
+			array(
+				'team_id'     => null,
+				'team_name'   => null,
+				'site_id'     => null,
+				'site_name'   => null,
+				'site_domain' => null,
+			)
+		);
+
+		HostingProviderFactory::reset();
+
+		Notices::success(
+			__( 'Cleared. Choose which Wordify team this WordPress installation belongs to.', 'post-domain' )
+		);
 	}
 
 	/**

@@ -395,8 +395,10 @@ final class Screen {
 		);
 
 		if ( null !== $connection->account && count( $connection->account->teams ) > 1 ) {
-			$html .= ' ' . self::form_open( 'pd_select_wordify_team' )
-				. '<input type="hidden" name="pd_wordify_team" value="">'
+			// Its own action. Posting an empty team to the selector is a mistake
+			// the selector is right to refuse, so asking to choose again cannot
+			// be expressed as one.
+			$html .= ' ' . self::form_open( 'pd_clear_wordify_team' )
 				. '<button type="submit" class="button-link">' . esc_html__( 'Choose a different team', 'post-domain' )
 				. '</button></form>';
 		}
