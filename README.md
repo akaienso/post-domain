@@ -361,9 +361,16 @@ token, which **you** create — the plugin ships with no credential of any kind.
   Only "a token is configured" is ever shown back.
 - It can also be supplied from `wp-config.php` for operators who do not permit
   database-stored secrets. See §12 of the operator guide.
-- Give it the narrowest abilities that work. Post Domain reads your identity,
-  lists sites, lists a site's domains, and attaches a domain. It never promotes
-  a domain to primary and never changes your main site's domain.
+- The token needs exactly two abilities: **Read Sites** (`sites:read`) and
+  **Manage Sites** (`sites:manage`). Full access is never requested. Post Domain
+  reads your identity, lists sites, lists a site's domains, and attaches a
+  domain; it never promotes a domain to primary and never changes your main
+  site's domain.
+- **Test connection** proves authentication, team and site readability, and that
+  the bound site is reachable with this token. It cannot prove **Manage Sites**:
+  no read-only call reports a token's abilities, and the plugin will not perform
+  a live mutation to probe for permission. A token missing that ability is
+  reported at the first attach, with instructions and no partial state.
 - The connection is bound to **one** Wordify team and site. Until it is, the
   **Add a domain** form is not shown, because a domain added without it would
   verify, get a certificate, and still serve your host's placeholder page.
@@ -374,8 +381,8 @@ token, which **you** create — the plugin ships with no credential of any kind.
 **Disconnecting removes local authority only.** No domain is detached at
 Wordify and no mapping is deleted.
 
-**Deletion.** The verified Wordify API surface exposes no domain-detachment
-operation. Deleting a mapping therefore removes the mapping here and tells you
+**Deletion.** No domain-detachment operation appears in the verified Wordify API
+surface. Deleting a mapping therefore removes the mapping here and tells you
 exactly what to remove in the Wordify console by hand. Nothing is invented.
 
 ### Manual or another host

@@ -309,7 +309,15 @@ final class Screen {
 			$html .= '<input type="password" class="regular-text" name="pd_wordify_token" id="pd_wordify_token"'
 				. ' autocomplete="off" spellcheck="false">';
 			$html .= '</p><p class="description">' . esc_html__(
-				'Create a token in the Wordify console with only the abilities Post Domain needs. It is stored encrypted and never displayed again.',
+				'Create a token in the Wordify console with exactly two abilities: Read Sites and Manage Sites. Both are required — reading alone can find your site but cannot attach a domain to it. Do not grant full access. The token is stored encrypted and never displayed again.',
+				'post-domain'
+			) . '</p>';
+			// Saying what the test proves is part of not overstating it: no
+			// read-only call reports a token's abilities, and probing for one by
+			// performing a live mutation is not something to do behind an
+			// operator's back.
+			$html .= '<p class="description">' . esc_html__(
+				'Test connection checks that the token authenticates and that your teams and sites can be read. It cannot confirm the Manage Sites ability, which is only exercised when a domain is first attached.',
 				'post-domain'
 			) . '</p>';
 			$html .= get_submit_button( __( 'Save token', 'post-domain' ), 'secondary', 'submit', false );

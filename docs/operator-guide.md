@@ -322,13 +322,22 @@ accepts it. To do that it needs a Wordify API token that **you** create — the
 plugin has no credential of its own and never will.
 
 1. In the Wordify console, create an API token.
-2. Give it the narrowest abilities that work. Post Domain needs to read who the
-   token belongs to, list your sites, list a site's domains, and attach a
-   domain. It never needs to change your primary domain, your billing, or your
-   site's settings.
+2. Tick exactly two abilities: **Read Sites** and **Manage Sites**. Both are
+   required — reading alone finds your site but cannot attach a domain to it.
+   Do not tick full access; Post Domain never needs your billing, your
+   primary domain, or your site's settings.
 3. Paste it into **Settings → Domain mappings → Hosting provider**.
 4. Choose **Test connection**, and pick which Wordify site this WordPress
    installation is.
+
+**What Test connection can and cannot tell you.** It proves the token
+authenticates, that your teams and sites can be read, and that the site you
+picked is one this token can see. It cannot prove the token has **Manage
+Sites**, because Wordify offers no read-only way to ask what a token is
+allowed to do, and Post Domain will not attach a throwaway domain to find
+out. If the ability is missing, you will learn it the first time you add a
+domain: the attach step stops with a message telling you to add **Manage
+Sites** to the token. Nothing is half-done and nothing is retried blindly.
 
 Until that connection is made and bound to one site, the **Add a domain** form
 is not shown. That is deliberate. A domain added without it would verify, get a
@@ -348,8 +357,8 @@ set up.
 your behalf. It does not detach any domain from Wordify and does not delete any
 mapping.
 
-**Deleting a mapping.** Wordify's API, as published, offers no way to detach a
-domain. So deleting a mapping here removes the mapping and then tells you
+**Deleting a mapping.** No domain-detachment operation appears anywhere in
+Wordify's published API surface. So deleting a mapping here removes the mapping and then tells you
 exactly what to remove in the Wordify console yourself. Post Domain will not
 guess at an operation it cannot verify.
 

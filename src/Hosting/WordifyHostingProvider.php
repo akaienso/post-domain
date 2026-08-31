@@ -12,6 +12,8 @@ use PostDomain\Contracts\HostingProvider;
  *
  * 1. A write is attempted at most once per call. A refusal, a timeout or an
  *    already-attached answer is resolved by *reading*, never by writing again.
+ *    A rejected or under-scoped token short-circuits even that read: it is a
+ *    fact about the credential that no further call will change.
  * 2. A hostname is only ever claimed as ours after a read has shown it on the
  *    bound site. A hostname on some other site is `foreign()` and is never
  *    adopted, because adopting it would take a live domain off another site.
@@ -77,6 +79,14 @@ final class WordifyHostingProvider implements HostingProvider {
 			return $attached->is( $context->host )
 				? RegistrationOutcome::registered( $attached->reference, $this->environment->id() )
 				: RegistrationOutcome::ambiguous( 'The hosting provider acknowledged a different hostname.' );
+		}
+
+		if ( $attached->kind->is_credential_fault() ) {
+			// A rejected or under-scoped token is a fact about the credential.
+			// Reading again would answer a different question, and writing again
+			// would fail identically, so this stops here with the one thing an
+			// administrator can act on.
+			return RegistrationOutcome::refused( $attached->message );
 		}
 
 		return $this->resolve_by_reading( $context, $attached );

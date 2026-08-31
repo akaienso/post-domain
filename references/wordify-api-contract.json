@@ -1,66 +1,92 @@
 {
-  "source": "Wordify MCP server tool schemas, as exposed to this session",
   "captured_at": "2026-08-31",
-  "openapi_document": {
-    "url": "https://console.wordify.com/docs/api.json",
-    "obtained": false,
-    "observed_status": 200,
-    "observed_content_type": "text/html",
-    "note": "The document is behind console authentication. An unauthenticated request returns the console SPA shell rather than JSON, so no HTTP paths, request/response schemas, auth header name, error codes, scope names or idempotency mechanism could be verified from it."
+  "provenance": [
+    "Wordify's official public API documentation",
+    "Wordify's official API-token UI, for the ability names",
+    "Wordify MCP tool schemas, for operation semantics and parameters",
+    "Authenticated read-only Wordify MCP responses against a real account, for response field names",
+    "Unauthenticated HTTP route probes, for path existence"
+  ],
+  "not_obtained": {
+    "openapi_document": "https://console.wordify.com/docs/api.json is behind console authentication and was never read. Nothing in this file is derived from it."
   },
-  "verified_operations": {
-    "get_me": {
-      "read_only": true,
-      "parameters": {},
-      "returns": "the authenticated user plus an inline list of every team they belong to",
-      "notes": "Orientation call. For multi-team users a team is selected before site, billing or task calls."
-    },
-    "list_sites": {
-      "read_only": true,
-      "http": "GET /api/v1/sites",
-      "http_confidence": "stated in the tool description; the only HTTP path this session could verify",
-      "filters": ["php_version", "cdn_enabled", "provisioning_status", "domain", "has_plugin", "plugin_version", "cache_enabled", "is_staging"],
-      "pagination": ["page", "per_page (default 25, max 100)", "links.next"],
-      "provisioning_status_values": ["pending", "provisioning", "active", "syncing", "deleting", "failed"],
-      "sort_fields": ["created_at", "updated_at", "domain", "name", "id"]
-    },
-    "get_site": {
-      "read_only": true,
-      "parameters": { "site_id": "26-char base32 ULID or a bare domain", "include": "php_config, cdn_config, cache_config, basic_auth, redis, wordpress_settings, cron_config, plugins, themes, team, wp_options" },
-      "authorisation": "enforced by the site policy; a token scoped to one team cannot read sites on another team"
-    },
-    "list_domains": {
-      "read_only": true,
-      "parameters": { "site_id": "ULID or bare domain" },
-      "returns": "every domain attached to the site, primary first then newest",
-      "record_fields": ["ssl_state", "dns_verified_at", "is_primary"]
-    },
-    "add_domain": {
-      "read_only": false,
-      "parameters": {
-        "site_id": "ULID or bare domain",
-        "domain": "without www prefix, public TLD only, max 253 chars",
-        "make_primary": "default false; promotes to primary once DNS verifies",
-        "use_www": "only meaningful with make_primary"
-      },
-      "behaviour": "creates a parked domain pointer, then asynchronously verifies DNS and provisions an SSL certificate; returns the created domain record immediately",
-      "rejects": "temporary wordify.io-style subdomains"
-    },
-    "recheck_domain_dns": {
-      "read_only": false,
-      "parameters": { "site_id": "ULID or bare domain" },
-      "behaviour": "synchronous; refreshes dns_verified_at and ssl_state for every domain on the site",
-      "side_effects": "live DNS queries and, when SSL state is missing or stale, a fresh Let's Encrypt issuance request",
-      "rate_limit": "Let's Encrypt rate-limits per registered domain per week; tight retry loops must be avoided"
+  "base_url": "https://console.wordify.com/api/v1",
+  "authentication": {
+    "scheme": "bearer",
+    "header": "Authorization: Bearer <token>",
+    "token_prefix": "wpk_",
+    "team_header": "X-Wordify-Team",
+    "team_header_note": "Carries the bound team for a multi-team account. The team id is an opaque string/ULID and is never treated as an integer."
+  },
+  "required_abilities": {
+    "needed": ["sites:read", "sites:manage"],
+    "ui_labels": ["Read Sites", "Manage Sites"],
+    "not_requested": "*",
+    "site_scoping": "Not supported. Evidence supports team-scoped authorization only; the plugin binds its own operations to one selected site, which is not the same as the token being restricted to one."
+  },
+  "routes": {
+    "me": { "method": "GET", "path": "/api/v1/me" },
+    "sites": { "method": "GET", "path": "/api/v1/sites" },
+    "site": { "method": "GET", "path": "/api/v1/sites/{site_id}" },
+    "domains": { "method": "GET", "path": "/api/v1/sites/{site_id}/domains" },
+    "attach_domain": { "method": "POST", "path": "/api/v1/sites/{site_id}/domains" },
+    "recheck": { "method": "POST", "path": "/api/v1/sites/{site_id}/domains/recheck" }
+  },
+  "route_probe_evidence": {
+    "method": "Unauthenticated JSON requests. No credential was sent and nothing was mutated.",
+    "result": "Every route listed above answered HTTP 401 with Wordify's JSON error envelope rather than 404, which is what establishes that the path exists.",
+    "recheck_disambiguation": "POST /api/v1/sites/{site_id}/domains/recheck answered 401. Other candidate recheck paths answered 404 or 405.",
+    "error_envelope": {
+      "status": 401,
+      "content_type": "application/json",
+      "response_header": "X-Request-Id",
+      "body": "error.code = unauthenticated, a human message, and error.request_id"
     }
   },
-  "not_verified": {
-    "http_paths": "Every path except GET /api/v1/sites. Not guessed.",
-    "auth_header": "The bearer header name and format could not be read from the specification.",
-    "response_envelopes": "Field names beyond those the tool schemas state.",
-    "error_codes": "HTTP status codes and error body shape for refusals, rate limits and conflicts.",
-    "idempotency": "Whether the API exposes an idempotency key on writes, and under what header or field.",
-    "abilities": "The exact token ability/scope names, and whether a token can be restricted to a single site rather than a team.",
-    "domain_detachment": "No domain deletion or detachment operation is exposed by the MCP surface, and none could be confirmed from the specification."
+  "request_bodies": {
+    "attach_domain": {
+      "domain": "the normalized mapped hostname",
+      "make_primary": "always boolean false; not exposed as a caller-controlled parameter",
+      "use_www": "not sent — the contract states it is only meaningful when make_primary is true"
+    },
+    "recheck": "none; the site is already in the path"
+  },
+  "observed_responses": {
+    "me": {
+      "shape": "a top-level user record",
+      "fields": ["id", "name", "email", "current_team_id", "teams[]"],
+      "team_fields": ["id (opaque string)", "name", "api_access"]
+    },
+    "sites": {
+      "shape": "paginated envelope",
+      "fields": ["data[]", "links", "meta"],
+      "site_fields": ["id (26-character ULID)", "display_name", "name", "domain", "provisioning_status", "is_staging", "available_actions[]"]
+    },
+    "domains": {
+      "shape": "a top-level JSON array",
+      "fields": [
+        "id",
+        "domain",
+        "is_primary",
+        "www_redirect",
+        "dns_status",
+        "ssl_status",
+        "ssl_enabled",
+        "dns_health_state",
+        "dns_given_up",
+        "dns_checked_at",
+        "ssl_checked_at",
+        "created_at"
+      ]
+    }
+  },
+  "behaviour": {
+    "attach_domain": "Creates a parked domain pointer, then asynchronously verifies DNS and provisions a certificate. Rejects wordify.io-style provisioning subdomains. Public TLD, no www prefix, 253 characters maximum.",
+    "recheck": "Synchronous. Performs live DNS queries and can trigger a fresh Let's Encrypt issuance request, which is rate limited per registered domain per week. Never called automatically by this plugin.",
+    "detachment": "No domain detachment or deletion operation is exposed by any surface examined. None is implemented, and mapping deletion tells the operator what to remove by hand."
+  },
+  "plugin_position": {
+    "wordify_status_is_not_success": "Wordify's dns_status and ssl_status are reported, never acted on. They do not replace the plugin's Cloudflare state, and they do not settle the signed final-origin probe.",
+    "ability_proof": "The API exposes no read-only way to enumerate a token's abilities, so a read-only connection test cannot prove sites:manage. That is surfaced at the first attachment as a typed insufficient-ability failure with instructions, never as a retry and never by attempting a mutation to probe permissions."
   }
 }

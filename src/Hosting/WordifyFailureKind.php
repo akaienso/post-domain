@@ -11,12 +11,18 @@ namespace PostDomain\Hosting;
  * resolved by reading, never by repeating a write.
  */
 enum WordifyFailureKind: string {
-	/** The operation's HTTP path was never verified, so nothing was sent. */
+	/** This build has no route for the operation, so nothing was sent. */
 	case ENDPOINT_UNVERIFIED = 'endpoint_unverified';
-	/** The auth header name was never verified, so no credential was sent. */
-	case AUTH_UNVERIFIED = 'auth_unverified';
+
 	/** No token, team or site is configured. */
 	case NOT_CONFIGURED = 'not_configured';
+
+	/** 401. The credential was rejected: absent, malformed, expired, revoked. */
+	case UNAUTHENTICATED = 'unauthenticated';
+
+	/** 403. The token is valid but lacks the ability the call needs. */
+	case INSUFFICIENT_ABILITY = 'insufficient_ability';
+
 	/** No answer: connection error, timeout, 5xx. */
 	case TRANSPORT = 'transport';
 	/** Answered, and said no. */
@@ -29,5 +35,14 @@ enum WordifyFailureKind: string {
 	/** True when the call may or may not have landed, or may succeed later. */
 	public function is_transient(): bool {
 		return self::TRANSPORT === $this || self::RATE_LIMITED === $this;
+	}
+
+	/**
+	 * True when nothing about the request will change on a retry, so retrying is
+	 * a wasted call rather than a chance of success. A missing ability and a
+	 * rejected credential are both facts about the token, not about the moment.
+	 */
+	public function is_credential_fault(): bool {
+		return self::UNAUTHENTICATED === $this || self::INSUFFICIENT_ABILITY === $this;
 	}
 }

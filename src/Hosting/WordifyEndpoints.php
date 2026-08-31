@@ -4,115 +4,95 @@ declare( strict_types = 1 );
 namespace PostDomain\Hosting;
 
 /**
- * The single seam holding every unverified detail of the Wordify HTTP surface.
+ * The Wordify HTTP surface this plugin talks to.
  *
- * The authenticated OpenAPI document at https://console.wordify.com/docs/api.json
- * could not be obtained: it answers 200 with the console SPA shell rather than
- * JSON. So the operation *semantics* are verified — from the MCP tool schemas
- * recorded in `references/wordify-api-contract.json` — while almost none of the
- * transport is. This class is where that line is drawn, deliberately and in one
- * place, instead of being smeared through the client as plausible-looking
- * constants.
+ * Provenance, stated exactly: these routes were established from Wordify's
+ * public API documentation, its API-token UI, the Wordify MCP tool schemas, and
+ * unauthenticated route probes in which every protected route below answered
+ * HTTP 401 with Wordify's JSON error envelope rather than 404 — a 404 would
+ * have meant the path did not exist. Response field names come from read-only
+ * MCP responses against a real account. The authenticated OpenAPI document was
+ * never obtained, and nothing here is inferred from one.
  *
- * Verified and shipped filled in:
- *   - `GET /api/v1/sites`, including its `domain` filter and its pagination.
- *
- * NOT verified, and therefore shipped empty:
- *   - every other HTTP path (site, domains, attach, recheck);
- *   - the authentication header name and token format;
- *   - the response envelope beyond the field names the tool schemas state
- *     (`ssl_state`, `dns_verified_at`, `is_primary`, `provisioning_status`, and
- *     26-character ULID site ids);
- *   - error status codes and error body shape;
- *   - any idempotency key mechanism — there is no evidence one exists, so the
- *     provider never relies on one;
- *   - a domain detachment operation, which no verified surface exposes at all.
- *
- * The base URL is the console host the documentation URL itself lives on; it is
- * observed, not read from a specification, and it is filterable for that reason.
- *
- * `WordifyApiClient` fails closed against this map: an operation with no path,
- * or any request at all while the auth header name is unknown, returns a
- * `WordifyFailure` naming the missing piece. It never guesses a path, and it
- * never sends a credential under a header name nobody verified.
- *
- * An operator who holds the specification supplies the rest through the
- * `pd_wordify_endpoints` filter:
- *
- *     add_filter( 'pd_wordify_endpoints', function ( array $config ): array {
- *         $config['auth_header']        = 'Authorization';
- *         $config['paths']['domains']   = '/api/v1/sites/{site_id}/domains';
- *         return $config;
- *     } );
- *
- * Filling one in is a statement that it was read from the specification. Until
- * then the plugin's manual workflow is what runs, which is the safe default.
+ * All six routes ship filled in. Production needs no filter and no custom PHP.
+ * `pd_wordify_endpoints` remains only so a test can point the client at a fake
+ * base URL, and so an operator on a future API version can adjust a path; it is
+ * validated, and it cannot remove a route or change the authentication scheme.
  *
  * @package PostDomain
  */
 final class WordifyEndpoints {
 
-	public const OP_ME    = 'me';
-	public const OP_SITES = 'sites';
-	public const OP_SITE  = 'site';
-
+	public const OP_ME            = 'me';
+	public const OP_SITES         = 'sites';
+	public const OP_SITE          = 'site';
 	public const OP_DOMAINS       = 'domains';
 	public const OP_ATTACH_DOMAIN = 'attach_domain';
 	public const OP_RECHECK       = 'recheck';
 
-	/** The only path this project could verify. */
-	public const VERIFIED_SITES_PATH = '/api/v1/sites';
+	public const BASE = 'https://console.wordify.com/api/v1';
 
-	/** Observed from the documentation URL, not read from a specification. */
-	public const OBSERVED_BASE = 'https://console.wordify.com';
+	/** The header carrying the bound team for a multi-team account. */
+	public const TEAM_HEADER = 'X-Wordify-Team';
+
+	/** Tokens Wordify issues are prefixed. A value without it is not one. */
+	public const TOKEN_PREFIX = 'wpk_';
+
+	/** @var array<string, string> */
+	private const ROUTES = array(
+		self::OP_ME            => '/me',
+		self::OP_SITES         => '/sites',
+		self::OP_SITE          => '/sites/{site_id}',
+		self::OP_DOMAINS       => '/sites/{site_id}/domains',
+		self::OP_ATTACH_DOMAIN => '/sites/{site_id}/domains',
+		self::OP_RECHECK       => '/sites/{site_id}/domains/recheck',
+	);
 
 	/**
-	 * @param array<string, string> $paths Operation id => path template, `{site_id}` substituted.
+	 * @param array<string, string> $paths Operation id => path template.
 	 */
 	private function __construct(
 		private readonly string $base,
-		private readonly array $paths,
-		private readonly ?string $auth_header
+		private readonly array $paths
 	) {}
 
-	/**
-	 * The shipped map: the one verified path, nothing else, no auth header.
-	 */
+	/** Every verified route, against the real base URL. */
 	public static function verified(): self {
-		return new self( self::OBSERVED_BASE, array( self::OP_SITES => self::VERIFIED_SITES_PATH ), null );
+		return new self( self::BASE, self::ROUTES );
 	}
 
 	/**
 	 * @param array<string, string> $paths
 	 */
-	public static function supplied( string $base, array $paths, ?string $auth_header ): self {
-		return new self( $base, $paths, $auth_header );
+	public static function supplied( string $base, array $paths ): self {
+		return new self( rtrim( $base, '/' ), array_merge( self::ROUTES, $paths ) );
 	}
 
 	/**
-	 * The verified map plus whatever an operator who holds the specification has
-	 * supplied. WordPress-dependent, so it is called by the factory rather than
-	 * by the client.
+	 * The shipped map, with a narrow filter seam over it.
+	 *
+	 * The seam exists for tests that need a fake base URL, and for a future API
+	 * version that moves a path. It can override a path and the base; it cannot
+	 * delete a route, and it has no say over authentication at all — the scheme
+	 * is not configuration and a filter must never be able to redirect a
+	 * credential somewhere unintended.
 	 */
 	public static function configured(): self {
 		$verified = self::verified();
 
 		/**
-		 * Filters the Wordify HTTP transport details the plugin could not verify.
+		 * Filters the Wordify base URL and route templates.
 		 *
-		 * Expects, and is validated back down to, an array of the shape
-		 * `array{ base: string, paths: array<string, string>, auth_header: string|null }`.
-		 * Anything else is discarded: a malformed filter must not be able to make
-		 * this client send a credential somewhere unintended.
+		 * Expects `array{ base: string, paths: array<string, string> }`. Anything
+		 * else is discarded, and missing routes are filled from the shipped map.
 		 *
 		 * @param mixed $config
 		 */
 		$config = apply_filters(
 			'pd_wordify_endpoints',
 			array(
-				'base'        => $verified->base,
-				'paths'       => $verified->paths,
-				'auth_header' => $verified->auth_header,
+				'base'  => $verified->base,
+				'paths' => $verified->paths,
 			)
 		);
 
@@ -120,38 +100,26 @@ final class WordifyEndpoints {
 			return $verified;
 		}
 
+		/** @var array<string, string> $clean */
+		$clean = array();
 		$paths = isset( $config['paths'] ) && is_array( $config['paths'] ) ? $config['paths'] : array();
-
-		/** @var array<string, string> $clean_paths */
-		$clean_paths = array();
 
 		foreach ( $paths as $operation => $path ) {
 			if ( is_string( $operation ) && is_string( $path ) && '' !== $path ) {
-				$clean_paths[ $operation ] = $path;
+				$clean[ $operation ] = $path;
 			}
 		}
 
-		$base        = isset( $config['base'] ) && is_string( $config['base'] ) && '' !== $config['base']
-			? $config['base']
+		$base = isset( $config['base'] ) && is_string( $config['base'] ) && '' !== $config['base']
+			? rtrim( $config['base'], '/' )
 			: $verified->base;
-		$auth_header = isset( $config['auth_header'] ) && is_string( $config['auth_header'] ) && '' !== $config['auth_header']
-			? $config['auth_header']
-			: null;
 
-		// The verified path is not something a filter may unset: it is the one
-		// thing here that is known to be true.
-		$clean_paths[ self::OP_SITES ] = self::VERIFIED_SITES_PATH;
-
-		return new self( rtrim( $base, '/' ), $clean_paths, $auth_header );
+		// Every shipped route survives whatever the filter did or did not say.
+		return new self( $base, array_merge( self::ROUTES, $clean ) );
 	}
 
 	public function base(): string {
 		return $this->base;
-	}
-
-	/** The header name to send the token under, or null while it is unverified. */
-	public function auth_header(): ?string {
-		return $this->auth_header;
 	}
 
 	public function knows( string $operation ): bool {
@@ -159,7 +127,7 @@ final class WordifyEndpoints {
 	}
 
 	/**
-	 * The absolute URL for an operation, or null when its path is unverified.
+	 * The absolute URL for an operation.
 	 *
 	 * @param array<string, string> $tokens Template tokens, e.g. `site_id`.
 	 */

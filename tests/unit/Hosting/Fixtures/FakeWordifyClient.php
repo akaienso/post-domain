@@ -38,7 +38,7 @@ final class FakeWordifyClient implements WordifyClient {
 	private array $site_answers = array();
 
 	public static function domain( string $host, bool $is_primary = false, string $reference = 'dom-1' ): WordifyDomain {
-		return new WordifyDomain( $host, $is_primary, 'active', '2026-08-30T00:00:00Z', $reference );
+		return new WordifyDomain( $host, $is_primary, 'active', 'verified', '2026-08-30T00:00:00Z', '2026-08-30T00:00:00Z', $reference );
 	}
 
 	/** @param WordifyDomain|WordifyFailure ...$answers */

@@ -175,7 +175,7 @@ final class Guide {
 					array(
 						'kind'  => 'p',
 						'items' => array(
-							__( 'If your site is on Wordify, Post Domain can tell Wordify about each mapped domain for you. That needs an API token you create in the Wordify console — the plugin has no credential of its own and never will. Give it only the abilities it needs: reading who the token belongs to, listing your sites, listing a site\'s domains, and attaching a domain.', 'post-domain' ),
+							__( 'If your site is on Wordify, Post Domain can tell Wordify about each mapped domain for you. That needs an API token you create in the Wordify console — the plugin has no credential of its own and never will. Give it exactly two abilities: Read Sites and Manage Sites. Both are needed — reading alone finds your site but cannot attach a domain to it. Do not give it full access.', 'post-domain' ),
 							__( 'Until that connection is made and bound to one site, the Add a domain form is not shown. That is deliberate: a domain added without it would verify, get a certificate, and then show your host\'s placeholder page — a failure that looks like everything worked.', 'post-domain' ),
 							__( 'Post Domain never makes a mapped domain your primary domain, and never changes your main site\'s domain, WordPress address or site address.', 'post-domain' ),
 							__( 'If the token is later revoked you will not be able to add new domains until you replace it, and every domain already serving keeps serving. Disconnecting removes the plugin\'s permission to act — it detaches no domain and deletes no mapping.', 'post-domain' ),

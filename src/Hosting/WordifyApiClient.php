@@ -11,10 +11,11 @@ use PostDomain\Support\HttpResponse;
  *
  * Two rules shape this class.
  *
- * It fails closed. Every path and the auth header name live in
- * `WordifyEndpoints`; anything not verified there produces a `WordifyFailure`
- * naming the missing piece before a request is made. No path is guessed, and no
- * token is ever sent under a header name nobody read from the specification.
+ * It fails closed. Every path lives in `WordifyEndpoints`; an operation with no
+ * route there produces a `WordifyFailure` before a request is made. All six
+ * verified routes ship, so that is a floor rather than an expected state. The
+ * authentication scheme is fixed in this class and is not configurable: a
+ * bearer credential is only a credential under the grammar it was issued for.
  *
  * It never surfaces a response. Bodies are decoded into value objects and then
  * dropped: no body, and no fragment of one, reaches an exception message, a log
@@ -22,9 +23,10 @@ use PostDomain\Support\HttpResponse;
  * of a supplier callable, never as a property, so it cannot be printed by a
  * var_dump of this object.
  *
- * The response envelope is not verified either, so decoding is deliberately
- * tolerant of where a list sits (`data`, a named key, or the top level) while
- * being strict about the field names the tool schemas do state.
+ * Envelopes differ per route — `/sites` paginates under `data`, `/domains`
+ * answers with a top-level array — so decoding is deliberately tolerant of
+ * where a list sits (`data`, a named key, or the top level) while being strict
+ * about the field names observed in real responses.
  *
  * @package PostDomain
  */
@@ -44,13 +46,20 @@ final class WordifyApiClient implements WordifyClient {
 	public function __construct(
 		private readonly HttpClient $http,
 		callable $token_supplier,
-		private readonly WordifyEndpoints $endpoints
+		private readonly WordifyEndpoints $endpoints,
+		private readonly ?string $team_id = null
 	) {
 		$this->token_supplier = $token_supplier;
 	}
 
+	/**
+	 * Ready once there is a credential to send.
+	 *
+	 * The transport is verified and shipped, so readiness is about the operator's
+	 * token and nothing else.
+	 */
 	public function is_ready(): bool {
-		return null !== $this->endpoints->auth_header() && '' !== $this->token();
+		return '' !== $this->token();
 	}
 
 	/** @return WordifyAccount|WordifyFailure */
@@ -153,7 +162,6 @@ final class WordifyApiClient implements WordifyClient {
 			WordifyEndpoints::OP_ATTACH_DOMAIN,
 			'POST',
 			array(
-				'site_id'      => $site_id,
 				'domain'       => $host,
 				'make_primary' => false,
 			),
@@ -177,7 +185,10 @@ final class WordifyApiClient implements WordifyClient {
 
 	/** @return WordifyDomainList|WordifyFailure */
 	public function recheck( string $site_id ) {
-		$response = $this->request( WordifyEndpoints::OP_RECHECK, 'POST', array( 'site_id' => $site_id ), array( 'site_id' => $site_id ) );
+		// No body: the site is in the path, and inventing a field the contract
+		// does not name is how a request starts being rejected for the wrong
+		// reason.
+		$response = $this->request( WordifyEndpoints::OP_RECHECK, 'POST', null, array( 'site_id' => $site_id ) );
 
 		return $this->domain_list( $response, WordifyEndpoints::OP_RECHECK );
 	}
@@ -217,12 +228,6 @@ final class WordifyApiClient implements WordifyClient {
 	 * @return HttpResponse|WordifyFailure
 	 */
 	private function request( string $operation, string $method, ?array $body = null, array $tokens = array(), array $query = array() ) {
-		$header = $this->endpoints->auth_header();
-
-		if ( null === $header ) {
-			return WordifyFailure::auth_unverified( $operation );
-		}
-
 		$url = $this->endpoints->url( $operation, $tokens );
 
 		if ( null === $url ) {
@@ -239,14 +244,27 @@ final class WordifyApiClient implements WordifyClient {
 			$url .= ( str_contains( $url, '?' ) ? '&' : '?' ) . http_build_query( $query );
 		}
 
+		$headers = array(
+			// The scheme is part of the credential's meaning, not a header name
+			// to be configured. Sending the bare token would authenticate nothing
+			// and would put a secret on the wire under the wrong grammar.
+			'Authorization' => 'Bearer ' . $token,
+			'Accept'        => 'application/json',
+			'Content-Type'  => 'application/json',
+		);
+
+		// Multi-team accounts need to be told which team the request is for.
+		// Opaque string: never cast, never compared numerically.
+		if ( null !== $this->team_id && '' !== $this->team_id ) {
+			$headers[ WordifyEndpoints::TEAM_HEADER ] = $this->team_id;
+		}
+
 		$opts = array(
 			'timeout'     => self::TIMEOUT,
+			// A redirect from an API endpoint is not something to follow with a
+			// bearer token attached.
 			'redirection' => 0,
-			'headers'     => array(
-				$header        => $token,
-				'Accept'       => 'application/json',
-				'Content-Type' => 'application/json',
-			),
+			'headers'     => $headers,
 		);
 
 		if ( null !== $body ) {
@@ -259,6 +277,16 @@ final class WordifyApiClient implements WordifyClient {
 			return WordifyFailure::transport( $operation, $response->status );
 		}
 
+		$request_id = self::request_id( $response );
+
+		if ( 401 === $response->status ) {
+			return WordifyFailure::unauthenticated( $operation, $request_id );
+		}
+
+		if ( 403 === $response->status ) {
+			return WordifyFailure::insufficient_ability( $operation, $request_id );
+		}
+
 		if ( 429 === $response->status ) {
 			return WordifyFailure::rate_limited( $operation );
 		}
@@ -268,6 +296,26 @@ final class WordifyApiClient implements WordifyClient {
 		}
 
 		return $response;
+	}
+
+	/**
+	 * Wordify's request id, for a support conversation.
+	 *
+	 * A correlation id and nothing else: it names no account, no site and no
+	 * person, so it is the one part of a refusal that can safely be shown.
+	 */
+	private static function request_id( HttpResponse $response ): ?string {
+		foreach ( $response->headers as $name => $value ) {
+			if ( 'x-request-id' === strtolower( (string) $name ) && is_scalar( $value ) ) {
+				$id = trim( (string) $value );
+
+				// Bounded and character-restricted: a header is caller-controlled
+				// and this one is rendered.
+				return 1 === preg_match( '/^[A-Za-z0-9._-]{1,64}$/', $id ) ? $id : null;
+			}
+		}
+
+		return null;
 	}
 
 	private function token(): string {
@@ -365,9 +413,33 @@ final class WordifyApiClient implements WordifyClient {
 		return new WordifyDomain(
 			$host,
 			isset( $record['is_primary'] ) && (bool) $record['is_primary'],
-			isset( $record['ssl_state'] ) && is_scalar( $record['ssl_state'] ) ? (string) $record['ssl_state'] : null,
-			isset( $record['dns_verified_at'] ) && is_scalar( $record['dns_verified_at'] ) ? (string) $record['dns_verified_at'] : null,
+			// Current names first. The aliases are a courtesy to an older or a
+			// future shape and must never win over a field that is actually
+			// present, or a live response would be read through a stale name.
+			self::field( $record, array( 'ssl_status', 'ssl_state' ) ),
+			self::field( $record, array( 'dns_status' ) ),
+			self::field( $record, array( 'dns_checked_at', 'dns_verified_at' ) ),
+			self::field( $record, array( 'ssl_checked_at' ) ),
 			$reference
 		);
+	}
+
+	/**
+	 * The first of these keys the record actually carries.
+	 *
+	 * Order is the contract: the observed current name is always first, so an
+	 * alias can only fill a gap and can never shadow a present field.
+	 *
+	 * @param array<string, mixed> $record
+	 * @param string[]             $keys
+	 */
+	private static function field( array $record, array $keys ): ?string {
+		foreach ( $keys as $key ) {
+			if ( isset( $record[ $key ] ) && is_scalar( $record[ $key ] ) && '' !== (string) $record[ $key ] ) {
+				return (string) $record[ $key ];
+			}
+		}
+
+		return null;
 	}
 }

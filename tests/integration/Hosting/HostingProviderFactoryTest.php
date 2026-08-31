@@ -198,7 +198,13 @@ final class HostingProviderFactoryTest extends WP_UnitTestCase {
 		);
 	}
 
-	public function test_configured_wordify_credentials_still_refuse_while_the_transport_is_unverified(): void {
+	/**
+	 * The counterpart to the "no credential, no provider" case: with a token and
+	 * a binding in place, the Wordify provider is what comes back, bound to the
+	 * team and site the operator chose. The transport ships complete, so nothing
+	 * further is required to reach it.
+	 */
+	public function test_configured_wordify_credentials_resolve_to_the_wordify_provider(): void {
 		// Credentials alone are not readiness: with no verified auth header the
 		// client cannot send anything, so the provider is not ready — and the
 		// answer is a refusal, not a silent demotion to the manual workflow.
@@ -245,9 +251,11 @@ final class HostingProviderFactoryTest extends WP_UnitTestCase {
 
 		$resolved = HostingProviderFactory::for_new_mapping();
 
-		$this->assertInstanceOf( HostingProviderUnavailable::class, $resolved );
+		$this->assertInstanceOf( \PostDomain\Hosting\WordifyHostingProvider::class, $resolved );
 		$this->assertNotInstanceOf( ManualHostingProvider::class, $resolved );
-		$this->assertSame( 'hosting_provider_not_ready', $resolved->reason );
+		$this->assertTrue( $resolved->is_ready() );
+		$this->assertSame( 'team-1', $resolved->environment()?->team_id );
+		$this->assertSame( '01HQ0000000000000000000001', $resolved->environment()?->site_id );
 
 		remove_all_filters( 'pd_hosting_has_credential' );
 		remove_all_filters( 'pd_hosting_credential_store' );

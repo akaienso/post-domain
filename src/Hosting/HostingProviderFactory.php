@@ -110,7 +110,8 @@ final class HostingProviderFactory {
 
 				return null === $secret ? '' : $secret->reveal();
 			},
-			WordifyEndpoints::configured()
+			WordifyEndpoints::configured(),
+			$environment->team_id
 		);
 
 		return new WordifyHostingProvider( $client, $environment );

@@ -17,23 +17,23 @@ final class WordifyFailure {
 		public readonly WordifyFailureKind $kind,
 		public readonly ?int $status,
 		public readonly string $message,
-		public readonly ?string $operation
+		public readonly ?string $operation,
+		/** Wordify's X-Request-Id, safe to quote to support; identifies nobody. */
+		public readonly ?string $request_id = null
 	) {}
 
+	/**
+	 * An operation this build has no route for.
+	 *
+	 * All six routes ship, so this is reachable only if a filter removed one,
+	 * which the endpoint map does not permit — it is kept as a fail-closed floor
+	 * rather than as an expected state.
+	 */
 	public static function endpoint_unverified( string $operation ): self {
 		return new self(
 			WordifyFailureKind::ENDPOINT_UNVERIFIED,
 			null,
-			'This Wordify operation has no verified HTTP path. Supply one through the pd_wordify_endpoints filter.',
-			$operation
-		);
-	}
-
-	public static function auth_unverified( string $operation ): self {
-		return new self(
-			WordifyFailureKind::AUTH_UNVERIFIED,
-			null,
-			'The Wordify authentication header is not known. Supply it through the pd_wordify_endpoints filter.',
+			'That Wordify operation is not available in this version of the plugin.',
 			$operation
 		);
 	}
@@ -48,6 +48,43 @@ final class WordifyFailure {
 
 	public static function rate_limited( string $operation ): self {
 		return new self( WordifyFailureKind::RATE_LIMITED, 429, 'The hosting provider is rate limiting this account.', $operation );
+	}
+
+	/**
+	 * The credential was rejected outright: absent, malformed, expired, revoked.
+	 *
+	 * Wordify answers 401 with a JSON envelope carrying `error.code`,
+	 * `error.request_id` and a human message. The message is not carried here —
+	 * a provider's own prose is not shown to an administrator or written to a
+	 * log — but the request id is, because it is the one thing that makes a
+	 * support conversation possible and it identifies no one on its own.
+	 */
+	public static function unauthenticated( string $operation, ?string $request_id = null ): self {
+		return new self(
+			WordifyFailureKind::UNAUTHENTICATED,
+			401,
+			'The Wordify API token was not accepted.',
+			$operation,
+			$request_id
+		);
+	}
+
+	/**
+	 * Authenticated, and not permitted.
+	 *
+	 * For this plugin that almost always means a token created with Read Sites
+	 * but not Manage Sites. Nothing here can prove that before a mutation is
+	 * attempted, so this is where it surfaces, and it must surface as advice
+	 * rather than as a retry.
+	 */
+	public static function insufficient_ability( string $operation, ?string $request_id = null ): self {
+		return new self(
+			WordifyFailureKind::INSUFFICIENT_ABILITY,
+			403,
+			'The Wordify API token does not have the Manage Sites ability.',
+			$operation,
+			$request_id
+		);
 	}
 
 	public static function refused( string $operation, int $status ): self {
